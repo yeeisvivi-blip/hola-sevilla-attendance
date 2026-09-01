@@ -86,6 +86,11 @@ function normalizePhone(value) {
   return digits ? `+${digits}` : '';
 }
 
+function loginEmailFromPhone(value) {
+  const digits = normalizePhone(value).replace(/\D/g, '');
+  return `p${digits}@attendance.invalid`;
+}
+
 function madridDate(date = new Date()) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: MADRID_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
 }
@@ -230,7 +235,7 @@ async function login(event) {
   const status = $('#authStatus');
   status.textContent = L('正在登录…', 'Iniciando sesión…');
   const { data, error } = await client.auth.signInWithPassword({
-    phone: normalizePhone($('#loginPhone').value),
+    email: loginEmailFromPhone($('#loginPhone').value),
     password: $('#loginPassword').value,
   });
   if (error) { status.textContent = errorText(error); return; }
@@ -255,7 +260,7 @@ async function startKioskConfiguration(event) {
   const status = $('#authStatus');
   status.textContent = L('正在验证VIVI身份…', 'Verificando a VIVI…');
   const { data, error } = await client.auth.signInWithPassword({
-    phone: normalizePhone($('#kioskManagerPhone').value),
+    email: loginEmailFromPhone($('#kioskManagerPhone').value),
     password: $('#kioskManagerPassword').value,
   });
   if (error) { status.textContent = errorText(error); return; }
