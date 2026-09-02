@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#153f35">
+  <title>HOLA!SEVILLA · 更新应用</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #f4f1e9; color: #173c34; font-family: system-ui, "Microsoft YaHei", sans-serif; }
+    main { width: min(100%, 520px); padding: 34px; background: white; border-radius: 20px; box-shadow: 0 18px 60px #173c3418; text-align: center; }
+    b { display: grid; place-items: center; width: 52px; height: 52px; margin: auto; border-radius: 15px; color: white; background: #153f35; font-size: 28px; }
+    h1 { margin: 22px 0 10px; }
+    p { line-height: 1.6; }
+    .error { color: #a22525; }
+  </style>
+</head>
+<body>
+  <main>
+    <b>H</b>
+    <h1>正在更新打卡系统</h1>
+    <p id="status">正在清除旧版本缓存，请稍候……</p>
+  </main>
+  <script>
+    (async () => {
+      const status = document.getElementById('status');
+      try {
+        const registrations = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistrations() : [];
+        await Promise.all(registrations.map((registration) => registration.unregister()));
+        const cacheNames = 'caches' in window ? await caches.keys() : [];
+        await Promise.all(cacheNames.map((name) => caches.delete(name)));
+        status.textContent = '更新完成，正在重新打开系统……';
+        setTimeout(() => location.replace('./?fresh=20260902-3'), 800);
+      } catch (error) {
+        status.className = 'error';
+        status.textContent = `自动更新失败：${error instanceof Error ? error.message : String(error)}`;
+      }
+    })();
+  </script>
+</body>
+</html>
