@@ -1,4 +1,4 @@
-const CACHE_NAME = 'hola-sevilla-production-v4';
+const CACHE_NAME = 'hola-sevilla-production-v5';
 const BASE = new URL('./', self.location.href);
 const SHELL = ['', 'index.html', 'styles.css', 'app.js', 'config.js', 'manifest.webmanifest', 'icon.svg']
   .map((path) => new URL(path, BASE).href);
