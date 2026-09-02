@@ -118,6 +118,15 @@ tr:last-child td { border-bottom: 0; }
 .stat-card b { margin-top: 9px; font-size: 28px; letter-spacing: -.04em; }
 .split { display: grid; grid-template-columns: minmax(280px, .72fr) minmax(0, 1.28fr); gap: 18px; align-items: start; }
 .sticky-card { position: sticky; top: 105px; }
+.weekly-schedule { display: grid; gap: 9px; }
+.weekly-row { display: grid; grid-template-columns: 76px 80px minmax(180px, 1fr) 110px 110px; gap: 10px; align-items: end; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: #fafbf8; }
+.weekly-row label { gap: 5px; }
+.weekly-row label > span { color: var(--muted); font-size: 11px; }
+.weekly-row input, .weekly-row select { min-height: 42px; }
+.weekly-day-name { align-self: center; color: var(--green); }
+.inline-check { display: flex; align-items: center; align-self: center; gap: 8px; }
+.inline-check input { width: 18px; min-height: 18px; margin: 0; }
+.inline-check span { color: var(--ink) !important; font-size: 13px !important; }
 .empty { padding: 34px 15px; color: var(--muted); text-align: center; }
 .button-row { display: flex; gap: 7px; flex-wrap: wrap; }
 .button-row button { min-height: 34px; padding: 7px 10px; }
@@ -175,6 +184,7 @@ tr:last-child td { border-bottom: 0; }
   .mobile-nav button.active { color: var(--green); }
   .split { grid-template-columns: 1fr; }
   .sticky-card { position: static; }
+  .weekly-row { grid-template-columns: 70px 75px minmax(160px, 1fr) 100px 100px; }
 }
 
 @media (max-width: 620px) {
@@ -195,6 +205,8 @@ tr:last-child td { border-bottom: 0; }
   .kiosk-card { padding: 24px 18px; border-radius: 22px; }
   .setup-page { padding: 16px; }
   .setup-card { padding: 24px; }
+  .weekly-row { grid-template-columns: 1fr 1fr; align-items: end; }
+  .weekly-store { grid-column: 1 / -1; }
 }
 
 @media print {
