@@ -10,7 +10,7 @@ const LANG_STORAGE = 'holaSevillaLanguage';
 const FUNCTION_RELEASES = {
   'admin-api': '2026.09.02.2',
   'kiosk-punch': '2026.09.02.1',
-  'gps-punch': '2026.09.02.1',
+  'gps-punch': '2026.09.02.2',
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -88,10 +88,12 @@ function errorText(error) {
     INVALID_SCHEDULE_TIME: L('排班结束时间必须晚于开始时间', 'El fin del turno debe ser posterior al inicio'),
     INVALID_MONTH: L('请选择有效的排班月份', 'Selecciona un mes válido'),
     INVALID_WEEK_PATTERN: L('请检查一周模板，每个工作日都要填写正确的店铺和时间', 'Revisa la plantilla semanal: cada día laborable necesita tienda y horario válidos'),
+    NO_SCHEDULE_TODAY: L('今天没有已发布的排班，不能使用手机打卡', 'No hay horario publicado para hoy. No puedes fichar con el móvil'),
+    SCHEDULE_DAY_OFF: L('今天是排班休息日，不能打卡', 'Hoy es día libre según el horario. No puedes fichar'),
     INVALID_CORRECTION: L('请至少填写一个有效的修正时间', 'Indica al menos una hora válida para corregir'),
     NO_GPS_PERMISSION: L('当前没有有效的手机GPS打卡授权', 'No tienes autorización GPS vigente'),
     NO_ALLOWED_EVENTS: L('请至少选择一种允许的GPS打卡动作', 'Selecciona al menos un tipo de fichaje GPS'),
-    OUTSIDE_AUTHORIZED_AREA: L('当前位置不在授权店铺范围内', 'Estás fuera del área autorizada'),
+    OUTSIDE_AUTHORIZED_AREA: L('当前位置距离排班店铺超过100米，不能打卡', 'Estás a más de 100 metros de la tienda asignada. No puedes fichar'),
     LOCATION_NOT_ACCURATE_ENOUGH: L('定位精度不足，请到开阔位置重试', 'La ubicación no es suficientemente precisa'),
     LOCATION_PERMISSION_DENIED: L('浏览器没有定位权限，请在地址栏允许位置权限', 'El navegador no tiene permiso de ubicación. Actívalo en la barra de direcciones'),
     LOCATION_UNAVAILABLE: L('暂时无法取得准确位置，请打开手机定位后重试', 'No se pudo obtener la ubicación. Activa el GPS e inténtalo de nuevo'),
@@ -251,7 +253,7 @@ function renderAuth() {
   app.innerHTML = `<main class="auth-shell">
     <section class="auth-story">
       <div class="brand-lockup"><span class="brand-mark">H</span><span><b>HOLA!SEVILLA</b><small>CONTROL HORARIO OFICIAL</small></span></div>
-      <div><p class="eyebrow">NOVAKEEPS S.L.</p><h1>${L('每一次到岗，清楚记录。', 'Cada jornada, claramente registrada.')}</h1><p>${L('四店统一排班、考勤、申请与审计。员工手机只用于查看和申请，特殊情况由VIVI授权GPS打卡。', 'Horarios, fichajes, solicitudes y auditoría para las cuatro tiendas. El móvil se usa para consultar y solicitar; el fichaje GPS requiere autorización de VIVI.')}</p></div>
+      <div><p class="eyebrow">NOVAKEEPS S.L.</p><h1>${L('每一次到岗，清楚记录。', 'Cada jornada, claramente registrada.')}</h1><p>${L('四店统一排班、考勤、申请与审计。员工手机可在当天排班店铺100米内定位打卡，跨店等特殊情况由VIVI临时授权。', 'Horarios, fichajes, solicitudes y auditoría para las cuatro tiendas. El móvil permite fichar a menos de 100 m de la tienda asignada; las excepciones requieren autorización de VIVI.')}</p></div>
       <div class="auth-facts"><div><b>4</b><span>${L('家店铺', 'tiendas')}</span></div><div><b>20'</b><span>${L('休息', 'descanso')}</span></div><div><b>7h</b><span>${L('每日班次', 'jornada')}</span></div></div>
     </section>
     <section class="auth-panel">
@@ -277,7 +279,7 @@ function renderLoginForm(role) {
     <label>${L('手机号', 'Teléfono')}<input id="loginPhone" type="tel" placeholder="+34 600 000 000" required autocomplete="username"></label>
     <label>${L('登录密码', 'Contraseña')}<input id="loginPassword" type="password" minlength="8" required autocomplete="current-password"></label>
     <button class="primary-btn" type="submit">${role === 'manager' ? L('进入四店管理后台', 'Entrar al panel de VIVI') : L('登录查看我的信息', 'Entrar a mi cuenta')}</button>
-    <div class="callout"><b>${L('说明', 'Nota')}</b><span>${role === 'manager' ? L('只有VIVI管理员账号可以进入。', 'Solo puede acceder la cuenta administradora de VIVI.') : L('手机端默认不能打卡，可查看排班、考勤并提交申请。', 'El móvil no ficha por defecto; permite ver horarios, registros y enviar solicitudes.')}</span></div>
+    <div class="callout"><b>${L('说明', 'Nota')}</b><span>${role === 'manager' ? L('只有VIVI管理员账号可以进入。', 'Solo puede acceder la cuenta administradora de VIVI.') : L('手机可查看排班和申请，也可在当天排班店铺100米内定位打卡。', 'Puedes consultar horarios y solicitudes y fichar con ubicación a menos de 100 m de la tienda asignada.')}</span></div>
   </form>`;
 }
 
@@ -659,18 +661,34 @@ function renderEmployeeHome() {
   const permissions = state.data.permissions || [];
   const status = record?.clock_out ? L('今日已完成', 'Jornada completada') : record?.clock_in ? L('工作进行中', 'Jornada en curso') : schedule?.is_day_off ? L('今天休息', 'Día libre') : L('等待到店', 'Pendiente de entrada');
   return `<div class="page-grid">
-    <article class="card hero-card"><div><p class="eyebrow">${dateText(today)}</p><h2>${escapeHTML(state.profile.full_name)}，${status}</h2><p>${schedule ? (schedule.is_day_off ? L('排班：休息', 'Horario: descanso') : `${escapeHTML(schedule.stores?.name || '')} · ${timeText(schedule.starts_at)}—${timeText(schedule.ends_at)}`) : L('VIVI尚未发布今天的排班', 'VIVI todavía no ha publicado el horario de hoy')}</p></div><div class="hero-meta"><span>${L('手机端：查看与申请', 'Móvil: consulta y solicitudes')}</span><span>${L('普通打卡：店铺电脑', 'Fichaje normal: ordenador de tienda')}</span></div></article>
+    <article class="card hero-card"><div><p class="eyebrow">${dateText(today)}</p><h2>${escapeHTML(state.profile.full_name)}，${status}</h2><p>${schedule ? (schedule.is_day_off ? L('排班：休息', 'Horario: descanso') : `${escapeHTML(schedule.stores?.name || '')} · ${timeText(schedule.starts_at)}—${timeText(schedule.ends_at)}`) : L('VIVI尚未发布今天的排班', 'VIVI todavía no ha publicado el horario de hoy')}</p></div><div class="hero-meta"><span>${L('手机定位：店铺100米内打卡', 'Móvil: fichaje dentro de 100 m')}</span><span>${L('店铺电脑：PIN打卡', 'Ordenador: fichaje con PIN')}</span></div></article>
     <article class="card summary-card"><div class="metric"><span>${L('上班', 'Entrada')}</span><b>${timeText(record?.clock_in)}</b></div><div class="metric"><span>${L('休息', 'Pausa')}</span><b>${timeText(record?.break_start)}–${timeText(record?.break_end)}</b></div><div class="metric"><span>${L('下班', 'Salida')}</span><b>${timeText(record?.clock_out)}</b></div></article>
   </div>
-  ${permissions.length ? permissions.map((permission) => renderGpsCard(permission, record)).join('') : `<article class="card"><p class="eyebrow">MOBILE POLICY</p><h2>${L('手机GPS打卡未启用', 'Fichaje GPS no habilitado')}</h2><p>${L('这是正常状态。特殊情况下由VIVI按员工、店铺和时间段临时授权。系统只在按下打卡时读取一次位置，不会持续追踪。', 'Es el estado normal. VIVI puede autorizarlo temporalmente por empleado, tienda y franja horaria. Solo se obtiene la ubicación al pulsar fichar; no hay seguimiento continuo.')}</p></article>`}
+  ${renderScheduledMobilePunch(schedule, record)}
+  ${permissions.map((permission) => renderGpsCard(permission, record)).join('')}
   <article class="card"><div class="section-head"><div><p class="eyebrow">NEXT 7 DAYS</p><h2>${L('近期排班', 'Próximos turnos')}</h2></div></div>${scheduleTable(state.data.schedules.filter((item) => item.work_date >= today).slice(0, 7), false)}</article>`;
+}
+
+function renderScheduledMobilePunch(schedule, record) {
+  const nextActions = nextActionsFromRecord(record);
+  let content;
+  if (!schedule) {
+    content = `<div class="callout warning"><b>${L('不能打卡', 'No disponible')}</b><span>${L('今天没有已发布的排班，请联系VIVI。', 'No hay horario publicado para hoy. Contacta con VIVI.')}</span></div>`;
+  } else if (schedule.is_day_off) {
+    content = `<div class="callout"><b>${L('今日休息', 'Día libre')}</b><span>${L('休息日不显示打卡按钮。', 'No se muestran botones de fichaje en un día libre.')}</span></div>`;
+  } else if (!nextActions.length) {
+    content = `<span class="status ok">${L('今天已经完成打卡', 'La jornada de hoy ya está completa')}</span>`;
+  } else {
+    content = `<div class="button-row">${nextActions.map((event) => `<button class="${event === 'clock_out' ? 'secondary-btn' : 'primary-btn'}" data-gps-punch="${event}" type="button">${eventLabel(event)}</button>`).join('')}</div>`;
+  }
+  return `<article class="card"><p class="eyebrow">MOBILE GPS PUNCH</p><h2>${L('店铺100米内手机打卡', 'Fichaje móvil dentro de 100 m')}</h2><p>${schedule && !schedule.is_day_off ? `${escapeHTML(schedule.stores?.name || '')}<br>${escapeHTML(schedule.stores?.address || '')}` : L('手机打卡必须对应当天已发布的排班。', 'El fichaje móvil debe corresponder al horario publicado de hoy.')}</p>${content}<div class="callout"><b>GPS · 100m</b><span>${L('点击打卡时只读取一次位置。必须允许精确定位；系统不会持续追踪。', 'La ubicación se obtiene una sola vez al fichar. Debes permitir ubicación precisa; no hay seguimiento continuo.')}</span></div></article>`;
 }
 
 function renderGpsCard(permission, record) {
   const used = permission.used_events || [];
   const nextActions = nextActionsFromRecord(record);
   const allowed = (permission.allowed_events || []).filter((event) => !used.includes(event) && nextActions.includes(event));
-  return `<article class="card"><p class="eyebrow">TEMPORARY GPS AUTHORIZATION</p><h2>${L('特殊情况手机GPS打卡已授权', 'Fichaje GPS autorizado temporalmente')}</h2><p>${escapeHTML(permission.stores?.name || '')}<br>${madridDisplay(new Date(permission.valid_from), true)} → ${madridDisplay(new Date(permission.valid_until), true)}<br>${escapeHTML(permission.reason)}</p><div class="button-row">${allowed.map((event) => `<button class="primary-btn" data-gps-punch="${event}" type="button">${eventLabel(event)}</button>`).join('') || `<span class="status ok">${nextActions.length ? L('当前没有符合顺序的可用动作', 'No hay una acción disponible en este momento') : L('今天已经完成打卡', 'La jornada de hoy ya está completa')}</span>`}</div><div class="callout"><b>GPS</b><span>${L('点击后浏览器只读取一次当前位置，并记录精度与距店距离。', 'Al pulsar, el navegador obtiene una sola ubicación y registra precisión y distancia.')}</span></div></article>`;
+  return `<article class="card"><p class="eyebrow">TEMPORARY GPS AUTHORIZATION</p><h2>${L('特殊情况手机GPS打卡已授权', 'Fichaje GPS autorizado temporalmente')}</h2><p>${escapeHTML(permission.stores?.name || '')}<br>${madridDisplay(new Date(permission.valid_from), true)} → ${madridDisplay(new Date(permission.valid_until), true)}<br>${escapeHTML(permission.reason)}</p><div class="button-row">${allowed.map((event) => `<button class="primary-btn" data-gps-punch="${event}" data-gps-permission="${permission.id}" type="button">${eventLabel(event)}</button>`).join('') || `<span class="status ok">${nextActions.length ? L('当前没有符合顺序的可用动作', 'No hay una acción disponible en este momento') : L('今天已经完成打卡', 'La jornada de hoy ya está completa')}</span>`}</div><div class="callout"><b>GPS · 100m</b><span>${L('临时跨店打卡也必须在授权店铺100米内。', 'El fichaje excepcional también debe realizarse a menos de 100 m de la tienda autorizada.')}</span></div></article>`;
 }
 
 function scheduleTable(items, showEmployee = true, editable = false) {
@@ -705,7 +723,7 @@ function requestTypeLabel(type) { return ({ missed_punch: L('补卡', 'Correcci�
 function statusLabel(status) { return ({ pending: L('待审批', 'Pendiente'), approved: L('已批准', 'Aprobada'), rejected: L('已拒绝', 'Rechazada') })[status] || status; }
 
 function renderProfile() {
-  return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>${escapeHTML(state.profile.employee_no)} · ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('在职', 'En activo') : L('停用', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article><article class="card summary-card"><p class="eyebrow">PRIVACY</p><h3>${L('数据与位置', 'Datos y ubicación')}</h3><p>${L('考勤记录按公司法定义务保存。GPS仅在获得授权并主动按下打卡时读取。', 'Los registros se conservan según la obligación legal. El GPS solo se obtiene con autorización y al pulsar fichar.')}</p></article></div>`;
+  return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>${escapeHTML(state.profile.employee_no)} · ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('在职', 'En activo') : L('停用', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article><article class="card summary-card"><p class="eyebrow">PRIVACY</p><h3>${L('数据与位置', 'Datos y ubicación')}</h3><p>${L('考勤记录按公司法定义务保存。GPS只在员工主动点击打卡时读取一次，用于确认是否在店铺100米内，不会持续追踪。', 'Los registros se conservan según la obligación legal. El GPS se obtiene una sola vez al fichar para confirmar que estás a menos de 100 m de la tienda; no hay seguimiento continuo.')}</p></article></div>`;
 }
 
 function renderManagerHome() {
@@ -820,7 +838,7 @@ function renderManagerRequests() {
 function renderGpsAdmin() {
   const today = madridDate();
   const canGrant = state.data.employees.some((employee) => employee.active) && state.data.stores.some((store) => store.active !== false);
-  return `<div class="split"><article class="card sticky-card"><p class="eyebrow">TEMPORARY AUTHORIZATION</p><h2>${L('授权手机GPS打卡', 'Autorizar fichaje GPS')}</h2><p>${L('只用于电脑故障、跨店或其他已确认的特殊情况。按员工、店铺、事件和时间段授权。', 'Solo para avería del ordenador, apoyo entre tiendas u otra excepción confirmada. Se limita por empleado, tienda, eventos y horario.')}</p>${canGrant ? `<form id="gpsForm" class="stack-form">
+  return `<div class="split"><article class="card sticky-card"><p class="eyebrow">TEMPORARY AUTHORIZATION</p><h2>${L('特殊情况跨店GPS授权', 'Autorización GPS excepcional')}</h2><p>${L('员工正常手机打卡按当天排班店铺判断，无需授权。这里仅用于电脑故障、临时跨店或其他已确认的特殊情况。', 'El fichaje móvil normal usa la tienda asignada y no necesita autorización. Esta sección es solo para averías, cambios temporales de tienda u otras excepciones confirmadas.')}</p>${canGrant ? `<form id="gpsForm" class="stack-form">
     <label>${L('员工', 'Empleado')}<select id="gpsEmployee">${employeeOptions()}</select></label><label>${L('店铺', 'Tienda')}<select id="gpsStore">${storeOptions()}</select></label>
     <div class="form-row"><label>${L('开始日期时间', 'Desde')}<input id="gpsFrom" type="datetime-local" value="${today}T09:00" required></label><label>${L('结束日期时间', 'Hasta')}<input id="gpsUntil" type="datetime-local" value="${today}T23:00" required></label></div>
     <label>${L('允许事件', 'Eventos permitidos')}<select id="gpsEvents" multiple size="4"><option value="clock_in" selected>${L('上班', 'Entrada')}</option><option value="break_start" selected>${L('开始休息', 'Inicio pausa')}</option><option value="break_end" selected>${L('结束休息', 'Fin pausa')}</option><option value="clock_out" selected>${L('下班', 'Salida')}</option></select></label>
@@ -834,7 +852,7 @@ function gpsPermissionTable() {
 }
 
 function renderStores() {
-  return `<div class="page-grid">${state.data.stores.map((store) => `<article class="card" style="grid-column:span 6"><p class="eyebrow">${escapeHTML(store.code)}</p><h2>${escapeHTML(store.name)}</h2><form class="stack-form store-form" data-store-id="${store.id}"><label>${L('准确地址', 'Dirección exacta')}<input name="address" value="${escapeHTML(store.address || '')}" required></label><div class="form-row"><label>Latitude<input name="latitude" type="number" step="any" value="${store.latitude ?? ''}" required></label><label>Longitude<input name="longitude" type="number" step="any" value="${store.longitude ?? ''}" required></label></div><label>${L('有效半径（米）', 'Radio válido (m)')}<input name="radius" type="number" min="20" max="1000" value="${store.radius_m || 100}" required></label><button class="primary-btn" type="submit">${L('保存店铺GPS', 'Guardar GPS')}</button></form></article>`).join('')}</div><article class="card"><p class="eyebrow">KIOSK DEVICES</p><h2>${L('已绑定店铺电脑', 'Ordenadores vinculados')}</h2>${deviceTable()}</article>`;
+  return `<div class="page-grid">${state.data.stores.map((store) => `<article class="card" style="grid-column:span 6"><p class="eyebrow">${escapeHTML(store.code)}</p><h2>${escapeHTML(store.name)}</h2><form class="stack-form store-form" data-store-id="${store.id}"><label>${L('准确地址', 'Dirección exacta')}<input name="address" value="${escapeHTML(store.address || '')}" required></label><div class="form-row"><label>Latitude<input name="latitude" type="number" step="any" value="${store.latitude ?? ''}" required></label><label>Longitude<input name="longitude" type="number" step="any" value="${store.longitude ?? ''}" required></label></div><label>${L('手机打卡范围（最大100米）', 'Radio de fichaje móvil (máx. 100 m)')}<input name="radius" type="number" min="20" max="100" value="${Math.min(Number(store.radius_m) || 100, 100)}" required></label><button class="primary-btn" type="submit">${L('保存店铺GPS', 'Guardar GPS')}</button></form></article>`).join('')}</div><article class="card"><p class="eyebrow">KIOSK DEVICES</p><h2>${L('已绑定店铺电脑', 'Ordenadores vinculados')}</h2>${deviceTable()}</article>`;
 }
 
 function deviceTable() {
@@ -861,7 +879,7 @@ function bindPortal() {
   $('#refreshData')?.addEventListener('click', refreshPortal);
   $$('[data-view]').forEach((button) => button.addEventListener('click', () => { state.view = button.dataset.view; renderPortal(); }));
   $('#requestForm')?.addEventListener('submit', submitRequest);
-  $$('[data-gps-punch]').forEach((button) => button.addEventListener('click', () => gpsPunch(button.dataset.gpsPunch)));
+  $$('[data-gps-punch]').forEach((button) => button.addEventListener('click', () => gpsPunch(button.dataset.gpsPunch, button.dataset.gpsPermission || null)));
   $('#employeeForm')?.addEventListener('submit', createEmployee);
   $$('[data-toggle-employee]').forEach((button) => button.addEventListener('click', () => toggleEmployee(button)));
   $$('[data-delete-employee]').forEach((button) => button.addEventListener('click', () => deleteEmployee(button)));
@@ -945,12 +963,12 @@ async function submitRequest(event) {
   }
 }
 
-async function gpsPunch(eventType) {
+async function gpsPunch(eventType, permissionId = null) {
   if (!navigator.geolocation) { toast(L('此设备不支持定位', 'Este dispositivo no admite ubicación'), true); return; }
   if (state.busy) return;
   state.busy = true;
   $$('[data-gps-punch]').forEach((button) => { button.disabled = true; });
-  toast(L('正在读取一次当前位置…', 'Obteniendo una ubicación…'));
+  toast(L('正在确认你位于店铺100米内…', 'Comprobando que estás a menos de 100 m…'));
   try {
     const position = await new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, {
       enableHighAccuracy: true, timeout: 15_000, maximumAge: 0,
@@ -960,8 +978,9 @@ async function gpsPunch(eventType) {
       latitude: position.coords.latitude,
       longitude: position.coords.longitude,
       accuracy: position.coords.accuracy,
+      ...(permissionId ? { permissionId } : {}),
     }, { authenticated: true });
-    await finishMutation(`${eventLabel(eventType)} · ${timeText(result.event.occurredAt)}`);
+    await finishMutation(`${eventLabel(eventType)} · ${timeText(result.event.occurredAt)} · ${Math.round(result.distanceM)}m`);
   } catch (error) {
     const locationError = error?.code === 1 ? 'LOCATION_PERMISSION_DENIED' : [2, 3].includes(error?.code) ? 'LOCATION_UNAVAILABLE' : error;
     toast(errorText(locationError), true);
