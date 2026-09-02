@@ -7,6 +7,8 @@ const config = window.HOLA_CONFIG || {};
 const MADRID_TZ = config.timezone || 'Europe/Madrid';
 const KIOSK_STORAGE = 'holaSevillaKioskV1';
 const LANG_STORAGE = 'holaSevillaLanguage';
+const APP_RELEASE = '2026.09.02.1';
+const REQUEST_TIMEOUT_MS = 20_000;
 const configured = /^https:\/\/[^/]+\.supabase\.co$/.test(config.supabaseUrl || '')
   && String(config.supabasePublishableKey || '').startsWith('sb_publishable_');
 
@@ -28,8 +30,11 @@ const state = {
   kioskStore: null,
   kioskSelected: null,
   kioskSuccess: null,
+  health: null,
   busy: false,
 };
+
+let kioskResetTimer;
 
 function readJSON(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
@@ -60,26 +65,70 @@ function toast(message, error = false) {
 }
 
 function errorText(error) {
-  const code = String(error?.message || error?.error || error || 'UNKNOWN_ERROR');
+  const code = String(error?.code || error?.message || error?.error || error || 'UNKNOWN_ERROR');
   const messages = {
     INVALID_LOGIN_CREDENTIALS: L('手机号或密码不正确', 'Teléfono o contraseña incorrectos'),
+    INVALID_PHONE: L('手机号格式不正确，请填写完整号码，例如 +34 600 000 000', 'El teléfono no es válido. Usa el formato completo, por ejemplo +34 600 000 000'),
     INVALID_PIN: L('个人PIN不正确', 'PIN personal incorrecto'),
+    PIN_MUST_BE_6_DIGITS: L('PIN必须是6位数字', 'El PIN debe tener 6 cifras'),
+    PIN_NOT_CONFIGURED: L('该员工尚未设置PIN，请由VIVI重设PIN', 'Este empleado no tiene PIN. VIVI debe restablecerlo'),
     PIN_TEMPORARILY_LOCKED: L('PIN错误次数过多，请15分钟后重试', 'Demasiados intentos. Prueba en 15 minutos'),
     NOT_ASSIGNED_TO_THIS_STORE: L('你今天未被安排在此店', 'Hoy no estás asignado a esta tienda'),
     INVALID_EVENT_SEQUENCE: L('打卡顺序不正确，请刷新后重试', 'Secuencia de fichaje incorrecta'),
+    INVALID_INPUT: L('填写的信息不完整或格式不正确', 'Faltan datos o el formato no es válido'),
+    INVALID_TIME_RANGE: L('结束时间必须晚于开始时间', 'La hora final debe ser posterior a la inicial'),
+    INVALID_WORKDATE: L('日期格式不正确，请重新选择日期', 'La fecha no es válida. Selecciónala de nuevo'),
+    INVALID_SCHEDULE_TIME: L('排班结束时间必须晚于开始时间', 'El fin del turno debe ser posterior al inicio'),
+    INVALID_CORRECTION: L('请至少填写一个有效的修正时间', 'Indica al menos una hora válida para corregir'),
     NO_GPS_PERMISSION: L('当前没有有效的手机GPS打卡授权', 'No tienes autorización GPS vigente'),
+    NO_ALLOWED_EVENTS: L('请至少选择一种允许的GPS打卡动作', 'Selecciona al menos un tipo de fichaje GPS'),
     OUTSIDE_AUTHORIZED_AREA: L('当前位置不在授权店铺范围内', 'Estás fuera del área autorizada'),
     LOCATION_NOT_ACCURATE_ENOUGH: L('定位精度不足，请到开阔位置重试', 'La ubicación no es suficientemente precisa'),
+    LOCATION_PERMISSION_DENIED: L('浏览器没有定位权限，请在地址栏允许位置权限', 'El navegador no tiene permiso de ubicación. Actívalo en la barra de direcciones'),
+    LOCATION_UNAVAILABLE: L('暂时无法取得准确位置，请打开手机定位后重试', 'No se pudo obtener la ubicación. Activa el GPS e inténtalo de nuevo'),
     STORE_GPS_NOT_CONFIGURED: L('VIVI尚未配置该店GPS坐标', 'La tienda todavía no tiene coordenadas GPS'),
+    STORE_NOT_FOUND: L('店铺不存在，请刷新后重试', 'La tienda no existe. Actualiza e inténtalo de nuevo'),
+    STORE_NOT_ACTIVE: L('该店铺已停用，不能执行此操作', 'La tienda está desactivada'),
     EMPLOYEE_DISABLED: L('账号已停用，请联系VIVI', 'Cuenta desactivada. Contacta con VIVI'),
+    EMPLOYEE_NOT_ACTIVE: L('该员工不存在或已停用', 'El empleado no existe o está desactivado'),
     DELETE_REQUIRES_DEACTIVATION: L('请先停用该员工，再删除误建账号', 'Desactiva primero al empleado antes de eliminar la cuenta errónea'),
     EMPLOYEE_HAS_RECORDS: L('该员工已有排班、打卡、GPS授权、申请或修正记录，只能停用，不能删除', 'Este empleado ya tiene registros. Solo se puede desactivar, no eliminar'),
     EMPLOYEE_NOT_FOUND: L('员工账号不存在，可能已被删除', 'La cuenta no existe o ya fue eliminada'),
     EMPLOYEE_DELETE_FAILED: L('账号删除失败，请确认该员工没有任何正式记录', 'No se pudo eliminar. Comprueba que no tenga registros oficiales'),
     DEVICE_DISABLED: L('此店铺电脑未授权或已停用', 'Este ordenador no está autorizado'),
+    DEVICE_DENIED: L('此电脑凭证不正确，请由VIVI重新绑定', 'La credencial de este ordenador no es válida. VIVI debe vincularlo de nuevo'),
+    DEVICE_REQUIRED: L('此电脑尚未绑定店铺', 'Este ordenador todavía no está vinculado'),
+    REQUEST_ALREADY_REVIEWED: L('该申请已处理，请刷新查看最新状态', 'La solicitud ya fue revisada. Actualiza para ver el estado'),
+    RECORD_NOT_FOUND: L('记录不存在或已发生变化，请刷新后重试', 'El registro no existe o ha cambiado. Actualiza e inténtalo de nuevo'),
+    UNAUTHENTICATED: L('登录已过期，请重新登录', 'La sesión ha caducado. Inicia sesión de nuevo'),
+    SESSION_EXPIRED: L('登录已过期，请重新登录', 'La sesión ha caducado. Inicia sesión de nuevo'),
+    FORBIDDEN: L('当前账号没有执行此操作的权限', 'Esta cuenta no tiene permiso para realizar esta acción'),
+    NETWORK_ERROR: L('无法连接服务器，请检查网络后重试', 'No se pudo conectar con el servidor. Comprueba la red'),
+    REQUEST_TIMEOUT: L('服务器响应超时，请稍后重试', 'El servidor tardó demasiado. Inténtalo de nuevo'),
+    INVALID_SERVER_RESPONSE: L('服务器返回异常，请刷新后重试', 'Respuesta no válida del servidor. Actualiza e inténtalo de nuevo'),
+    DATA_LOAD_FAILED: L('数据加载失败，请检查网络并刷新', 'No se pudieron cargar los datos. Comprueba la red y actualiza'),
+    OPERATION_FAILED: L('操作未完成，请刷新后重试', 'La operación no se completó. Actualiza e inténtalo de nuevo'),
   };
   const normalized = code.toUpperCase().replace(/\s+/g, '_');
-  return messages[normalized] || code;
+  if (messages[normalized]) return messages[normalized];
+  if (/FAILED TO (SEND|FETCH)|FAILED TO FETCH|NETWORK|LOAD FAILED/i.test(code)) return messages.NETWORK_ERROR;
+  if (/JWT|TOKEN.*EXPIRED|SESSION.*EXPIRED/i.test(code)) return messages.SESSION_EXPIRED;
+  if (/DUPLICATE|ALREADY (REGISTERED|EXISTS)|UNIQUE CONSTRAINT/i.test(code)) return L('手机号已存在，请检查是否重复创建', 'El teléfono ya existe. Comprueba si la cuenta está duplicada');
+  if (normalized.startsWith('INVALID_')) return messages.INVALID_INPUT;
+  console.error('Unhandled application error:', error);
+  return messages.OPERATION_FAILED;
+}
+
+function normalizedErrorCode(error) {
+  return String(error?.code || error?.message || error?.error || error || 'UNKNOWN_ERROR').toUpperCase().replace(/\s+/g, '_');
+}
+
+function forgetKioskIfInvalid(error) {
+  const code = normalizedErrorCode(error);
+  if (!['DEVICE_DISABLED', 'DEVICE_DENIED', 'DEVICE_REQUIRED'].includes(code)) return false;
+  localStorage.removeItem(KIOSK_STORAGE);
+  state.kiosk = null;
+  return true;
 }
 
 function normalizePhone(value) {
@@ -234,80 +283,154 @@ function bindAuth() {
 
 async function login(event) {
   event.preventDefault();
-  const desiredRole = event.currentTarget.dataset.role;
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  if (button.disabled) return;
+  button.disabled = true;
+  const desiredRole = form.dataset.role;
   const status = $('#authStatus');
   status.textContent = L('正在登录…', 'Iniciando sesión…');
-  const { data, error } = await client.auth.signInWithPassword({
-    email: loginEmailFromPhone($('#loginPhone').value),
-    password: $('#loginPassword').value,
-  });
-  if (error) { status.textContent = errorText(error); return; }
-  const profile = await loadProfile(data.user.id);
-  if (!profile || !profile.active || (desiredRole === 'manager' && profile.role !== 'manager') || (desiredRole === 'employee' && profile.role !== 'employee')) {
-    await client.auth.signOut();
-    status.textContent = desiredRole === 'manager' ? L('此账号不是VIVI管理员', 'Esta cuenta no es administradora') : L('此账号不是员工账号', 'Esta cuenta no es de empleado');
-    return;
+  try {
+    const { data, error } = await client.auth.signInWithPassword({
+      email: loginEmailFromPhone($('#loginPhone').value),
+      password: $('#loginPassword').value,
+    });
+    if (error) throw error;
+    const profile = await loadProfile(data.user.id);
+    if (!profile || !profile.active || (desiredRole === 'manager' && profile.role !== 'manager') || (desiredRole === 'employee' && profile.role !== 'employee')) {
+      await client.auth.signOut();
+      status.textContent = desiredRole === 'manager' ? L('此账号不是VIVI管理员', 'Esta cuenta no es administradora') : L('此账号不是员工账号', 'Esta cuenta no es de empleado');
+      return;
+    }
+    state.session = data.session; state.profile = profile; state.view = 'home';
+    await loadPortalData(); renderPortal();
+  } catch (error) {
+    if (state.profile) {
+      state.session = null; state.profile = null; state.data = {};
+      await client.auth.signOut().catch(() => {});
+    }
+    status.textContent = errorText(error);
+  } finally {
+    button.disabled = false;
   }
-  state.session = data.session; state.profile = profile; state.view = 'home';
-  await loadPortalData(); renderPortal();
 }
 
 async function loadProfile(userId) {
   const { data, error } = await client.from('profiles').select('*, stores(id,name,address)').eq('user_id', userId).single();
-  if (error) { toast(errorText(error), true); return null; }
+  if (error) {
+    console.error('Profile load failed:', error);
+    throw new Error('DATA_LOAD_FAILED');
+  }
   return data;
 }
 
 async function startKioskConfiguration(event) {
   event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  if (button.disabled) return;
+  button.disabled = true;
   const status = $('#authStatus');
   status.textContent = L('正在验证VIVI身份…', 'Verificando a VIVI…');
-  const { data, error } = await client.auth.signInWithPassword({
-    email: loginEmailFromPhone($('#kioskManagerPhone').value),
-    password: $('#kioskManagerPassword').value,
-  });
-  if (error) { status.textContent = errorText(error); return; }
-  const profile = await loadProfile(data.user.id);
-  if (profile?.role !== 'manager' || !profile.active) {
-    await client.auth.signOut(); status.textContent = L('只有VIVI可以配置店铺电脑', 'Solo VIVI puede configurar el ordenador'); return;
+  try {
+    const { data, error } = await client.auth.signInWithPassword({
+      email: loginEmailFromPhone($('#kioskManagerPhone').value),
+      password: $('#kioskManagerPassword').value,
+    });
+    if (error) throw error;
+    const profile = await loadProfile(data.user.id);
+    if (profile?.role !== 'manager' || !profile.active) {
+      await client.auth.signOut(); status.textContent = L('只有VIVI可以配置店铺电脑', 'Solo VIVI puede configurar el ordenador'); return;
+    }
+    const { data: stores, error: storeError } = await client.from('stores').select('*').eq('active', true).order('name');
+    if (storeError) throw new Error('DATA_LOAD_FAILED');
+    if (!stores?.length) throw new Error('STORE_NOT_FOUND');
+    $('#entryContent').innerHTML = `<form id="finishKioskSetup" class="stack-form">
+      <label>${L('绑定店铺', 'Tienda vinculada')}<select id="kioskStore">${stores.map((store) => `<option value="${store.id}">${escapeHTML(store.name)}</option>`).join('')}</select></label>
+      <label>${L('电脑名称', 'Nombre del ordenador')}<input id="kioskName" value="${L('店铺收银电脑', 'Ordenador de caja')}" required minlength="2"></label>
+      <button class="primary-btn" type="submit">${L('完成绑定', 'Completar vinculación')}</button>
+    </form>`;
+    $('#finishKioskSetup').addEventListener('submit', finishKioskConfiguration);
+    status.textContent = '';
+  } catch (error) {
+    await client.auth.signOut().catch(() => {});
+    state.session = null;
+    state.profile = null;
+    status.textContent = errorText(error);
+  } finally {
+    button.disabled = false;
   }
-  const { data: stores, error: storeError } = await client.from('stores').select('*').eq('active', true).order('name');
-  if (storeError) { status.textContent = errorText(storeError); return; }
-  $('#entryContent').innerHTML = `<form id="finishKioskSetup" class="stack-form">
-    <label>${L('绑定店铺', 'Tienda vinculada')}<select id="kioskStore">${stores.map((store) => `<option value="${store.id}">${escapeHTML(store.name)}</option>`).join('')}</select></label>
-    <label>${L('电脑名称', 'Nombre del ordenador')}<input id="kioskName" value="${L('店铺收银电脑', 'Ordenador de caja')}" required minlength="2"></label>
-    <button class="primary-btn" type="submit">${L('完成绑定', 'Completar vinculación')}</button>
-  </form>`;
-  $('#finishKioskSetup').addEventListener('submit', finishKioskConfiguration);
-  status.textContent = '';
 }
 
 async function finishKioskConfiguration(event) {
   event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  if (button.disabled) return;
+  button.disabled = true;
   const status = $('#authStatus');
   status.textContent = L('正在生成此电脑的独立凭证…', 'Creando credencial del ordenador…');
-  const storeId = $('#kioskStore').value;
-  const { data, error } = await client.functions.invoke('admin-api', { body: { action: 'create_kiosk', storeId, name: $('#kioskName').value } });
-  if (error || data?.error) { status.textContent = errorText(data?.error || error); return; }
-  const { data: store } = await client.from('stores').select('name').eq('id', storeId).single();
-  state.kiosk = { deviceId: data.deviceId, deviceSecret: data.deviceSecret, storeName: store?.name || '' };
-  localStorage.setItem(KIOSK_STORAGE, JSON.stringify(state.kiosk));
-  await client.auth.signOut(); state.session = null; state.profile = null;
-  openKiosk();
+  try {
+    const storeId = $('#kioskStore').value;
+    const result = await adminAction({ action: 'create_kiosk', storeId, name: $('#kioskName').value });
+    const { data: store } = await client.from('stores').select('name').eq('id', storeId).maybeSingle();
+    state.kiosk = { deviceId: result.deviceId, deviceSecret: result.deviceSecret, storeName: store?.name || '' };
+    localStorage.setItem(KIOSK_STORAGE, JSON.stringify(state.kiosk));
+    await client.auth.signOut(); state.session = null; state.profile = null;
+    await openKiosk();
+  } catch (error) {
+    status.textContent = errorText(error);
+  } finally {
+    button.disabled = false;
+  }
 }
 
-async function rawFunction(name, body) {
-  const response = await fetch(`${config.supabaseUrl}/functions/v1/${name}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', apikey: config.supabasePublishableKey },
-    body: JSON.stringify(body),
-  });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw Object.assign(new Error(result.error || `HTTP_${response.status}`), result);
+async function functionRequest(name, body, { authenticated = false, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+  const headers = { 'Content-Type': 'application/json', apikey: config.supabasePublishableKey };
+  if (authenticated) {
+    const { data, error } = await client.auth.getSession();
+    const accessToken = data?.session?.access_token;
+    if (error || !accessToken) throw new Error('SESSION_EXPIRED');
+    headers.Authorization = `Bearer ${accessToken}`;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(`${config.supabaseUrl}/functions/v1/${name}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+  } catch (error) {
+    throw new Error(error?.name === 'AbortError' ? 'REQUEST_TIMEOUT' : 'NETWORK_ERROR');
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const responseText = await response.text().catch(() => '');
+  let result = {};
+  if (responseText) {
+    try { result = JSON.parse(responseText); }
+    catch { throw new Error('INVALID_SERVER_RESPONSE'); }
+  }
+  if (!response.ok || result?.error) {
+    const requestError = new Error(result?.error || `HTTP_${response.status}`);
+    Object.assign(requestError, { status: response.status, detail: result?.detail, recordCounts: result?.recordCounts });
+    throw requestError;
+  }
   return result;
 }
 
+async function rawFunction(name, body) {
+  return functionRequest(name, body);
+}
+
 async function openKiosk() {
+  clearTimeout(kioskResetTimer);
   if (!state.kiosk) { state.entry = 'kiosk'; renderAuth(); return; }
   state.kioskSuccess = null; state.kioskSelected = null;
   app.innerHTML = `<div class="boot"><span class="brand-mark">H</span><p>${L('正在加载今日员工…', 'Cargando empleados de hoy…')}</p></div>`;
@@ -316,13 +439,21 @@ async function openKiosk() {
     state.kioskEmployees = result.employees || []; state.kioskStore = result.store;
     renderKiosk();
   } catch (error) {
-    localStorage.removeItem(KIOSK_STORAGE); state.kiosk = null;
+    forgetKioskIfInvalid(error);
     toast(errorText(error), true); renderAuth();
   }
 }
 
 function eventLabel(type) {
   return ({ clock_in: L('上班', 'Entrada'), break_start: L('开始休息', 'Inicio pausa'), break_end: L('结束休息', 'Fin pausa'), clock_out: L('下班', 'Salida') })[type] || type;
+}
+
+function nextActionsFromRecord(record) {
+  if (!record?.clock_in) return ['clock_in'];
+  if (record.clock_out) return [];
+  if (record.break_start && !record.break_end) return ['break_end'];
+  if (!record.break_start) return ['break_start', 'clock_out'];
+  return ['clock_out'];
 }
 
 function renderKiosk() {
@@ -349,7 +480,7 @@ function renderEmployeeChoices(employees, selected) {
 }
 
 function bindKiosk() {
-  $('#exitKiosk')?.addEventListener('click', renderAuth);
+  $('#exitKiosk')?.addEventListener('click', () => { clearTimeout(kioskResetTimer); renderAuth(); });
   $('#kioskRefresh')?.addEventListener('click', openKiosk);
   $('#employeeSearch')?.addEventListener('input', (event) => {
     const term = event.target.value.trim().toLowerCase();
@@ -376,14 +507,39 @@ async function kioskPunch(eventType) {
     const result = await rawFunction('kiosk-punch', { action: 'punch', ...state.kiosk, employeeId: state.kioskSelected, pin, eventType });
     state.kioskSuccess = { name: result.employee.name, eventType, occurredAt: result.event.occurredAt };
     renderKiosk();
-    setTimeout(() => openKiosk(), 5000);
-  } catch (error) { toast(errorText(error), true); $('#kioskPin').value = ''; $('#kioskPin').focus(); }
+    kioskResetTimer = setTimeout(() => openKiosk(), 5000);
+  } catch (error) {
+    if (forgetKioskIfInvalid(error)) { toast(errorText(error), true); renderAuth(); return; }
+    toast(errorText(error), true);
+    const pinInput = $('#kioskPin');
+    if (pinInput) { pinInput.value = ''; pinInput.focus(); }
+  }
   finally { state.busy = false; }
 }
 
 async function loadPortalData() {
   if (!state.profile) return;
   if (state.profile.role === 'manager') await loadManagerData(); else await loadEmployeeData();
+}
+
+function assertQueryResults(results) {
+  const failed = results.find((result) => result?.error);
+  if (!failed) return;
+  console.error('Supabase data query failed:', failed.error);
+  throw new Error('DATA_LOAD_FAILED');
+}
+
+async function checkSystemHealth() {
+  const functionNames = ['admin-api', 'kiosk-punch', 'gps-punch'];
+  const checks = await Promise.all(functionNames.map(async (name) => {
+    try {
+      const result = await functionRequest(name, { action: 'health' }, { timeoutMs: 8_000 });
+      return { name, ok: result?.release === APP_RELEASE, release: result?.release || '' };
+    } catch (error) {
+      return { name, ok: false, error: errorText(error) };
+    }
+  }));
+  state.health = checks;
 }
 
 async function loadEmployeeData() {
@@ -397,8 +553,7 @@ async function loadEmployeeData() {
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(50),
     client.from('gps_permissions').select('*, stores(name,address,latitude,longitude,radius_m)').eq('active', true).lte('valid_from', now).gte('valid_until', now).order('valid_until'),
   ]);
-  const firstError = [stores, schedules, attendance, requests, permissions].find((result) => result.error)?.error;
-  if (firstError) toast(errorText(firstError), true);
+  assertQueryResults([stores, schedules, attendance, requests, permissions]);
   state.data = { stores: stores.data || [], schedules: schedules.data || [], attendance: attendance.data || [], requests: requests.data || [], permissions: permissions.data || [] };
 }
 
@@ -413,14 +568,13 @@ async function loadManagerData() {
     client.from('schedules').select('*, stores(name)').gte('work_date', today).lte('work_date', addDays(today, 14)).order('work_date'),
     client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(100),
-    client.from('gps_permissions').select('*, stores(name)').gte('valid_until', new Date().toISOString()).order('valid_until'),
+    client.from('gps_permissions').select('*, stores(name)').eq('active', true).gte('valid_until', new Date().toISOString()).order('valid_until'),
     client.from('kiosk_devices').select('*, stores(name)').order('created_at', { ascending: false }),
     client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
     client.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(100),
   ]);
   const results = [stores, employees, schedules, events, requests, permissions, devices, attendance, audits];
-  const firstError = results.find((result) => result.error)?.error;
-  if (firstError) toast(errorText(firstError), true);
+  assertQueryResults(results);
   const employeeById = new Map((employees.data || []).map((employee) => [employee.user_id, employee]));
   const attachEmployee = (items) => (items || []).map((item) => ({ ...item, profiles: employeeById.get(item.employee_id) || null }));
   state.data = {
@@ -434,6 +588,7 @@ async function loadManagerData() {
     attendance: attendance.data || [],
     audits: audits.data || [],
   };
+  await checkSystemHealth();
 }
 
 function navItems() {
@@ -453,7 +608,7 @@ function renderPortal() {
     </aside>
     <main class="main-area"><header class="topbar"><div><p class="eyebrow">${state.profile.role === 'manager' ? 'VIVI · 4 STORES' : escapeHTML(state.profile.stores?.name || 'HOLA!SEVILLA')}</p><h1>${currentTitle}</h1></div><div class="top-actions">${languageButton()}<button class="ghost-btn" id="refreshData" type="button">↻</button><div class="date-chip"><b id="portalClock">${timeText(new Date())}</b><small>${madridDisplay()}</small></div></div></header>
       <section class="view">${renderPortalView()}</section></main>
-    <nav class="mobile-nav">${items.slice(0, 4).map(([view, label]) => `<button class="${state.view === view ? 'active' : ''}" data-view="${view}">${label}</button>`).join('')}</nav>
+    <nav class="mobile-nav">${items.map(([view, label]) => `<button class="${state.view === view ? 'active' : ''}" data-view="${view}" type="button">${label}</button>`).join('')}</nav>
   </div>`;
   bindPortal();
 }
@@ -469,20 +624,21 @@ function renderEmployeeHome() {
   const today = madridDate();
   const schedule = state.data.schedules.find((item) => item.work_date === today);
   const record = state.data.attendance.find((item) => item.work_date === today);
-  const permission = state.data.permissions[0];
+  const permissions = state.data.permissions || [];
   const status = record?.clock_out ? L('今日已完成', 'Jornada completada') : record?.clock_in ? L('工作进行中', 'Jornada en curso') : schedule?.is_day_off ? L('今天休息', 'Día libre') : L('等待到店', 'Pendiente de entrada');
   return `<div class="page-grid">
     <article class="card hero-card"><div><p class="eyebrow">${dateText(today)}</p><h2>${escapeHTML(state.profile.full_name)}，${status}</h2><p>${schedule ? (schedule.is_day_off ? L('排班：休息', 'Horario: descanso') : `${escapeHTML(schedule.stores?.name || '')} · ${timeText(schedule.starts_at)}—${timeText(schedule.ends_at)}`) : L('VIVI尚未发布今天的排班', 'VIVI todavía no ha publicado el horario de hoy')}</p></div><div class="hero-meta"><span>${L('手机端：查看与申请', 'Móvil: consulta y solicitudes')}</span><span>${L('普通打卡：店铺电脑', 'Fichaje normal: ordenador de tienda')}</span></div></article>
     <article class="card summary-card"><div class="metric"><span>${L('上班', 'Entrada')}</span><b>${timeText(record?.clock_in)}</b></div><div class="metric"><span>${L('休息', 'Pausa')}</span><b>${timeText(record?.break_start)}–${timeText(record?.break_end)}</b></div><div class="metric"><span>${L('下班', 'Salida')}</span><b>${timeText(record?.clock_out)}</b></div></article>
   </div>
-  ${permission ? renderGpsCard(permission, record) : `<article class="card"><p class="eyebrow">MOBILE POLICY</p><h2>${L('手机GPS打卡未启用', 'Fichaje GPS no habilitado')}</h2><p>${L('这是正常状态。特殊情况下由VIVI按员工、店铺和时间段临时授权。系统只在按下打卡时读取一次位置，不会持续追踪。', 'Es el estado normal. VIVI puede autorizarlo temporalmente por empleado, tienda y franja horaria. Solo se obtiene la ubicación al pulsar fichar; no hay seguimiento continuo.')}</p></article>`}
+  ${permissions.length ? permissions.map((permission) => renderGpsCard(permission, record)).join('') : `<article class="card"><p class="eyebrow">MOBILE POLICY</p><h2>${L('手机GPS打卡未启用', 'Fichaje GPS no habilitado')}</h2><p>${L('这是正常状态。特殊情况下由VIVI按员工、店铺和时间段临时授权。系统只在按下打卡时读取一次位置，不会持续追踪。', 'Es el estado normal. VIVI puede autorizarlo temporalmente por empleado, tienda y franja horaria. Solo se obtiene la ubicación al pulsar fichar; no hay seguimiento continuo.')}</p></article>`}
   <article class="card"><div class="section-head"><div><p class="eyebrow">NEXT 7 DAYS</p><h2>${L('近期排班', 'Próximos turnos')}</h2></div></div>${scheduleTable(state.data.schedules.filter((item) => item.work_date >= today).slice(0, 7), false)}</article>`;
 }
 
 function renderGpsCard(permission, record) {
   const used = permission.used_events || [];
-  const allowed = (permission.allowed_events || []).filter((event) => !used.includes(event));
-  return `<article class="card"><p class="eyebrow">TEMPORARY GPS AUTHORIZATION</p><h2>${L('特殊情况手机GPS打卡已授权', 'Fichaje GPS autorizado temporalmente')}</h2><p>${escapeHTML(permission.stores?.name || '')} · ${timeText(permission.valid_from)}—${timeText(permission.valid_until)}<br>${escapeHTML(permission.reason)}</p><div class="button-row">${allowed.map((event) => `<button class="primary-btn" data-gps-punch="${event}" type="button">${eventLabel(event)}</button>`).join('') || `<span class="status ok">${L('授权事件已使用', 'Eventos autorizados utilizados')}</span>`}</div><div class="callout"><b>GPS</b><span>${L('点击后浏览器只读取一次当前位置，并记录精度与距店距离。', 'Al pulsar, el navegador obtiene una sola ubicación y registra precisión y distancia.')}</span></div></article>`;
+  const nextActions = nextActionsFromRecord(record);
+  const allowed = (permission.allowed_events || []).filter((event) => !used.includes(event) && nextActions.includes(event));
+  return `<article class="card"><p class="eyebrow">TEMPORARY GPS AUTHORIZATION</p><h2>${L('特殊情况手机GPS打卡已授权', 'Fichaje GPS autorizado temporalmente')}</h2><p>${escapeHTML(permission.stores?.name || '')}<br>${madridDisplay(new Date(permission.valid_from), true)} → ${madridDisplay(new Date(permission.valid_until), true)}<br>${escapeHTML(permission.reason)}</p><div class="button-row">${allowed.map((event) => `<button class="primary-btn" data-gps-punch="${event}" type="button">${eventLabel(event)}</button>`).join('') || `<span class="status ok">${nextActions.length ? L('当前没有符合顺序的可用动作', 'No hay una acción disponible en este momento') : L('今天已经完成打卡', 'La jornada de hoy ya está completa')}</span>`}</div><div class="callout"><b>GPS</b><span>${L('点击后浏览器只读取一次当前位置，并记录精度与距店距离。', 'Al pulsar, el navegador obtiene una sola ubicación y registra precisión y distancia.')}</span></div></article>`;
 }
 
 function scheduleTable(items, showEmployee = true) {
@@ -525,7 +681,9 @@ function renderManagerHome() {
   const punched = new Set(state.data.events.filter((event) => event.event_type === 'clock_in').map((event) => event.employee_id));
   const pending = state.data.requests.filter((item) => item.status === 'pending');
   const unconfigured = state.data.stores.filter((store) => store.latitude === null || store.longitude === null);
-  return `<div class="stat-grid"><article class="stat-card"><small>${L('在职员工', 'Empleados activos')}</small><b>${active.length}</b></article><article class="stat-card"><small>${L('今日已上班打卡', 'Entradas hoy')}</small><b>${punched.size}</b></article><article class="stat-card"><small>${L('待审批', 'Pendientes')}</small><b>${pending.length}</b></article><article class="stat-card"><small>${L('GPS未配置店铺', 'Tiendas sin GPS')}</small><b>${unconfigured.length}</b></article></div>
+  const unhealthy = (state.health || []).filter((item) => !item.ok);
+  return `${unhealthy.length ? `<div class="callout warning"><b>${L('系统版本未同步', 'Versión sin sincronizar')}</b><span>${L('以下后台需要重新部署：', 'Hay que volver a desplegar:')} ${unhealthy.map((item) => escapeHTML(item.name)).join('、')}</span></div>` : `<div class="callout"><b>${L('系统正常', 'Sistema correcto')}</b><span>${L('网页、数据库与三套后台服务连接正常。', 'La web, la base de datos y los tres servicios están conectados.')}</span></div>`}
+  <div class="stat-grid"><article class="stat-card"><small>${L('在职员工', 'Empleados activos')}</small><b>${active.length}</b></article><article class="stat-card"><small>${L('今日已上班打卡', 'Entradas hoy')}</small><b>${punched.size}</b></article><article class="stat-card"><small>${L('待审批', 'Pendientes')}</small><b>${pending.length}</b></article><article class="stat-card"><small>${L('GPS未配置店铺', 'Tiendas sin GPS')}</small><b>${unconfigured.length}</b></article></div>
   ${unconfigured.length ? `<div class="callout warning"><b>${L('上线前必须完成', 'Pendiente antes de publicar')}</b><span>${L('请在“店铺设置”中填写四店准确地址、经纬度和有效范围。未配置的店铺不能使用GPS打卡。', 'Completa dirección, coordenadas y radio de las cuatro tiendas. Sin ello no se permite el fichaje GPS.')}</span></div>` : ''}
   <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日实时打卡', 'Fichajes de hoy')}</h2></div><span class="status ok">Europe/Madrid</span></div>${eventTable(state.data.events)}</article>`;
 }
@@ -535,14 +693,15 @@ function eventTable(items) {
   return `<div class="table-wrap"><table><thead><tr><th>${L('时间', 'Hora')}</th><th>${L('员工', 'Empleado')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('事件', 'Evento')}</th><th>${L('来源', 'Origen')}</th></tr></thead><tbody>${items.map((item) => `<tr><td>${timeText(item.occurred_at)}</td><td>${escapeHTML(item.profiles?.full_name || '')}</td><td>${escapeHTML(item.stores?.name || '')}</td><td>${eventLabel(item.event_type)}</td><td><span class="status ${item.source === 'gps' ? 'pending' : 'ok'}">${item.source === 'kiosk' ? L('店铺电脑', 'Ordenador') : item.source.toUpperCase()}</span></td></tr>`).join('')}</tbody></table></div>`;
 }
 
-function storeOptions(selected = '') { return state.data.stores.map((store) => `<option value="${store.id}" ${selected === store.id ? 'selected' : ''}>${escapeHTML(store.name)}</option>`).join(''); }
+function storeOptions(selected = '') { return state.data.stores.filter((store) => store.active !== false).map((store) => `<option value="${store.id}" ${selected === store.id ? 'selected' : ''}>${escapeHTML(store.name)}</option>`).join(''); }
 function employeeOptions(activeOnly = true) { return state.data.employees.filter((employee) => !activeOnly || employee.active).map((employee) => `<option value="${employee.user_id}">${escapeHTML(employee.full_name)} · ${escapeHTML(employee.employee_no)}</option>`).join(''); }
 
 function renderEmployees() {
-  return `<div class="split"><article class="card sticky-card"><p class="eyebrow">NEW EMPLOYEE</p><h2>${L('创建员工正式账号', 'Crear cuenta de empleado')}</h2><p>${L('员工不能自行注册。手机密码用于查看，6位PIN用于店铺电脑打卡。', 'El empleado no puede registrarse solo. La contraseña es para el móvil y el PIN de 6 cifras para fichar en tienda.')}</p><form id="employeeForm" class="stack-form">
+  const hasStores = state.data.stores.some((store) => store.active !== false);
+  return `<div class="split"><article class="card sticky-card"><p class="eyebrow">NEW EMPLOYEE</p><h2>${L('创建员工正式账号', 'Crear cuenta de empleado')}</h2><p>${L('员工不能自行注册。手机密码用于查看，6位PIN用于店铺电脑打卡。', 'El empleado no puede registrarse solo. La contraseña es para el móvil y el PIN de 6 cifras para fichar en tienda.')}</p>${hasStores ? `<form id="employeeForm" class="stack-form">
     <label>${L('姓名', 'Nombre completo')}<input id="employeeName" required minlength="2"></label><label>${L('手机号', 'Teléfono')}<input id="employeePhone" type="tel" placeholder="+34 600 000 000" required></label>
     <label>${L('所属店铺', 'Tienda habitual')}<select id="employeeStore">${storeOptions()}</select></label><div class="form-row"><label>${L('手机登录密码', 'Contraseña móvil')}<input id="employeePassword" type="password" minlength="8" required></label><label>${L('店铺打卡PIN', 'PIN de fichaje')}<input id="employeePin" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required></label></div>
-    <button class="primary-btn" type="submit">${L('创建员工', 'Crear empleado')}</button></form></article>
+    <button class="primary-btn" type="submit">${L('创建员工', 'Crear empleado')}</button></form>` : `<div class="callout warning"><b>${L('没有可用店铺', 'No hay tiendas disponibles')}</b><span>${L('请先检查店铺数据。', 'Comprueba primero los datos de las tiendas.')}</span></div>`}</article>
     <article class="card"><div class="section-head"><div><p class="eyebrow">TEAM</p><h2>${L('员工账号', 'Cuentas de empleados')}</h2></div><span class="status ok">${state.data.employees.filter((item) => item.active).length} ${L('人在职', 'activos')}</span></div>${employeeTable()}</article></div>`;
 }
 
@@ -553,10 +712,11 @@ function employeeTable() {
 
 function renderSchedule() {
   const today = madridDate();
-  return `<div class="split"><article class="card sticky-card"><p class="eyebrow">PUBLISH SHIFT</p><h2>${L('发布或修改排班', 'Publicar o modificar turno')}</h2><form id="scheduleForm" class="stack-form">
+  const canPublish = state.data.employees.some((employee) => employee.active) && state.data.stores.some((store) => store.active !== false);
+  return `<div class="split"><article class="card sticky-card"><p class="eyebrow">PUBLISH SHIFT</p><h2>${L('发布或修改排班', 'Publicar o modificar turno')}</h2>${canPublish ? `<form id="scheduleForm" class="stack-form">
     <label>${L('员工', 'Empleado')}<select id="scheduleEmployee">${employeeOptions()}</select></label><label>${L('工作店铺', 'Tienda')}<select id="scheduleStore">${storeOptions()}</select></label><label>${L('日期', 'Fecha')}<input id="scheduleDate" type="date" value="${today}" required></label>
     <label><span><input id="scheduleDayOff" type="checkbox" style="width:auto;min-height:auto"> ${L('当天休息', 'Día libre')}</span></label><div class="form-row"><label>${L('开始', 'Inicio')}<input id="scheduleStart" type="time" value="10:00" required></label><label>${L('结束', 'Fin')}<input id="scheduleEnd" type="time" value="17:00" required></label></div>
-    <label>${L('备注（可选）', 'Nota opcional')}<input id="scheduleNotes" maxlength="500"></label><button class="primary-btn" type="submit">${L('保存并发布', 'Guardar y publicar')}</button></form></article>
+    <label>${L('备注（可选）', 'Nota opcional')}<input id="scheduleNotes" maxlength="500"></label><button class="primary-btn" type="submit">${L('保存并发布', 'Guardar y publicar')}</button></form>` : `<div class="callout warning"><b>${L('暂时无法排班', 'No se puede publicar')}</b><span>${L('请先创建一名在职员工并确认店铺已启用。', 'Crea primero un empleado activo y comprueba que la tienda esté habilitada.')}</span></div>`}</article>
     <article class="card"><p class="eyebrow">NEXT 14 DAYS</p><h2>${L('未来排班', 'Próximos horarios')}</h2>${scheduleTable(state.data.schedules, true)}</article></div>`;
 }
 
@@ -566,11 +726,12 @@ function renderManagerRequests() {
 
 function renderGpsAdmin() {
   const today = madridDate();
-  return `<div class="split"><article class="card sticky-card"><p class="eyebrow">TEMPORARY AUTHORIZATION</p><h2>${L('授权手机GPS打卡', 'Autorizar fichaje GPS')}</h2><p>${L('只用于电脑故障、跨店或其他已确认的特殊情况。按员工、店铺、事件和时间段授权。', 'Solo para avería del ordenador, apoyo entre tiendas u otra excepción confirmada. Se limita por empleado, tienda, eventos y horario.')}</p><form id="gpsForm" class="stack-form">
+  const canGrant = state.data.employees.some((employee) => employee.active) && state.data.stores.some((store) => store.active !== false);
+  return `<div class="split"><article class="card sticky-card"><p class="eyebrow">TEMPORARY AUTHORIZATION</p><h2>${L('授权手机GPS打卡', 'Autorizar fichaje GPS')}</h2><p>${L('只用于电脑故障、跨店或其他已确认的特殊情况。按员工、店铺、事件和时间段授权。', 'Solo para avería del ordenador, apoyo entre tiendas u otra excepción confirmada. Se limita por empleado, tienda, eventos y horario.')}</p>${canGrant ? `<form id="gpsForm" class="stack-form">
     <label>${L('员工', 'Empleado')}<select id="gpsEmployee">${employeeOptions()}</select></label><label>${L('店铺', 'Tienda')}<select id="gpsStore">${storeOptions()}</select></label>
     <div class="form-row"><label>${L('开始日期时间', 'Desde')}<input id="gpsFrom" type="datetime-local" value="${today}T09:00" required></label><label>${L('结束日期时间', 'Hasta')}<input id="gpsUntil" type="datetime-local" value="${today}T23:00" required></label></div>
     <label>${L('允许事件', 'Eventos permitidos')}<select id="gpsEvents" multiple size="4"><option value="clock_in" selected>${L('上班', 'Entrada')}</option><option value="break_start" selected>${L('开始休息', 'Inicio pausa')}</option><option value="break_end" selected>${L('结束休息', 'Fin pausa')}</option><option value="clock_out" selected>${L('下班', 'Salida')}</option></select></label>
-    <label>${L('授权原因', 'Motivo')}<textarea id="gpsReason" minlength="5" required></textarea></label><button class="primary-btn" type="submit">${L('创建临时授权', 'Crear autorización')}</button></form></article>
+    <label>${L('授权原因', 'Motivo')}<textarea id="gpsReason" minlength="5" required></textarea></label><button class="primary-btn" type="submit">${L('创建临时授权', 'Crear autorización')}</button></form>` : `<div class="callout warning"><b>${L('暂时无法授权', 'No se puede autorizar')}</b><span>${L('请先创建一名在职员工并确认店铺已启用。', 'Crea primero un empleado activo y comprueba que la tienda esté habilitada.')}</span></div>`}</article>
     <article class="card"><p class="eyebrow">ACTIVE GPS</p><h2>${L('当前授权', 'Autorizaciones actuales')}</h2>${gpsPermissionTable()}</article></div>`;
 }
 
@@ -590,8 +751,9 @@ function deviceTable() {
 
 function renderExport() {
   const today = madridDate();
+  const canCorrect = state.data.employees.length > 0;
   return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">MONTHLY EXPORT</p><h2>${L('导出本月正式考勤', 'Exportar control horario mensual')}</h2><p>${L('CSV包含员工、日期、店铺、上班、休息、下班及是否审计修正，可由Excel直接打开。', 'El CSV incluye empleado, fecha, tienda, entrada, pausa, salida y correcciones auditadas; se abre directamente en Excel.')}</p></div><div><button class="primary-btn" id="exportCsv" type="button" style="background:white;color:#153f35">${L('下载CSV', 'Descargar CSV')}</button></div></article><article class="card summary-card"><p class="eyebrow">RETENTION</p><h3>${L('保存与审计', 'Conservación y auditoría')}</h3><p>${L('原始打卡事件不可修改或删除。人工修正另存，并记录VIVI、原因和时间。正式记录按西班牙要求保留4年。', 'Los eventos originales no se modifican ni eliminan. Cada corrección guarda quién, motivo y hora. Los registros oficiales se conservan 4 años.')}</p></article></div>
-  <div class="split"><article class="card sticky-card"><p class="eyebrow">AUDITED CORRECTION</p><h2>${L('人工修正考勤', 'Corrección manual')}</h2><p>${L('不会覆盖原始打卡，只会新增一条带原因和操作人的修正记录。', 'No sobrescribe el fichaje original; crea una corrección nueva con motivo y responsable.')}</p><form id="correctionForm" class="stack-form"><label>${L('员工', 'Empleado')}<select id="correctionEmployee">${employeeOptions(false)}</select></label><label>${L('日期', 'Fecha')}<input id="correctionDate" type="date" value="${today}" required></label><div class="form-row"><label>${L('上班', 'Entrada')}<input id="correctionClockIn" type="time"></label><label>${L('下班', 'Salida')}<input id="correctionClockOut" type="time"></label></div><div class="form-row"><label>${L('开始休息', 'Inicio pausa')}<input id="correctionBreakStart" type="time"></label><label>${L('结束休息', 'Fin pausa')}<input id="correctionBreakEnd" type="time"></label></div><label>${L('修正原因（必填）', 'Motivo obligatorio')}<textarea id="correctionReason" minlength="5" required></textarea></label><button class="primary-btn" type="submit">${L('保存审计修正', 'Guardar corrección')}</button></form></article><article class="card"><h2>${L('本月预览', 'Vista previa del mes')}</h2>${attendanceTable(state.data.attendance, true)}</article></div>
+  <div class="split"><article class="card sticky-card"><p class="eyebrow">AUDITED CORRECTION</p><h2>${L('人工修正考勤', 'Corrección manual')}</h2><p>${L('不会覆盖原始打卡，只会新增一条带原因和操作人的修正记录。', 'No sobrescribe el fichaje original; crea una corrección nueva con motivo y responsable.')}</p>${canCorrect ? `<form id="correctionForm" class="stack-form"><label>${L('员工', 'Empleado')}<select id="correctionEmployee">${employeeOptions(false)}</select></label><label>${L('日期', 'Fecha')}<input id="correctionDate" type="date" value="${today}" required></label><div class="form-row"><label>${L('上班', 'Entrada')}<input id="correctionClockIn" type="time"></label><label>${L('下班', 'Salida')}<input id="correctionClockOut" type="time"></label></div><div class="form-row"><label>${L('开始休息', 'Inicio pausa')}<input id="correctionBreakStart" type="time"></label><label>${L('结束休息', 'Fin pausa')}<input id="correctionBreakEnd" type="time"></label></div><label>${L('修正原因（必填）', 'Motivo obligatorio')}<textarea id="correctionReason" minlength="5" required></textarea></label><button class="primary-btn" type="submit">${L('保存审计修正', 'Guardar corrección')}</button></form>` : `<div class="callout warning"><b>${L('尚无员工账号', 'No hay empleados')}</b><span>${L('创建员工后才能新增考勤修正。', 'Crea un empleado antes de añadir una corrección.')}</span></div>`}</article><article class="card"><h2>${L('本月预览', 'Vista previa del mes')}</h2>${attendanceTable(state.data.attendance, true)}</article></div>
   <article class="card"><p class="eyebrow">AUDIT LOG</p><h2>${L('最近100条管理操作', 'Últimas 100 acciones')}</h2>${auditTable()}</article>`;
 }
 
@@ -602,7 +764,7 @@ function auditTable() {
 
 function bindPortal() {
   $('#languageToggle')?.addEventListener('click', () => setLang(state.lang === 'zh' ? 'es' : 'zh'));
-  $('#logout')?.addEventListener('click', async () => { await client.auth.signOut(); state.session = null; state.profile = null; state.data = {}; renderAuth(); });
+  $('#logout')?.addEventListener('click', logout);
   $('#refreshData')?.addEventListener('click', refreshPortal);
   $$('[data-view]').forEach((button) => button.addEventListener('click', () => { state.view = button.dataset.view; renderPortal(); }));
   $('#requestForm')?.addEventListener('submit', submitRequest);
@@ -615,69 +777,125 @@ function bindPortal() {
   $('#scheduleDayOff')?.addEventListener('change', (event) => { $('#scheduleStart').disabled = event.target.checked; $('#scheduleEnd').disabled = event.target.checked; });
   $$('[data-review]').forEach((button) => button.addEventListener('click', () => reviewRequest(button)));
   $('#gpsForm')?.addEventListener('submit', grantGps);
-  $$('[data-revoke-gps]').forEach((button) => button.addEventListener('click', () => revokeGps(button.dataset.revokeGps)));
+  $$('[data-revoke-gps]').forEach((button) => button.addEventListener('click', () => revokeGps(button)));
   $$('.store-form').forEach((form) => form.addEventListener('submit', saveStore));
   $$('[data-toggle-kiosk]').forEach((button) => button.addEventListener('click', () => toggleKiosk(button)));
   $('#exportCsv')?.addEventListener('click', exportCsv);
   $('#correctionForm')?.addEventListener('submit', saveCorrection);
 }
 
-async function refreshPortal() { await loadPortalData(); renderPortal(); toast(L('已刷新', 'Actualizado')); }
+async function logout() {
+  try { await client.auth.signOut(); }
+  catch (error) { console.error('Sign out failed:', error); }
+  state.session = null;
+  state.profile = null;
+  state.data = {};
+  state.health = null;
+  state.busy = false;
+  renderAuth();
+}
+
+async function reloadPortal() {
+  await loadPortalData();
+  renderPortal();
+}
+
+async function refreshPortal() {
+  try {
+    await reloadPortal();
+    toast(L('已刷新', 'Actualizado'));
+  } catch (error) {
+    toast(errorText(error), true);
+  }
+}
+
+async function finishMutation(successMessage) {
+  try {
+    await reloadPortal();
+    toast(successMessage);
+  } catch (error) {
+    console.error('Mutation succeeded but refresh failed:', error);
+    toast(L('操作已完成，但最新数据加载失败，请点击刷新', 'La operación terminó, pero no se pudieron actualizar los datos. Pulsa actualizar'), true);
+  }
+}
 
 async function adminAction(body) {
-  const { data, error } = await client.functions.invoke('admin-api', { body });
-  if (error || data?.error) {
-    let code = data?.error;
-    if (!code && error?.context instanceof Response) {
-      try { code = (await error.context.clone().json())?.error; } catch { /* keep the original Functions error */ }
-    }
-    throw new Error(code || error?.message || 'ADMIN_ACTION_FAILED');
-  }
-  return data;
+  return functionRequest('admin-api', body, { authenticated: true });
 }
 
 async function submitRequest(event) {
   event.preventDefault();
-  const { error } = await client.from('requests').insert({
-    employee_id: state.profile.user_id,
-    request_type: $('#requestType').value,
-    request_date: $('#requestDate').value,
-    related_time: $('#requestTime').value || null,
-    reason: $('#requestReason').value.trim(),
-  });
-  if (error) { toast(errorText(error), true); return; }
-  await refreshPortal(); toast(L('申请已提交给VIVI', 'Solicitud enviada a VIVI'));
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const { error } = await client.from('requests').insert({
+      employee_id: state.profile.user_id,
+      request_type: $('#requestType').value,
+      request_date: $('#requestDate').value,
+      related_time: $('#requestTime').value || null,
+      reason: $('#requestReason').value.trim(),
+    });
+    if (error) throw error;
+    form.reset();
+    await finishMutation(L('申请已提交给VIVI', 'Solicitud enviada a VIVI'));
+  } catch (error) {
+    toast(errorText(error), true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function gpsPunch(eventType) {
   if (!navigator.geolocation) { toast(L('此设备不支持定位', 'Este dispositivo no admite ubicación'), true); return; }
+  if (state.busy) return;
+  state.busy = true;
+  $$('[data-gps-punch]').forEach((button) => { button.disabled = true; });
   toast(L('正在读取一次当前位置…', 'Obteniendo una ubicación…'));
-  navigator.geolocation.getCurrentPosition(async (position) => {
-    const { data, error } = await client.functions.invoke('gps-punch', { body: {
+  try {
+    const position = await new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, {
+      enableHighAccuracy: true, timeout: 15_000, maximumAge: 0,
+    }));
+    const result = await functionRequest('gps-punch', {
       eventType,
       latitude: position.coords.latitude,
       longitude: position.coords.longitude,
       accuracy: position.coords.accuracy,
-    } });
-    if (error || data?.error) { toast(errorText(data?.error || error), true); return; }
-    toast(`${eventLabel(eventType)} · ${timeText(data.event.occurredAt)}`); await refreshPortal();
-  }, (error) => toast(error.message || L('无法获取位置', 'No se pudo obtener la ubicación'), true), { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
+    }, { authenticated: true });
+    await finishMutation(`${eventLabel(eventType)} · ${timeText(result.event.occurredAt)}`);
+  } catch (error) {
+    const locationError = error?.code === 1 ? 'LOCATION_PERMISSION_DENIED' : [2, 3].includes(error?.code) ? 'LOCATION_UNAVAILABLE' : error;
+    toast(errorText(locationError), true);
+  } finally {
+    state.busy = false;
+    $$('[data-gps-punch]').forEach((button) => { button.disabled = false; });
+  }
 }
 
 async function createEmployee(event) {
   event.preventDefault();
   const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  if (button.disabled) return;
+  button.disabled = true;
   try {
     await adminAction({ action: 'create_employee', fullName: $('#employeeName').value, phone: $('#employeePhone').value, storeId: $('#employeeStore').value, password: $('#employeePassword').value, pin: $('#employeePin').value, language: 'es' });
-    form.reset(); await refreshPortal(); toast(L('员工账号已创建', 'Cuenta de empleado creada'));
+    form.reset();
+    await finishMutation(L('员工账号已创建', 'Cuenta de empleado creada'));
   } catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
 }
 
 async function toggleEmployee(button) {
   const active = button.dataset.active === 'true';
   if (!confirm(active ? L('确定重新启用此员工？', '¿Reactivar este empleado?') : L('停用后员工会立即退出，确定继续？', 'El empleado cerrará sesión. ¿Continuar?'))) return;
-  try { await adminAction({ action: 'update_employee', employeeId: button.dataset.toggleEmployee, active }); await refreshPortal(); }
-  catch (error) { toast(errorText(error), true); }
+  button.disabled = true;
+  try {
+    await adminAction({ action: 'update_employee', employeeId: button.dataset.toggleEmployee, active });
+    await finishMutation(active ? L('员工账号已启用', 'Cuenta reactivada') : L('员工账号已停用', 'Cuenta desactivada'));
+  } catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
 }
 
 async function deleteEmployee(button) {
@@ -695,8 +913,7 @@ async function deleteEmployee(button) {
   button.disabled = true;
   try {
     await adminAction({ action: 'delete_employee', employeeId: employee.user_id });
-    await refreshPortal();
-    toast(L('误建员工账号已永久删除', 'La cuenta errónea se eliminó permanentemente'));
+    await finishMutation(L('误建员工账号已永久删除', 'La cuenta errónea se eliminó permanentemente'));
   } catch (error) {
     toast(errorText(error), true);
   } finally {
@@ -708,73 +925,116 @@ async function resetEmployeeCredential(button) {
   const type = button.dataset.reset;
   const value = prompt(type === 'pin' ? L('输入新的6位PIN', 'Nuevo PIN de 6 cifras') : L('输入新的手机登录密码（至少8位）', 'Nueva contraseña móvil (mínimo 8 caracteres)'));
   if (!value) return;
+  button.disabled = true;
   try { await adminAction({ action: type === 'pin' ? 'reset_pin' : 'reset_password', employeeId: button.dataset.id, [type]: value }); toast(L('已更新', 'Actualizado')); }
   catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
 }
 
 async function saveSchedule(event) {
   event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
   const dayOff = $('#scheduleDayOff').checked;
   const date = $('#scheduleDate').value;
   const start = $('#scheduleStart').value;
   const end = $('#scheduleEnd').value;
+  if (!dayOff && end <= start) { toast(errorText('INVALID_SCHEDULE_TIME'), true); return; }
+  if (button.disabled) return;
+  button.disabled = true;
   try {
     await adminAction({ action: 'upsert_schedule', employeeId: $('#scheduleEmployee').value, storeId: $('#scheduleStore').value, workDate: date, dayOff, startsAt: dayOff ? null : madridLocalToIso(date, start), endsAt: dayOff ? null : madridLocalToIso(date, end), notes: $('#scheduleNotes').value });
-    await refreshPortal(); toast(L('排班已发布', 'Horario publicado'));
+    await finishMutation(L('排班已发布', 'Horario publicado'));
   } catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
 }
 
 async function reviewRequest(button) {
   const note = prompt(button.dataset.review === 'approved' ? L('批准备注（可留空）', 'Nota de aprobación (opcional)') : L('请填写拒绝原因', 'Indica el motivo del rechazo'));
   if (button.dataset.review === 'rejected' && !note) return;
-  try { await adminAction({ action: 'review_request', requestId: button.dataset.id, status: button.dataset.review, note: note || '' }); await refreshPortal(); }
+  button.disabled = true;
+  try {
+    await adminAction({ action: 'review_request', requestId: button.dataset.id, status: button.dataset.review, note: note || '' });
+    await finishMutation(L('申请状态已更新', 'Solicitud actualizada'));
+  }
   catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
 }
 
 async function grantGps(event) {
   event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
   const from = $('#gpsFrom').value;
   const until = $('#gpsUntil').value;
   const allowedEvents = [...$('#gpsEvents').selectedOptions].map((option) => option.value);
+  if (!from || !until || until <= from) { toast(errorText('INVALID_TIME_RANGE'), true); return; }
+  if (!allowedEvents.length) { toast(errorText('NO_ALLOWED_EVENTS'), true); return; }
+  if (button.disabled) return;
+  button.disabled = true;
   try {
     await adminAction({ action: 'grant_gps', employeeId: $('#gpsEmployee').value, storeId: $('#gpsStore').value, validFrom: madridLocalToIso(from.slice(0,10), from.slice(11)), validUntil: madridLocalToIso(until.slice(0,10), until.slice(11)), allowedEvents, reason: $('#gpsReason').value });
-    await refreshPortal(); toast(L('GPS临时授权已创建', 'Autorización GPS creada'));
+    await finishMutation(L('GPS临时授权已创建', 'Autorización GPS creada'));
   } catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
 }
 
-async function revokeGps(permissionId) {
+async function revokeGps(button) {
   if (!confirm(L('确定撤销此GPS授权？', '¿Revocar esta autorización GPS?'))) return;
-  try { await adminAction({ action: 'revoke_gps', permissionId }); await refreshPortal(); }
+  button.disabled = true;
+  try {
+    await adminAction({ action: 'revoke_gps', permissionId: button.dataset.revokeGps });
+    await finishMutation(L('GPS授权已撤销', 'Autorización GPS revocada'));
+  }
   catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
 }
 
 async function saveStore(event) {
   event.preventDefault();
   const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  if (button.disabled) return;
+  button.disabled = true;
   try {
     await adminAction({ action: 'update_store', storeId: form.dataset.storeId, address: form.elements.address.value, latitude: Number(form.elements.latitude.value), longitude: Number(form.elements.longitude.value), radiusM: Number(form.elements.radius.value) });
-    await refreshPortal(); toast(L('店铺GPS已保存', 'GPS de tienda guardado'));
+    await finishMutation(L('店铺GPS已保存', 'GPS de tienda guardado'));
   } catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
 }
 
 async function toggleKiosk(button) {
   const active = button.dataset.active === 'true';
   if (!confirm(active ? L('确定启用这台电脑？', '¿Activar este ordenador?') : L('停用后此电脑将无法打卡，确定继续？', 'Este ordenador dejará de fichar. ¿Continuar?'))) return;
-  try { await adminAction({ action: 'set_kiosk_active', deviceId: button.dataset.toggleKiosk, active }); await refreshPortal(); }
+  button.disabled = true;
+  try {
+    await adminAction({ action: 'set_kiosk_active', deviceId: button.dataset.toggleKiosk, active });
+    await finishMutation(active ? L('店铺电脑已启用', 'Ordenador activado') : L('店铺电脑已停用', 'Ordenador desactivado'));
+  }
   catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
 }
 
 async function saveCorrection(event) {
   event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
   const date = $('#correctionDate').value;
   const iso = (selector) => $(selector).value ? madridLocalToIso(date, $(selector).value) : null;
   if (!$('#correctionClockIn').value && !$('#correctionClockOut').value && !$('#correctionBreakStart').value && !$('#correctionBreakEnd').value) {
     toast(L('请至少填写一个修正时间', 'Indica al menos una hora corregida'), true); return;
   }
+  const suppliedTimes = [$('#correctionClockIn').value, $('#correctionBreakStart').value, $('#correctionBreakEnd').value, $('#correctionClockOut').value].filter(Boolean);
+  if (suppliedTimes.some((value, index) => index > 0 && value <= suppliedTimes[index - 1])) {
+    toast(errorText('INVALID_TIME_RANGE'), true); return;
+  }
+  if (button.disabled) return;
+  button.disabled = true;
   try {
     await adminAction({ action: 'correct_attendance', employeeId: $('#correctionEmployee').value, workDate: date, clockIn: iso('#correctionClockIn'), breakStart: iso('#correctionBreakStart'), breakEnd: iso('#correctionBreakEnd'), clockOut: iso('#correctionClockOut'), reason: $('#correctionReason').value });
-    await refreshPortal(); toast(L('审计修正已保存，原始记录未改变', 'Corrección guardada; el original no se ha modificado'));
+    await finishMutation(L('审计修正已保存，原始记录未改变', 'Corrección guardada; el original no se ha modificado'));
   } catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
 }
 
 function csvCell(value) { return `"${String(value ?? '').replaceAll('"', '""')}"`; }
@@ -805,7 +1065,7 @@ async function initialize() {
     } else { await client.auth.signOut(); renderAuth(); }
   } else { renderAuth(); }
   client.auth.onAuthStateChange((event) => {
-    if (event === 'SIGNED_OUT') { state.session = null; state.profile = null; state.data = {}; }
+    if (event === 'SIGNED_OUT') { state.session = null; state.profile = null; state.data = {}; state.health = null; state.busy = false; }
   });
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(() => {});
 }
