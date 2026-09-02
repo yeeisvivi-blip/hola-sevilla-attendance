@@ -407,10 +407,10 @@ async function loadManagerData() {
   const [stores, employees, schedules, events, requests, permissions, devices, attendance, audits] = await Promise.all([
     client.from('stores').select('*').order('name'),
     client.from('profiles').select('*, stores(name)').eq('role', 'employee').order('full_name'),
-    client.from('schedules').select('*, profiles!schedules_employee_id_fkey(full_name,employee_no), stores(name)').gte('work_date', today).lte('work_date', addDays(today, 14)).order('work_date'),
-    client.from('attendance_events').select('*, profiles!attendance_events_employee_id_fkey(full_name,employee_no), stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
-    client.from('requests').select('*, profiles!requests_employee_id_fkey(full_name,employee_no)').order('created_at', { ascending: false }).limit(100),
-    client.from('gps_permissions').select('*, profiles!gps_permissions_employee_id_fkey(full_name), stores(name)').gte('valid_until', new Date().toISOString()).order('valid_until'),
+    client.from('schedules').select('*, stores(name)').gte('work_date', today).lte('work_date', addDays(today, 14)).order('work_date'),
+    client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
+    client.from('requests').select('*').order('created_at', { ascending: false }).limit(100),
+    client.from('gps_permissions').select('*, stores(name)').gte('valid_until', new Date().toISOString()).order('valid_until'),
     client.from('kiosk_devices').select('*, stores(name)').order('created_at', { ascending: false }),
     client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
     client.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(100),
@@ -418,7 +418,19 @@ async function loadManagerData() {
   const results = [stores, employees, schedules, events, requests, permissions, devices, attendance, audits];
   const firstError = results.find((result) => result.error)?.error;
   if (firstError) toast(errorText(firstError), true);
-  state.data = { stores: stores.data || [], employees: employees.data || [], schedules: schedules.data || [], events: events.data || [], requests: requests.data || [], permissions: permissions.data || [], devices: devices.data || [], attendance: attendance.data || [], audits: audits.data || [] };
+  const employeeById = new Map((employees.data || []).map((employee) => [employee.user_id, employee]));
+  const attachEmployee = (items) => (items || []).map((item) => ({ ...item, profiles: employeeById.get(item.employee_id) || null }));
+  state.data = {
+    stores: stores.data || [],
+    employees: employees.data || [],
+    schedules: attachEmployee(schedules.data),
+    events: attachEmployee(events.data),
+    requests: attachEmployee(requests.data),
+    permissions: attachEmployee(permissions.data),
+    devices: devices.data || [],
+    attendance: attendance.data || [],
+    audits: audits.data || [],
+  };
 }
 
 function navItems() {
