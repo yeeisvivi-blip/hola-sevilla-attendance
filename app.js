@@ -13,7 +13,6 @@ const configured = /^https:\/\/[^/]+\.supabase\.co$/.test(config.supabaseUrl || 
 const client = configured
   ? createClient(config.supabaseUrl, config.supabasePublishableKey, {
       auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
-      global: { headers: { 'x-application-name': 'hola-sevilla-attendance' } },
     })
   : null;
 
