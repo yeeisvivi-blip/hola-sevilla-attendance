@@ -656,9 +656,10 @@ async function gpsPunch(eventType) {
 
 async function createEmployee(event) {
   event.preventDefault();
+  const form = event.currentTarget;
   try {
     await adminAction({ action: 'create_employee', fullName: $('#employeeName').value, phone: $('#employeePhone').value, storeId: $('#employeeStore').value, password: $('#employeePassword').value, pin: $('#employeePin').value, language: 'es' });
-    event.currentTarget.reset(); await refreshPortal(); toast(L('员工账号已创建', 'Cuenta de empleado creada'));
+    form.reset(); await refreshPortal(); toast(L('员工账号已创建', 'Cuenta de empleado creada'));
   } catch (error) { toast(errorText(error), true); }
 }
 
