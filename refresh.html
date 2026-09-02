@@ -29,7 +29,7 @@
         const cacheNames = 'caches' in window ? await caches.keys() : [];
         await Promise.all(cacheNames.map((name) => caches.delete(name)));
         status.textContent = '更新完成，正在重新打开系统……';
-        setTimeout(() => location.replace('./?fresh=20260902-3'), 800);
+        setTimeout(() => location.replace('./?fresh=20260902-7'), 800);
       } catch (error) {
         status.className = 'error';
         status.textContent = `自动更新失败：${error instanceof Error ? error.message : String(error)}`;
