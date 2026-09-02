@@ -73,6 +73,10 @@ function errorText(error) {
     LOCATION_NOT_ACCURATE_ENOUGH: L('定位精度不足，请到开阔位置重试', 'La ubicación no es suficientemente precisa'),
     STORE_GPS_NOT_CONFIGURED: L('VIVI尚未配置该店GPS坐标', 'La tienda todavía no tiene coordenadas GPS'),
     EMPLOYEE_DISABLED: L('账号已停用，请联系VIVI', 'Cuenta desactivada. Contacta con VIVI'),
+    DELETE_REQUIRES_DEACTIVATION: L('请先停用该员工，再删除误建账号', 'Desactiva primero al empleado antes de eliminar la cuenta errónea'),
+    EMPLOYEE_HAS_RECORDS: L('该员工已有排班、打卡、GPS授权、申请或修正记录，只能停用，不能删除', 'Este empleado ya tiene registros. Solo se puede desactivar, no eliminar'),
+    EMPLOYEE_NOT_FOUND: L('员工账号不存在，可能已被删除', 'La cuenta no existe o ya fue eliminada'),
+    EMPLOYEE_DELETE_FAILED: L('账号删除失败，请确认该员工没有任何正式记录', 'No se pudo eliminar. Comprueba que no tenga registros oficiales'),
     DEVICE_DISABLED: L('此店铺电脑未授权或已停用', 'Este ordenador no está autorizado'),
   };
   const normalized = code.toUpperCase().replace(/\s+/g, '_');
@@ -545,7 +549,7 @@ function renderEmployees() {
 
 function employeeTable() {
   if (!state.data.employees.length) return `<div class="empty">${L('尚未创建员工', 'Todavía no hay empleados')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>${L('员工', 'Empleado')}</th><th>${L('手机号', 'Teléfono')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('状态', 'Estado')}</th><th>${L('操作', 'Acción')}</th></tr></thead><tbody>${state.data.employees.map((employee) => `<tr><td><b>${escapeHTML(employee.full_name)}</b><br><small>${escapeHTML(employee.employee_no)}</small></td><td>${escapeHTML(employee.phone)}</td><td>${escapeHTML(employee.stores?.name || '')}</td><td><span class="status ${employee.active ? 'ok' : 'alert'}">${employee.active ? L('在职', 'Activo') : L('停用', 'Inactivo')}</span></td><td><div class="button-row"><button class="ghost-btn" data-reset="password" data-id="${employee.user_id}">${L('改密码', 'Contraseña')}</button><button class="ghost-btn" data-reset="pin" data-id="${employee.user_id}">PIN</button><button class="${employee.active ? 'danger-btn' : 'secondary-btn'}" data-toggle-employee="${employee.user_id}" data-active="${employee.active ? 'false' : 'true'}">${employee.active ? L('停用', 'Desactivar') : L('启用', 'Activar')}</button></div></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>${L('员工', 'Empleado')}</th><th>${L('手机号', 'Teléfono')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('状态', 'Estado')}</th><th>${L('操作', 'Acción')}</th></tr></thead><tbody>${state.data.employees.map((employee) => `<tr><td><b>${escapeHTML(employee.full_name)}</b><br><small>${escapeHTML(employee.employee_no)}</small></td><td>${escapeHTML(employee.phone)}</td><td>${escapeHTML(employee.stores?.name || '')}</td><td><span class="status ${employee.active ? 'ok' : 'alert'}">${employee.active ? L('在职', 'Activo') : L('停用', 'Inactivo')}</span></td><td><div class="button-row"><button class="ghost-btn" data-reset="password" data-id="${employee.user_id}">${L('改密码', 'Contraseña')}</button><button class="ghost-btn" data-reset="pin" data-id="${employee.user_id}">PIN</button><button class="${employee.active ? 'danger-btn' : 'secondary-btn'}" data-toggle-employee="${employee.user_id}" data-active="${employee.active ? 'false' : 'true'}">${employee.active ? L('停用', 'Desactivar') : L('启用', 'Activar')}</button>${employee.active ? '' : `<button class="danger-btn" data-delete-employee="${employee.user_id}">${L('删除误建账号', 'Eliminar cuenta errónea')}</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function renderSchedule() {
@@ -606,6 +610,7 @@ function bindPortal() {
   $$('[data-gps-punch]').forEach((button) => button.addEventListener('click', () => gpsPunch(button.dataset.gpsPunch)));
   $('#employeeForm')?.addEventListener('submit', createEmployee);
   $$('[data-toggle-employee]').forEach((button) => button.addEventListener('click', () => toggleEmployee(button)));
+  $$('[data-delete-employee]').forEach((button) => button.addEventListener('click', () => deleteEmployee(button)));
   $$('[data-reset]').forEach((button) => button.addEventListener('click', () => resetEmployeeCredential(button)));
   $('#scheduleForm')?.addEventListener('submit', saveSchedule);
   $('#scheduleDayOff')?.addEventListener('change', (event) => { $('#scheduleStart').disabled = event.target.checked; $('#scheduleEnd').disabled = event.target.checked; });
@@ -622,7 +627,13 @@ async function refreshPortal() { await loadPortalData(); renderPortal(); toast(L
 
 async function adminAction(body) {
   const { data, error } = await client.functions.invoke('admin-api', { body });
-  if (error || data?.error) throw new Error(data?.error || error?.message || 'ADMIN_ACTION_FAILED');
+  if (error || data?.error) {
+    let code = data?.error;
+    if (!code && error?.context instanceof Response) {
+      try { code = (await error.context.clone().json())?.error; } catch { /* keep the original Functions error */ }
+    }
+    throw new Error(code || error?.message || 'ADMIN_ACTION_FAILED');
+  }
   return data;
 }
 
@@ -668,6 +679,30 @@ async function toggleEmployee(button) {
   if (!confirm(active ? L('确定重新启用此员工？', '¿Reactivar este empleado?') : L('停用后员工会立即退出，确定继续？', 'El empleado cerrará sesión. ¿Continuar?'))) return;
   try { await adminAction({ action: 'update_employee', employeeId: button.dataset.toggleEmployee, active }); await refreshPortal(); }
   catch (error) { toast(errorText(error), true); }
+}
+
+async function deleteEmployee(button) {
+  const employee = state.data.employees.find((item) => item.user_id === button.dataset.deleteEmployee);
+  if (!employee) { toast(errorText('EMPLOYEE_NOT_FOUND'), true); return; }
+  const enteredName = prompt(L(
+    `仅限误建且没有任何记录的账号。永久删除不可恢复。\n请输入员工姓名“${employee.full_name}”确认：`,
+    `Solo para una cuenta errónea sin registros. La eliminación es irreversible.\nEscribe “${employee.full_name}” para confirmar:`,
+  ));
+  if (enteredName === null) return;
+  if (enteredName.trim() !== employee.full_name.trim()) {
+    toast(L('姓名不一致，已取消删除', 'El nombre no coincide. Eliminación cancelada'), true);
+    return;
+  }
+  button.disabled = true;
+  try {
+    await adminAction({ action: 'delete_employee', employeeId: employee.user_id });
+    await refreshPortal();
+    toast(L('误建员工账号已永久删除', 'La cuenta errónea se eliminó permanentemente'));
+  } catch (error) {
+    toast(errorText(error), true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function resetEmployeeCredential(button) {
