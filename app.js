@@ -7,7 +7,12 @@ const config = window.HOLA_CONFIG || {};
 const MADRID_TZ = config.timezone || 'Europe/Madrid';
 const KIOSK_STORAGE = 'holaSevillaKioskV1';
 const LANG_STORAGE = 'holaSevillaLanguage';
-const APP_RELEASE = '2026.09.02.1';
+const FUNCTION_RELEASES = {
+  'admin-api': '2026.09.02.2',
+  'kiosk-punch': '2026.09.02.1',
+  'gps-punch': '2026.09.02.1',
+};
+const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
 const configured = /^https:\/\/[^/]+\.supabase\.co$/.test(config.supabaseUrl || '')
   && String(config.supabasePublishableKey || '').startsWith('sb_publishable_');
@@ -32,6 +37,8 @@ const state = {
   kioskSuccess: null,
   health: null,
   busy: false,
+  scheduleMonth: null,
+  scheduleEmployeeId: null,
 };
 
 let kioskResetTimer;
@@ -79,6 +86,8 @@ function errorText(error) {
     INVALID_TIME_RANGE: L('结束时间必须晚于开始时间', 'La hora final debe ser posterior a la inicial'),
     INVALID_WORKDATE: L('日期格式不正确，请重新选择日期', 'La fecha no es válida. Selecciónala de nuevo'),
     INVALID_SCHEDULE_TIME: L('排班结束时间必须晚于开始时间', 'El fin del turno debe ser posterior al inicio'),
+    INVALID_MONTH: L('请选择有效的排班月份', 'Selecciona un mes válido'),
+    INVALID_WEEK_PATTERN: L('请检查一周模板，每个工作日都要填写正确的店铺和时间', 'Revisa la plantilla semanal: cada día laborable necesita tienda y horario válidos'),
     INVALID_CORRECTION: L('请至少填写一个有效的修正时间', 'Indica al menos una hora válida para corregir'),
     NO_GPS_PERMISSION: L('当前没有有效的手机GPS打卡授权', 'No tienes autorización GPS vigente'),
     NO_ALLOWED_EVENTS: L('请至少选择一种允许的GPS打卡动作', 'Selecciona al menos un tipo de fichaje GPS'),
@@ -186,6 +195,26 @@ function addDays(dateString, amount) {
   const date = new Date(`${dateString}T12:00:00Z`);
   date.setUTCDate(date.getUTCDate() + amount);
   return date.toISOString().slice(0, 10);
+}
+
+function monthLastDate(monthString) {
+  const [year, month] = String(monthString).split('-').map(Number);
+  if (!year || month < 1 || month > 12) return '';
+  return new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+}
+
+function currentScheduleMonth() {
+  const current = madridDate().slice(0, 7);
+  return state.scheduleMonth || (current < SCHEDULE_START_MONTH ? SCHEDULE_START_MONTH : current);
+}
+
+function madridTimeValue(value, fallback) {
+  if (!value) return fallback;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return fallback;
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: MADRID_TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).format(date);
 }
 
 function madridLocalToIso(dateString, timeString) {
@@ -534,7 +563,7 @@ async function checkSystemHealth() {
   const checks = await Promise.all(functionNames.map(async (name) => {
     try {
       const result = await functionRequest(name, { action: 'health' }, { timeoutMs: 8_000 });
-      return { name, ok: result?.release === APP_RELEASE, release: result?.release || '' };
+      return { name, ok: result?.release === FUNCTION_RELEASES[name], release: result?.release || '' };
     } catch (error) {
       return { name, ok: false, error: errorText(error) };
     }
@@ -560,12 +589,15 @@ async function loadEmployeeData() {
 async function loadManagerData() {
   const today = madridDate();
   const monthStart = `${today.slice(0, 7)}-01`;
+  const scheduleMonth = currentScheduleMonth();
+  const scheduleStart = addDays(`${scheduleMonth}-01`, -7);
+  const scheduleEnd = monthLastDate(scheduleMonth);
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const [stores, employees, schedules, events, requests, permissions, devices, attendance, audits] = await Promise.all([
     client.from('stores').select('*').order('name'),
     client.from('profiles').select('*, stores(name)').eq('role', 'employee').order('full_name'),
-    client.from('schedules').select('*, stores(name)').gte('work_date', today).lte('work_date', addDays(today, 14)).order('work_date'),
+    client.from('schedules').select('*, stores(name)').gte('work_date', scheduleStart).lte('work_date', scheduleEnd).order('work_date'),
     client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(100),
     client.from('gps_permissions').select('*, stores(name)').eq('active', true).gte('valid_until', new Date().toISOString()).order('valid_until'),
@@ -641,9 +673,9 @@ function renderGpsCard(permission, record) {
   return `<article class="card"><p class="eyebrow">TEMPORARY GPS AUTHORIZATION</p><h2>${L('特殊情况手机GPS打卡已授权', 'Fichaje GPS autorizado temporalmente')}</h2><p>${escapeHTML(permission.stores?.name || '')}<br>${madridDisplay(new Date(permission.valid_from), true)} → ${madridDisplay(new Date(permission.valid_until), true)}<br>${escapeHTML(permission.reason)}</p><div class="button-row">${allowed.map((event) => `<button class="primary-btn" data-gps-punch="${event}" type="button">${eventLabel(event)}</button>`).join('') || `<span class="status ok">${nextActions.length ? L('当前没有符合顺序的可用动作', 'No hay una acción disponible en este momento') : L('今天已经完成打卡', 'La jornada de hoy ya está completa')}</span>`}</div><div class="callout"><b>GPS</b><span>${L('点击后浏览器只读取一次当前位置，并记录精度与距店距离。', 'Al pulsar, el navegador obtiene una sola ubicación y registra precisión y distancia.')}</span></div></article>`;
 }
 
-function scheduleTable(items, showEmployee = true) {
+function scheduleTable(items, showEmployee = true, editable = false) {
   if (!items.length) return `<div class="empty">${L('暂无排班', 'No hay horarios')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('时间', 'Horario')}</th></tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td><b>${escapeHTML(item.profiles?.full_name || '')}</b><br><small>${escapeHTML(item.profiles?.employee_no || '')}</small></td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.stores?.name || '')}</td><td>${item.is_day_off ? `<span class="status">${L('休息', 'Libre')}</span>` : `${timeText(item.starts_at)}—${timeText(item.ends_at)}`}</td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('时间', 'Horario')}</th>${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td><b>${escapeHTML(item.profiles?.full_name || '')}</b><br><small>${escapeHTML(item.profiles?.employee_no || '')}</small></td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.stores?.name || '')}</td><td>${item.is_day_off ? `<span class="status">${L('休息', 'Libre')}</span>` : `${timeText(item.starts_at)}—${timeText(item.ends_at)}`}</td>${editable ? `<td>${item.profiles?.active === false ? '—' : `<button class="ghost-btn" data-edit-schedule="${item.id}" type="button">${L('修改', 'Modificar')}</button>`}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function renderRecords() {
@@ -694,7 +726,7 @@ function eventTable(items) {
 }
 
 function storeOptions(selected = '') { return state.data.stores.filter((store) => store.active !== false).map((store) => `<option value="${store.id}" ${selected === store.id ? 'selected' : ''}>${escapeHTML(store.name)}</option>`).join(''); }
-function employeeOptions(activeOnly = true) { return state.data.employees.filter((employee) => !activeOnly || employee.active).map((employee) => `<option value="${employee.user_id}">${escapeHTML(employee.full_name)} · ${escapeHTML(employee.employee_no)}</option>`).join(''); }
+function employeeOptions(activeOnly = true, selected = '') { return state.data.employees.filter((employee) => !activeOnly || employee.active).map((employee) => `<option value="${employee.user_id}" ${selected === employee.user_id ? 'selected' : ''}>${escapeHTML(employee.full_name)} · ${escapeHTML(employee.employee_no)}</option>`).join(''); }
 
 function renderEmployees() {
   const hasStores = state.data.stores.some((store) => store.active !== false);
@@ -710,14 +742,75 @@ function employeeTable() {
   return `<div class="table-wrap"><table><thead><tr><th>${L('员工', 'Empleado')}</th><th>${L('手机号', 'Teléfono')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('状态', 'Estado')}</th><th>${L('操作', 'Acción')}</th></tr></thead><tbody>${state.data.employees.map((employee) => `<tr><td><b>${escapeHTML(employee.full_name)}</b><br><small>${escapeHTML(employee.employee_no)}</small></td><td>${escapeHTML(employee.phone)}</td><td>${escapeHTML(employee.stores?.name || '')}</td><td><span class="status ${employee.active ? 'ok' : 'alert'}">${employee.active ? L('在职', 'Activo') : L('停用', 'Inactivo')}</span></td><td><div class="button-row"><button class="ghost-btn" data-reset="password" data-id="${employee.user_id}">${L('改密码', 'Contraseña')}</button><button class="ghost-btn" data-reset="pin" data-id="${employee.user_id}">PIN</button><button class="${employee.active ? 'danger-btn' : 'secondary-btn'}" data-toggle-employee="${employee.user_id}" data-active="${employee.active ? 'false' : 'true'}">${employee.active ? L('停用', 'Desactivar') : L('启用', 'Activar')}</button>${employee.active ? '' : `<button class="danger-btn" data-delete-employee="${employee.user_id}">${L('删除误建账号', 'Eliminar cuenta errónea')}</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
 }
 
+function weekdayNames() {
+  return [
+    L('周一', 'Lunes'), L('周二', 'Martes'), L('周三', 'Miércoles'), L('周四', 'Jueves'),
+    L('周五', 'Viernes'), L('周六', 'Sábado'), L('周日', 'Domingo'),
+  ];
+}
+
+function scheduleWeekdayIndex(dateString) {
+  return (new Date(`${dateString}T12:00:00Z`).getUTCDay() + 6) % 7;
+}
+
+function selectedScheduleEmployee() {
+  const activeEmployees = state.data.employees.filter((employee) => employee.active);
+  if (!activeEmployees.some((employee) => employee.user_id === state.scheduleEmployeeId)) {
+    state.scheduleEmployeeId = activeEmployees[0]?.user_id || null;
+  }
+  return activeEmployees.find((employee) => employee.user_id === state.scheduleEmployeeId) || null;
+}
+
+function weeklyTemplateFor(employee) {
+  const employeeSchedules = state.data.schedules
+    .filter((item) => item.employee_id === employee.user_id)
+    .sort((left, right) => left.work_date.localeCompare(right.work_date));
+  const fallbackStore = employee.home_store_id || state.data.stores.find((store) => store.active !== false)?.id || '';
+  return weekdayNames().map((name, weekday) => {
+    const existing = employeeSchedules.find((item) => scheduleWeekdayIndex(item.work_date) === weekday);
+    return {
+      weekday,
+      name,
+      dayOff: existing ? Boolean(existing.is_day_off) : weekday === 6,
+      storeId: existing?.store_id || fallbackStore,
+      start: madridTimeValue(existing?.starts_at, '10:00'),
+      end: madridTimeValue(existing?.ends_at, '17:00'),
+    };
+  });
+}
+
+function renderWeeklyRows(employee) {
+  if (!employee) return '';
+  return weeklyTemplateFor(employee).map((item) => `<div class="weekly-row" data-weekday="${item.weekday}">
+    <b class="weekly-day-name">${escapeHTML(item.name)}</b>
+    <label class="inline-check"><input data-weekly-off type="checkbox" ${item.dayOff ? 'checked' : ''}> <span>${L('休息', 'Libre')}</span></label>
+    <label class="weekly-store"><span>${L('店铺', 'Tienda')}</span><select data-weekly-store>${storeOptions(item.storeId)}</select></label>
+    <label><span>${L('开始', 'Inicio')}</span><input data-weekly-start type="time" value="${item.start}" ${item.dayOff ? 'disabled' : ''} required></label>
+    <label><span>${L('结束', 'Fin')}</span><input data-weekly-end type="time" value="${item.end}" ${item.dayOff ? 'disabled' : ''} required></label>
+  </div>`).join('');
+}
+
 function renderSchedule() {
   const today = madridDate();
-  const canPublish = state.data.employees.some((employee) => employee.active) && state.data.stores.some((store) => store.active !== false);
-  return `<div class="split"><article class="card sticky-card"><p class="eyebrow">PUBLISH SHIFT</p><h2>${L('发布或修改排班', 'Publicar o modificar turno')}</h2>${canPublish ? `<form id="scheduleForm" class="stack-form">
-    <label>${L('员工', 'Empleado')}<select id="scheduleEmployee">${employeeOptions()}</select></label><label>${L('工作店铺', 'Tienda')}<select id="scheduleStore">${storeOptions()}</select></label><label>${L('日期', 'Fecha')}<input id="scheduleDate" type="date" value="${today}" required></label>
-    <label><span><input id="scheduleDayOff" type="checkbox" style="width:auto;min-height:auto"> ${L('当天休息', 'Día libre')}</span></label><div class="form-row"><label>${L('开始', 'Inicio')}<input id="scheduleStart" type="time" value="10:00" required></label><label>${L('结束', 'Fin')}<input id="scheduleEnd" type="time" value="17:00" required></label></div>
-    <label>${L('备注（可选）', 'Nota opcional')}<input id="scheduleNotes" maxlength="500"></label><button class="primary-btn" type="submit">${L('保存并发布', 'Guardar y publicar')}</button></form>` : `<div class="callout warning"><b>${L('暂时无法排班', 'No se puede publicar')}</b><span>${L('请先创建一名在职员工并确认店铺已启用。', 'Crea primero un empleado activo y comprueba que la tienda esté habilitada.')}</span></div>`}</article>
-    <article class="card"><p class="eyebrow">NEXT 14 DAYS</p><h2>${L('未来排班', 'Próximos horarios')}</h2>${scheduleTable(state.data.schedules, true)}</article></div>`;
+  const month = currentScheduleMonth();
+  const employee = selectedScheduleEmployee();
+  const canPublish = Boolean(employee) && state.data.stores.some((store) => store.active !== false);
+  const dailyDate = today.startsWith(month) ? today : `${month}-01`;
+  const visibleSchedules = state.data.schedules.filter((item) => item.employee_id === employee?.user_id && item.work_date.startsWith(month));
+  if (!canPublish) return `<article class="card"><p class="eyebrow">SCHEDULE</p><h2>${L('排班', 'Horarios')}</h2><div class="callout warning"><b>${L('暂时无法排班', 'No se puede publicar')}</b><span>${L('请先创建一名在职员工并确认店铺已启用。', 'Crea primero un empleado activo y comprueba que la tienda esté habilitada.')}</span></div></article>`;
+  return `<article class="card"><div class="section-head"><div><p class="eyebrow">WEEKLY TEMPLATE · MONTHLY SCHEDULE</p><h2>${L('发布一周模板，自动生成整月', 'Publicar una semana y generar el mes')}</h2></div><span class="status ok">${escapeHTML(month)}</span></div>
+    <p>${L('设置周一到周日的固定班次，一次生成该员工整个月的排班。休息日也请保留所属店铺。', 'Configura los turnos fijos de lunes a domingo y genera todo el mes de una vez. Mantén la tienda también en los días libres.')}</p>
+    <form id="weeklyScheduleForm" class="stack-form"><div class="form-row"><label>${L('员工', 'Empleado')}<select id="weeklyEmployee">${employeeOptions(true, employee.user_id)}</select></label><label>${L('排班月份', 'Mes')}<input id="weeklyMonth" type="month" min="${SCHEDULE_START_MONTH}" value="${month}" required></label></div>
+      <div id="weeklyRows" class="weekly-schedule">${renderWeeklyRows(employee)}</div>
+      <label>${L('整月备注（可选）', 'Nota del mes (opcional)')}<input id="weeklyNotes" maxlength="500"></label>
+      <div class="callout warning"><b>${L('覆盖提示', 'Aviso')}</b><span>${L('生成整月会覆盖该员工这个月已经发布的排班；之后仍可在下方逐日修改。', 'Al generar el mes se sobrescribe el horario ya publicado de ese empleado; después podrás modificar días concretos.')}</span></div>
+      <button class="primary-btn" type="submit">${L('生成整月排班', 'Generar horario mensual')}</button>
+    </form></article>
+    <div class="split"><article class="card sticky-card" id="singleScheduleCard"><p class="eyebrow">DAILY OVERRIDE</p><h2>${L('单日修改', 'Modificar un día')}</h2><p>${L('临时换店、换班或休息时，只修改这一天。', 'Para un cambio puntual de tienda, turno o descanso, modifica solo ese día.')}</p>
+      <form id="singleScheduleForm" class="stack-form"><label>${L('员工', 'Empleado')}<select id="singleScheduleEmployee">${employeeOptions(true, employee.user_id)}</select></label><label>${L('工作店铺', 'Tienda')}<select id="singleScheduleStore">${storeOptions(employee.home_store_id)}</select></label><label>${L('日期', 'Fecha')}<input id="singleScheduleDate" type="date" min="${SCHEDULE_START_MONTH}-01" value="${dailyDate}" required></label>
+        <label class="inline-check"><input id="singleScheduleDayOff" type="checkbox"> <span>${L('当天休息', 'Día libre')}</span></label><div class="form-row"><label>${L('开始', 'Inicio')}<input id="singleScheduleStart" type="time" value="10:00" required></label><label>${L('结束', 'Fin')}<input id="singleScheduleEnd" type="time" value="17:00" required></label></div>
+        <label>${L('备注（可选）', 'Nota opcional')}<input id="singleScheduleNotes" maxlength="500"></label><button class="primary-btn" type="submit">${L('保存单日修改', 'Guardar cambio del día')}</button></form></article>
+      <article class="card"><div class="section-head"><div><p class="eyebrow">MONTH PREVIEW</p><h2>${L('整月排班', 'Horario del mes')} · ${escapeHTML(employee.full_name)}</h2></div><span class="status">${visibleSchedules.length} ${L('天', 'días')}</span></div>${scheduleTable(visibleSchedules, true, true)}</article></div>`;
 }
 
 function renderManagerRequests() {
@@ -773,8 +866,13 @@ function bindPortal() {
   $$('[data-toggle-employee]').forEach((button) => button.addEventListener('click', () => toggleEmployee(button)));
   $$('[data-delete-employee]').forEach((button) => button.addEventListener('click', () => deleteEmployee(button)));
   $$('[data-reset]').forEach((button) => button.addEventListener('click', () => resetEmployeeCredential(button)));
-  $('#scheduleForm')?.addEventListener('submit', saveSchedule);
-  $('#scheduleDayOff')?.addEventListener('change', (event) => { $('#scheduleStart').disabled = event.target.checked; $('#scheduleEnd').disabled = event.target.checked; });
+  $('#weeklyScheduleForm')?.addEventListener('submit', saveMonthlySchedule);
+  $('#weeklyEmployee')?.addEventListener('change', changeWeeklyEmployee);
+  $('#weeklyMonth')?.addEventListener('change', changeScheduleMonth);
+  bindWeeklyRows();
+  $('#singleScheduleForm')?.addEventListener('submit', saveSingleSchedule);
+  $('#singleScheduleDayOff')?.addEventListener('change', toggleSingleScheduleTimes);
+  $$('[data-edit-schedule]').forEach((button) => button.addEventListener('click', () => editSchedule(button)));
   $$('[data-review]').forEach((button) => button.addEventListener('click', () => reviewRequest(button)));
   $('#gpsForm')?.addEventListener('submit', grantGps);
   $$('[data-revoke-gps]').forEach((button) => button.addEventListener('click', () => revokeGps(button)));
@@ -931,20 +1029,107 @@ async function resetEmployeeCredential(button) {
   finally { button.disabled = false; }
 }
 
-async function saveSchedule(event) {
+function bindWeeklyRows() {
+  $$('.weekly-row').forEach((row) => {
+    const checkbox = $('[data-weekly-off]', row);
+    checkbox?.addEventListener('change', () => {
+      $('[data-weekly-start]', row).disabled = checkbox.checked;
+      $('[data-weekly-end]', row).disabled = checkbox.checked;
+    });
+  });
+}
+
+function changeWeeklyEmployee(event) {
+  state.scheduleEmployeeId = event.target.value;
+  renderPortal();
+}
+
+async function changeScheduleMonth(event) {
+  const month = event.target.value;
+  if (!/^\d{4}-\d{2}$/.test(month) || month < SCHEDULE_START_MONTH) {
+    event.target.value = currentScheduleMonth();
+    toast(errorText('INVALID_MONTH'), true);
+    return;
+  }
+  state.scheduleMonth = month;
+  event.target.disabled = true;
+  try { await reloadPortal(); }
+  catch (error) { toast(errorText(error), true); }
+  finally { event.target.disabled = false; }
+}
+
+function toggleSingleScheduleTimes(event) {
+  $('#singleScheduleStart').disabled = event.target.checked;
+  $('#singleScheduleEnd').disabled = event.target.checked;
+}
+
+function editSchedule(button) {
+  const item = state.data.schedules.find((schedule) => String(schedule.id) === button.dataset.editSchedule);
+  if (!item) { toast(errorText('RECORD_NOT_FOUND'), true); return; }
+  const employeeInput = $('#singleScheduleEmployee');
+  if (![...employeeInput.options].some((option) => option.value === item.employee_id)) {
+    toast(errorText('EMPLOYEE_NOT_ACTIVE'), true);
+    return;
+  }
+  employeeInput.value = item.employee_id;
+  $('#singleScheduleStore').value = item.store_id;
+  $('#singleScheduleDate').value = item.work_date;
+  $('#singleScheduleDayOff').checked = Boolean(item.is_day_off);
+  $('#singleScheduleStart').value = madridTimeValue(item.starts_at, '10:00');
+  $('#singleScheduleEnd').value = madridTimeValue(item.ends_at, '17:00');
+  $('#singleScheduleNotes').value = item.notes || '';
+  $('#singleScheduleStart').disabled = Boolean(item.is_day_off);
+  $('#singleScheduleEnd').disabled = Boolean(item.is_day_off);
+  $('#singleScheduleCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  toast(L('已载入这一天，请修改后保存', 'Día cargado. Modifícalo y guarda'));
+}
+
+async function saveMonthlySchedule(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const button = form.querySelector('button[type="submit"]');
-  const dayOff = $('#scheduleDayOff').checked;
-  const date = $('#scheduleDate').value;
-  const start = $('#scheduleStart').value;
-  const end = $('#scheduleEnd').value;
+  const month = $('#weeklyMonth').value;
+  if (!/^\d{4}-\d{2}$/.test(month) || month < SCHEDULE_START_MONTH) { toast(errorText('INVALID_MONTH'), true); return; }
+  const pattern = $$('.weekly-row').map((row) => ({
+    dayOff: $('[data-weekly-off]', row).checked,
+    storeId: $('[data-weekly-store]', row).value,
+    start: $('[data-weekly-start]', row).value,
+    end: $('[data-weekly-end]', row).value,
+  }));
+  if (pattern.length !== 7 || pattern.every((item) => item.dayOff) || pattern.some((item) => !item.storeId || (!item.dayOff && (!item.start || !item.end || item.end <= item.start)))) {
+    toast(errorText('INVALID_WEEK_PATTERN'), true);
+    return;
+  }
+  const employeeId = $('#weeklyEmployee').value;
+  const employee = state.data.employees.find((item) => item.user_id === employeeId);
+  const monthLabel = new Intl.DateTimeFormat(state.lang === 'zh' ? 'zh-CN' : 'es-ES', { year: 'numeric', month: 'long', timeZone: 'UTC' }).format(new Date(`${month}-01T12:00:00Z`));
+  if (!confirm(L(
+    `将按这份周模板覆盖 ${employee?.full_name || ''} ${monthLabel} 已有排班，之后仍可改单日。确定继续？`,
+    `Se sobrescribirá el horario de ${employee?.full_name || ''} para ${monthLabel}. Después podrás modificar días concretos. ¿Continuar?`,
+  ))) return;
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const result = await adminAction({ action: 'publish_month_schedule', employeeId, month, pattern, notes: $('#weeklyNotes').value });
+    await finishMutation(L(`整月排班已生成，共${result.count}天`, `Horario mensual generado: ${result.count} días`));
+  } catch (error) { toast(errorText(error), true); }
+  finally { button.disabled = false; }
+}
+
+async function saveSingleSchedule(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const dayOff = $('#singleScheduleDayOff').checked;
+  const date = $('#singleScheduleDate').value;
+  const start = $('#singleScheduleStart').value;
+  const end = $('#singleScheduleEnd').value;
   if (!dayOff && end <= start) { toast(errorText('INVALID_SCHEDULE_TIME'), true); return; }
   if (button.disabled) return;
   button.disabled = true;
   try {
-    await adminAction({ action: 'upsert_schedule', employeeId: $('#scheduleEmployee').value, storeId: $('#scheduleStore').value, workDate: date, dayOff, startsAt: dayOff ? null : madridLocalToIso(date, start), endsAt: dayOff ? null : madridLocalToIso(date, end), notes: $('#scheduleNotes').value });
-    await finishMutation(L('排班已发布', 'Horario publicado'));
+    await adminAction({ action: 'upsert_schedule', employeeId: $('#singleScheduleEmployee').value, storeId: $('#singleScheduleStore').value, workDate: date, dayOff, startsAt: dayOff ? null : madridLocalToIso(date, start), endsAt: dayOff ? null : madridLocalToIso(date, end), notes: $('#singleScheduleNotes').value });
+    await finishMutation(L('单日排班已保存', 'Cambio del día guardado'));
   } catch (error) { toast(errorText(error), true); }
   finally { button.disabled = false; }
 }
