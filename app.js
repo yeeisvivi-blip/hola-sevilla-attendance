@@ -8,8 +8,8 @@ const MADRID_TZ = config.timezone || 'Europe/Madrid';
 const KIOSK_STORAGE = 'holaSevillaKioskV1';
 const LANG_STORAGE = 'holaSevillaLanguage';
 const FUNCTION_RELEASES = {
-  'admin-api': '2026.09.02.2',
-  'kiosk-punch': '2026.09.02.1',
+  'admin-api': '2026.09.03.1',
+  'kiosk-punch': '2026.09.03.1',
   'gps-punch': '2026.09.02.2',
 };
 const SCHEDULE_START_MONTH = '2026-09';
@@ -109,6 +109,16 @@ function errorText(error) {
     DEVICE_DISABLED: L('此店铺电脑未授权或已停用', 'Este ordenador no está autorizado'),
     DEVICE_DENIED: L('此电脑凭证不正确，请由VIVI重新绑定', 'La credencial de este ordenador no es válida. VIVI debe vincularlo de nuevo'),
     DEVICE_REQUIRED: L('此电脑尚未绑定店铺', 'Este ordenador todavía no está vinculado'),
+    CAMERA_PERMISSION_DENIED: L('必须允许摄像头权限才能完成上下班打卡', 'Debes permitir el acceso a la cámara para fichar la entrada o la salida'),
+    CAMERA_UNAVAILABLE: L('无法使用电脑摄像头，请检查摄像头后重试，或使用本人手机在店铺100米内打卡', 'No se puede usar la cámara. Compruébala o ficha con tu móvil dentro de 100 m'),
+    CAMERA_CANCELLED: L('已取消拍照，本次打卡没有提交', 'Foto cancelada. El fichaje no se ha enviado'),
+    PHOTO_REQUIRED: L('上下班打卡必须拍摄现场照片', 'La entrada y la salida requieren una foto en el momento'),
+    PHOTO_INVALID: L('现场照片无效，请重新拍摄', 'La foto no es válida. Hazla de nuevo'),
+    PHOTO_STALE: L('照片已超时，请重新拍摄', 'La foto ha caducado. Hazla de nuevo'),
+    PHOTO_TOO_LARGE: L('照片文件过大，请重新拍摄', 'La foto es demasiado grande. Hazla de nuevo'),
+    PHOTO_UPLOAD_FAILED: L('照片上传失败，本次打卡未记录，请检查网络后重试', 'No se pudo subir la foto y el fichaje no se registró. Comprueba la red'),
+    PHOTO_STORAGE_UNAVAILABLE: L('照片存储暂时不可用，本次打卡未记录', 'El almacenamiento de fotos no está disponible y el fichaje no se registró'),
+    PHOTO_NOT_FOUND: L('照片不存在或已超过30天自动删除', 'La foto no existe o se eliminó automáticamente después de 30 días'),
     REQUEST_ALREADY_REVIEWED: L('该申请已处理，请刷新查看最新状态', 'La solicitud ya fue revisada. Actualiza para ver el estado'),
     RECORD_NOT_FOUND: L('记录不存在或已发生变化，请刷新后重试', 'El registro no existe o ha cambiado. Actualiza e inténtalo de nuevo'),
     UNAUTHENTICATED: L('登录已过期，请重新登录', 'La sesión ha caducado. Inicia sesión de nuevo'),
@@ -492,8 +502,8 @@ function renderKiosk() {
   app.innerHTML = `<main class="kiosk-shell">
     <header class="kiosk-top"><div class="brand-lockup"><span class="brand-mark">H</span><span><b>HOLA!SEVILLA</b><small>${escapeHTML(state.kioskStore?.name || state.kiosk?.storeName || '')}</small></span></div><div class="kiosk-clock"><b id="kioskTime">${timeText(new Date())}</b><small>${madridDisplay()}</small></div></header>
     <section class="kiosk-card">
-      ${state.kioskSuccess ? `<div class="success-panel"><b>✓ ${escapeHTML(state.kioskSuccess.name)}</b><span>${escapeHTML(eventLabel(state.kioskSuccess.eventType))} · ${escapeHTML(timeText(state.kioskSuccess.occurredAt))}</span><p>${L('打卡已记录，系统将自动退出。', 'Fichaje registrado. La pantalla se cerrará automáticamente.')}</p></div>` : `
-        <p class="eyebrow">FICHAJE EN TIENDA</p><h1>${L('选择你的姓名', 'Elige tu nombre')}</h1><p>${L('确认姓名后输入个人6位PIN。完成后不会保留个人登录状态。', 'Después introduce tu PIN personal de 6 cifras. La sesión se cerrará al terminar.')}</p>
+      ${state.kioskSuccess ? `<div class="success-panel"><b>✓ ${escapeHTML(state.kioskSuccess.name)}</b><span>${escapeHTML(eventLabel(state.kioskSuccess.eventType))} · ${escapeHTML(timeText(state.kioskSuccess.occurredAt))}</span><p>${state.kioskSuccess.photoCaptured ? L('打卡已记录，现场照片已安全上传且不会保存在电脑中。', 'Fichaje registrado. La foto se subió de forma segura y no se guardó en el ordenador.') : L('打卡已记录，系统将自动退出。', 'Fichaje registrado. La pantalla se cerrará automáticamente.')}</p></div>` : `
+        <p class="eyebrow">FICHAJE EN TIENDA</p><h1>${L('选择你的姓名', 'Elige tu nombre')}</h1><p>${L('确认姓名后输入个人6位PIN。上班和下班会自动拍摄现场照片；照片不会保存在这台电脑中。', 'Después introduce tu PIN personal de 6 cifras. En la entrada y la salida se hará una foto automática que no se guardará en este ordenador.')}</p>
         <input id="employeeSearch" type="search" placeholder="${L('搜索姓名…', 'Buscar nombre…')}" autocomplete="off">
         <div class="employee-picker" id="employeePicker">${renderEmployeeChoices(state.kioskEmployees, selected)}</div>
         ${selected ? `<div class="pin-box"><label>${L('个人6位PIN', 'PIN personal de 6 cifras')}<input id="kioskPin" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" autofocus></label></div>
@@ -529,14 +539,94 @@ function bindEmployeeChoices() {
   }));
 }
 
+function kioskPhotoRequired(eventType) {
+  return eventType === 'clock_in' || eventType === 'clock_out';
+}
+
+function waitMs(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function captureKioskPhoto(eventType) {
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('CAMERA_UNAVAILABLE');
+  const modalRoot = $('#modalRoot');
+  let stream = null;
+  let video = null;
+  try {
+    modalRoot.innerHTML = `<section class="modal camera-modal" role="dialog" aria-modal="true" aria-labelledby="cameraTitle">
+      <div class="modal-head"><div><p class="eyebrow">LIVE PHOTO</p><h2 id="cameraTitle">${eventLabel(eventType)} · ${L('现场拍照', 'Foto en directo')}</h2></div><button class="close-btn" id="cameraCancel" type="button" aria-label="${L('取消', 'Cancelar')}">×</button></div>
+      <p>${L('请本人正对摄像头。画面将在2秒后自动拍摄，照片不会保存在电脑里。', 'Mira de frente a la cámara. La foto se hará automáticamente en 2 segundos y no se guardará en el ordenador.')}</p>
+      <div class="camera-frame"><video id="kioskCamera" autoplay muted playsinline></video><strong id="cameraCountdown">…</strong></div>
+      <p class="camera-status" id="cameraStatus">${L('正在启动摄像头…', 'Iniciando la cámara…')}</p>
+    </section>`;
+    $('#cameraCancel')?.addEventListener('click', () => { modalRoot.innerHTML = ''; });
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: false,
+      });
+    } catch (error) {
+      if (error?.name === 'NotAllowedError' || error?.name === 'SecurityError') throw new Error('CAMERA_PERMISSION_DENIED');
+      throw new Error('CAMERA_UNAVAILABLE');
+    }
+    video = $('#kioskCamera');
+    if (!video) throw new Error('CAMERA_CANCELLED');
+    video.srcObject = stream;
+    if (video.readyState < 2) {
+      await Promise.race([
+        new Promise((resolve, reject) => {
+          video.addEventListener('loadeddata', resolve, { once: true });
+          video.addEventListener('error', () => reject(new Error('CAMERA_UNAVAILABLE')), { once: true });
+        }),
+        waitMs(10_000).then(() => { throw new Error('CAMERA_UNAVAILABLE'); }),
+      ]);
+    }
+    await video.play();
+    for (const number of [2, 1]) {
+      if (!video.isConnected) throw new Error('CAMERA_CANCELLED');
+      $('#cameraCountdown').textContent = String(number);
+      $('#cameraStatus').textContent = L('请保持正对摄像头', 'Mantén la mirada hacia la cámara');
+      await waitMs(1000);
+    }
+    if (!video.isConnected || !video.videoWidth || !video.videoHeight) throw new Error('CAMERA_UNAVAILABLE');
+
+    const scale = Math.min(1, 640 / video.videoWidth, 480 / video.videoHeight);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+    const context = canvas.getContext('2d', { alpha: false });
+    if (!context) throw new Error('CAMERA_UNAVAILABLE');
+    context.translate(canvas.width, 0);
+    context.scale(-1, 1);
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const photoDataUrl = canvas.toDataURL('image/jpeg', 0.72);
+    canvas.width = 1;
+    canvas.height = 1;
+    if (!photoDataUrl.startsWith('data:image/jpeg;base64,') || photoDataUrl.length > 600_100) throw new Error('PHOTO_TOO_LARGE');
+    $('#cameraCountdown').textContent = '✓';
+    $('#cameraStatus').textContent = L('照片已拍摄，正在安全上传…', 'Foto realizada. Subiendo de forma segura…');
+    return { photoDataUrl, photoCapturedAt: new Date().toISOString() };
+  } finally {
+    stream?.getTracks().forEach((track) => track.stop());
+    if (video) video.srcObject = null;
+    if (modalRoot) modalRoot.innerHTML = '';
+  }
+}
+
 async function kioskPunch(eventType) {
   const pin = $('#kioskPin')?.value || '';
   if (!/^\d{6}$/.test(pin)) { toast(L('请输入6位PIN', 'Introduce el PIN de 6 cifras'), true); return; }
   if (state.busy) return;
   state.busy = true;
+  $$('[data-punch]').forEach((button) => { button.disabled = true; });
   try {
-    const result = await rawFunction('kiosk-punch', { action: 'punch', ...state.kiosk, employeeId: state.kioskSelected, pin, eventType });
-    state.kioskSuccess = { name: result.employee.name, eventType, occurredAt: result.event.occurredAt };
+    const photo = kioskPhotoRequired(eventType) ? await captureKioskPhoto(eventType) : null;
+    const result = await rawFunction('kiosk-punch', {
+      action: 'punch', ...state.kiosk, employeeId: state.kioskSelected, pin, eventType,
+      ...(photo || {}),
+    });
+    state.kioskSuccess = { name: result.employee.name, eventType, occurredAt: result.event.occurredAt, photoCaptured: result.photoCaptured };
     renderKiosk();
     kioskResetTimer = setTimeout(() => openKiosk(), 5000);
   } catch (error) {
@@ -545,7 +635,10 @@ async function kioskPunch(eventType) {
     const pinInput = $('#kioskPin');
     if (pinInput) { pinInput.value = ''; pinInput.focus(); }
   }
-  finally { state.busy = false; }
+  finally {
+    state.busy = false;
+    $$('[data-punch]').forEach((button) => { button.disabled = false; });
+  }
 }
 
 async function loadPortalData() {
@@ -596,7 +689,8 @@ async function loadManagerData() {
   const scheduleEnd = monthLastDate(scheduleMonth);
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
-  const [stores, employees, schedules, events, requests, permissions, devices, attendance, audits] = await Promise.all([
+  const photoStart = new Date(Date.now() - 30 * 86_400_000).toISOString();
+  const [stores, employees, schedules, events, requests, permissions, devices, attendance, audits, photoEvents] = await Promise.all([
     client.from('stores').select('*').order('name'),
     client.from('profiles').select('*, stores(name)').eq('role', 'employee').order('full_name'),
     client.from('schedules').select('*, stores(name)').gte('work_date', scheduleStart).lte('work_date', scheduleEnd).order('work_date'),
@@ -606,8 +700,11 @@ async function loadManagerData() {
     client.from('kiosk_devices').select('*, stores(name)').order('created_at', { ascending: false }),
     client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
     client.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(100),
+    client.from('attendance_events').select('id, employee_id, store_id, event_type, source, occurred_at, metadata, stores(name)')
+      .eq('source', 'kiosk').in('event_type', ['clock_in', 'clock_out']).gte('occurred_at', photoStart)
+      .order('occurred_at', { ascending: false }).limit(1500),
   ]);
-  const results = [stores, employees, schedules, events, requests, permissions, devices, attendance, audits];
+  const results = [stores, employees, schedules, events, requests, permissions, devices, attendance, audits, photoEvents];
   assertQueryResults(results);
   const employeeById = new Map((employees.data || []).map((employee) => [employee.user_id, employee]));
   const attachEmployee = (items) => (items || []).map((item) => ({ ...item, profiles: employeeById.get(item.employee_id) || null }));
@@ -621,6 +718,7 @@ async function loadManagerData() {
     devices: devices.data || [],
     attendance: attendance.data || [],
     audits: audits.data || [],
+    photoEvents: attachEmployee(photoEvents.data),
   };
   await checkSystemHealth();
 }
@@ -723,7 +821,7 @@ function requestTypeLabel(type) { return ({ missed_punch: L('补卡', 'Correcci�
 function statusLabel(status) { return ({ pending: L('待审批', 'Pendiente'), approved: L('已批准', 'Aprobada'), rejected: L('已拒绝', 'Rechazada') })[status] || status; }
 
 function renderProfile() {
-  return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>${escapeHTML(state.profile.employee_no)} · ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('在职', 'En activo') : L('停用', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article><article class="card summary-card"><p class="eyebrow">PRIVACY</p><h3>${L('数据与位置', 'Datos y ubicación')}</h3><p>${L('考勤记录按公司法定义务保存。GPS只在员工主动点击打卡时读取一次，用于确认是否在店铺100米内，不会持续追踪。', 'Los registros se conservan según la obligación legal. El GPS se obtiene una sola vez al fichar para confirmar que estás a menos de 100 m de la tienda; no hay seguimiento continuo.')}</p></article></div>`;
+  return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>${escapeHTML(state.profile.employee_no)} · ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('在职', 'En activo') : L('停用', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article><article class="card summary-card"><p class="eyebrow">PRIVACY</p><h3>${L('数据、位置与照片', 'Datos, ubicación y fotos')}</h3><p>${L('GPS只在手机打卡时读取一次，不会持续追踪。店铺电脑的上班和下班打卡会拍摄现场照片，照片直接上传至私有云端，不保存在店铺电脑，并在30天后自动删除。', 'El GPS solo se obtiene al fichar con el móvil y no realiza seguimiento continuo. En el ordenador de tienda se hace una foto en la entrada y la salida; se sube directamente al almacenamiento privado, no se guarda en el ordenador y se elimina automáticamente después de 30 días.')}</p></article></div>`;
 }
 
 function renderManagerHome() {
@@ -739,8 +837,8 @@ function renderManagerHome() {
 }
 
 function eventTable(items) {
-  if (!items.length) return `<div class="empty">${L('今天尚无打卡', 'Todavía no hay fichajes hoy')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>${L('时间', 'Hora')}</th><th>${L('员工', 'Empleado')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('事件', 'Evento')}</th><th>${L('来源', 'Origen')}</th></tr></thead><tbody>${items.map((item) => `<tr><td>${timeText(item.occurred_at)}</td><td>${escapeHTML(item.profiles?.full_name || '')}</td><td>${escapeHTML(item.stores?.name || '')}</td><td>${eventLabel(item.event_type)}</td><td><span class="status ${item.source === 'gps' ? 'pending' : 'ok'}">${item.source === 'kiosk' ? L('店铺电脑', 'Ordenador') : item.source.toUpperCase()}</span></td></tr>`).join('')}</tbody></table></div>`;
+  if (!items.length) return `<div class="empty">${L('暂无打卡记录', 'No hay fichajes')}</div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>${L('时间', 'Hora')}</th><th>${L('员工', 'Empleado')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('事件', 'Evento')}</th><th>${L('来源', 'Origen')}</th><th>${L('现场照片', 'Foto')}</th></tr></thead><tbody>${items.map((item) => `<tr><td>${timeText(item.occurred_at)}</td><td>${escapeHTML(item.profiles?.full_name || '')}</td><td>${escapeHTML(item.stores?.name || '')}</td><td>${eventLabel(item.event_type)}</td><td><span class="status ${item.source === 'gps' ? 'pending' : 'ok'}">${item.source === 'kiosk' ? L('店铺电脑', 'Ordenador') : item.source.toUpperCase()}</span></td><td>${item.metadata?.photo_path ? `<button class="ghost-btn photo-button" data-view-photo="${item.id}" type="button">${L('查看照片', 'Ver foto')}</button>` : '—'}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function storeOptions(selected = '') { return state.data.stores.filter((store) => store.active !== false).map((store) => `<option value="${store.id}" ${selected === store.id ? 'selected' : ''}>${escapeHTML(store.name)}</option>`).join(''); }
@@ -865,6 +963,7 @@ function renderExport() {
   const canCorrect = state.data.employees.length > 0;
   return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">MONTHLY EXPORT</p><h2>${L('导出本月正式考勤', 'Exportar control horario mensual')}</h2><p>${L('CSV包含员工、日期、店铺、上班、休息、下班及是否审计修正，可由Excel直接打开。', 'El CSV incluye empleado, fecha, tienda, entrada, pausa, salida y correcciones auditadas; se abre directamente en Excel.')}</p></div><div><button class="primary-btn" id="exportCsv" type="button" style="background:white;color:#153f35">${L('下载CSV', 'Descargar CSV')}</button></div></article><article class="card summary-card"><p class="eyebrow">RETENTION</p><h3>${L('保存与审计', 'Conservación y auditoría')}</h3><p>${L('原始打卡事件不可修改或删除。人工修正另存，并记录VIVI、原因和时间。正式记录按西班牙要求保留4年。', 'Los eventos originales no se modifican ni eliminan. Cada corrección guarda quién, motivo y hora. Los registros oficiales se conservan 4 años.')}</p></article></div>
   <div class="split"><article class="card sticky-card"><p class="eyebrow">AUDITED CORRECTION</p><h2>${L('人工修正考勤', 'Corrección manual')}</h2><p>${L('不会覆盖原始打卡，只会新增一条带原因和操作人的修正记录。', 'No sobrescribe el fichaje original; crea una corrección nueva con motivo y responsable.')}</p>${canCorrect ? `<form id="correctionForm" class="stack-form"><label>${L('员工', 'Empleado')}<select id="correctionEmployee">${employeeOptions(false)}</select></label><label>${L('日期', 'Fecha')}<input id="correctionDate" type="date" value="${today}" required></label><div class="form-row"><label>${L('上班', 'Entrada')}<input id="correctionClockIn" type="time"></label><label>${L('下班', 'Salida')}<input id="correctionClockOut" type="time"></label></div><div class="form-row"><label>${L('开始休息', 'Inicio pausa')}<input id="correctionBreakStart" type="time"></label><label>${L('结束休息', 'Fin pausa')}<input id="correctionBreakEnd" type="time"></label></div><label>${L('修正原因（必填）', 'Motivo obligatorio')}<textarea id="correctionReason" minlength="5" required></textarea></label><button class="primary-btn" type="submit">${L('保存审计修正', 'Guardar corrección')}</button></form>` : `<div class="callout warning"><b>${L('尚无员工账号', 'No hay empleados')}</b><span>${L('创建员工后才能新增考勤修正。', 'Crea un empleado antes de añadir una corrección.')}</span></div>`}</article><article class="card"><h2>${L('本月预览', 'Vista previa del mes')}</h2>${attendanceTable(state.data.attendance, true)}</article></div>
+  <article class="card"><div class="section-head"><div><p class="eyebrow">PHOTO EVIDENCE · 30 DAYS</p><h2>${L('最近30天电脑打卡照片', 'Fotos de fichaje de los últimos 30 días')}</h2></div><span class="status ok">${L('私有存储', 'Almacenamiento privado')}</span></div><p>${L('只有上班和下班打卡拍照。点击“查看照片”时生成短时有效链接，照片不会下载到店铺电脑。', 'Solo se fotografían la entrada y la salida. “Ver foto” crea un enlace temporal; la foto no se descarga en el ordenador de tienda.')}</p>${eventTable(state.data.photoEvents || [])}</article>
   <article class="card"><p class="eyebrow">AUDIT LOG</p><h2>${L('最近100条管理操作', 'Últimas 100 acciones')}</h2>${auditTable()}</article>`;
 }
 
@@ -896,6 +995,7 @@ function bindPortal() {
   $$('[data-revoke-gps]').forEach((button) => button.addEventListener('click', () => revokeGps(button)));
   $$('.store-form').forEach((form) => form.addEventListener('submit', saveStore));
   $$('[data-toggle-kiosk]').forEach((button) => button.addEventListener('click', () => toggleKiosk(button)));
+  $$('[data-view-photo]').forEach((button) => button.addEventListener('click', () => viewAttendancePhoto(button)));
   $('#exportCsv')?.addEventListener('click', exportCsv);
   $('#correctionForm')?.addEventListener('submit', saveCorrection);
 }
@@ -1217,6 +1317,32 @@ async function toggleKiosk(button) {
   }
   catch (error) { toast(errorText(error), true); }
   finally { button.disabled = false; }
+}
+
+async function viewAttendancePhoto(button) {
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const result = await adminAction({ action: 'attendance_photo', eventId: button.dataset.viewPhoto });
+    const event = [...(state.data.events || []), ...(state.data.photoEvents || [])]
+      .find((item) => item.id === button.dataset.viewPhoto);
+    if (!event) throw new Error('RECORD_NOT_FOUND');
+    const employeeName = event.profiles?.full_name || '';
+    const modalRoot = $('#modalRoot');
+    modalRoot.innerHTML = `<section class="modal photo-modal" role="dialog" aria-modal="true" aria-labelledby="photoTitle">
+      <div class="modal-head"><div><p class="eyebrow">ATTENDANCE PHOTO</p><h2 id="photoTitle">${escapeHTML(employeeName)} · ${eventLabel(event.event_type)}</h2></div><button class="close-btn" id="closePhoto" type="button" aria-label="${L('关闭', 'Cerrar')}">×</button></div>
+      <p>${madridDisplay(new Date(event.occurred_at), true)} · ${escapeHTML(event.stores?.name || '')}</p>
+      <img class="attendance-photo" src="${escapeHTML(result.signedUrl)}" alt="${L('员工现场打卡照片', 'Foto del fichaje del empleado')}">
+      <p class="muted">${L('照片链接仅短时间有效；照片在打卡30天后自动删除。', 'El enlace solo es válido durante un tiempo breve; la foto se elimina 30 días después del fichaje.')}</p>
+    </section>`;
+    const close = () => { modalRoot.innerHTML = ''; modalRoot.onclick = null; };
+    $('#closePhoto')?.addEventListener('click', close);
+    modalRoot.onclick = (clickEvent) => { if (clickEvent.target === modalRoot) close(); };
+  } catch (error) {
+    toast(errorText(error), true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function saveCorrection(event) {

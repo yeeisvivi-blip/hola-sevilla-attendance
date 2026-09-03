@@ -167,6 +167,15 @@ tr:last-child td { border-bottom: 0; }
 .modal-head { display: flex; justify-content: space-between; gap: 15px; }
 .modal-head h2 { margin: 0; }
 .close-btn { width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 50%; background: transparent; font-size: 20px; }
+.camera-modal { width: min(720px, 100%); text-align: center; }
+.camera-modal .modal-head { text-align: left; }
+.camera-frame { position: relative; margin: 18px auto 12px; width: min(100%, 640px); overflow: hidden; border-radius: 18px; background: #071712; aspect-ratio: 4 / 3; }
+.camera-frame video { width: 100%; height: 100%; display: block; object-fit: cover; transform: scaleX(-1); }
+.camera-frame strong { position: absolute; inset: 50% auto auto 50%; transform: translate(-50%, -50%); width: 86px; height: 86px; display: grid; place-items: center; border-radius: 50%; color: white; background: rgba(7,23,18,.68); font-size: 48px; line-height: 1; }
+.camera-status { min-height: 24px; margin: 0; color: var(--green); font-weight: 800; }
+.photo-button { white-space: nowrap; }
+.photo-modal { width: min(760px, 100%); }
+.attendance-photo { width: 100%; max-height: min(68vh, 720px); display: block; object-fit: contain; border-radius: 16px; background: #071712; }
 
 @media (max-width: 980px) {
   .auth-shell { grid-template-columns: 1fr; padding: 0; }
