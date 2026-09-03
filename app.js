@@ -693,10 +693,11 @@ async function loadManagerData() {
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const photoStart = new Date(Date.now() - 30 * 86_400_000).toISOString();
-  const [stores, employees, schedules, events, requests, permissions, devices, attendance, audits, photoEvents, annualLeave] = await Promise.all([
+  const [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents, annualLeave] = await Promise.all([
     client.from('stores').select('*').order('name'),
     client.from('profiles').select('*, stores(name)').eq('role', 'employee').order('full_name'),
     client.from('schedules').select('*, stores(name)').gte('work_date', scheduleStart).lte('work_date', scheduleEnd).order('work_date'),
+    client.from('schedules').select('*, stores(name)').eq('work_date', today).order('starts_at'),
     client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(100),
     client.from('gps_permissions').select('*, stores(name)').eq('active', true).gte('valid_until', new Date().toISOString()).order('valid_until'),
@@ -709,7 +710,7 @@ async function loadManagerData() {
     client.from('schedules').select('employee_id, work_date').eq('schedule_kind', 'annual_leave').eq('published', true)
       .gte('work_date', `${leaveYear}-01-01`).lte('work_date', `${leaveYear}-12-31`).order('work_date'),
   ]);
-  const results = [stores, employees, schedules, events, requests, permissions, devices, attendance, audits, photoEvents];
+  const results = [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents];
   assertQueryResults(results);
   const employeeById = new Map((employees.data || []).map((employee) => [employee.user_id, employee]));
   const attachEmployee = (items) => (items || []).map((item) => ({ ...item, profiles: employeeById.get(item.employee_id) || null }));
@@ -717,6 +718,7 @@ async function loadManagerData() {
     stores: stores.data || [],
     employees: employees.data || [],
     schedules: attachEmployee(schedules.data),
+    todaySchedules: attachEmployee(todaySchedules.data),
     events: attachEmployee(events.data),
     requests: attachEmployee(requests.data),
     permissions: attachEmployee(permissions.data),
@@ -848,7 +850,114 @@ function renderManagerHome() {
   return `${unhealthy.length ? `<div class="callout warning"><b>${L('系统版本未同步', 'Versión sin sincronizar')}</b><span>${L('以下后台需要重新部署：', 'Hay que volver a desplegar:')} ${unhealthy.map((item) => escapeHTML(item.name)).join('、')}</span></div>` : `<div class="callout"><b>${L('系统正常', 'Sistema correcto')}</b><span>${L('网页、数据库与三套后台服务连接正常。', 'La web, la base de datos y los tres servicios están conectados.')}</span></div>`}
   <div class="stat-grid"><article class="stat-card"><small>${L('在职员工', 'Empleados activos')}</small><b>${active.length}</b></article><article class="stat-card"><small>${L('今日已上班打卡', 'Entradas hoy')}</small><b>${punched.size}</b></article><article class="stat-card"><small>${L('待审批', 'Pendientes')}</small><b>${pending.length}</b></article><article class="stat-card"><small>${L('GPS未配置店铺', 'Tiendas sin GPS')}</small><b>${unconfigured.length}</b></article></div>
   ${unconfigured.length ? `<div class="callout warning"><b>${L('上线前必须完成', 'Pendiente antes de publicar')}</b><span>${L('请在“店铺设置”中填写四店准确地址、经纬度和有效范围。未配置的店铺不能使用GPS打卡。', 'Completa dirección, coordenadas y radio de las cuatro tiendas. Sin ello no se permite el fichaje GPS.')}</span></div>` : ''}
-  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日实时打卡', 'Fichajes de hoy')}</h2></div><span class="status ok">Europe/Madrid</span></div>${eventTable(state.data.events)}</article>`;
+  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日员工打卡汇总', 'Resumen de fichajes de hoy')}</h2><p>${L('按当天排班店铺分组，每名员工的上班、休息和下班记录集中在同一行。', 'Agrupado por la tienda programada; todos los fichajes de cada empleado aparecen en una sola fila.')}</p></div><span class="status ok">Europe/Madrid</span></div>${todayAttendanceSummary(state.data.events)}</article>`;
+}
+
+function todayAttendanceRows(events = []) {
+  const today = madridDate();
+  const scheduleSource = state.data.todaySchedules || state.data.schedules || [];
+  const schedules = scheduleSource.filter((item) => item.work_date === today && scheduleKind(item) === 'work');
+  const storeById = new Map((state.data.stores || []).map((store, index) => [store.id, { ...store, order: index }]));
+  const scheduleByEmployee = new Map(schedules.map((schedule) => [schedule.employee_id, schedule]));
+  const rows = new Map();
+
+  const ensureRow = ({ employeeId, storeId, profile, schedule }) => {
+    const resolvedStoreId = storeId || schedule?.store_id || profile?.store_id || '';
+    const key = `${employeeId || profile?.user_id || 'unknown'}::${resolvedStoreId || 'unknown'}`;
+    if (!rows.has(key)) {
+      const store = storeById.get(resolvedStoreId);
+      rows.set(key, {
+        key,
+        employeeId: employeeId || profile?.user_id || '',
+        employeeName: profile?.full_name || '',
+        employeeNo: profile?.employee_no || '',
+        storeId: resolvedStoreId,
+        storeName: store?.name || schedule?.stores?.name || '',
+        storeOrder: store?.order ?? Number.MAX_SAFE_INTEGER,
+        schedule: schedule || null,
+        events: {},
+        sources: new Set(),
+      });
+    }
+    const row = rows.get(key);
+    if (!row.schedule && schedule) row.schedule = schedule;
+    if (!row.employeeName && profile?.full_name) row.employeeName = profile.full_name;
+    if (!row.employeeNo && profile?.employee_no) row.employeeNo = profile.employee_no;
+    if (!row.storeName && schedule?.stores?.name) row.storeName = schedule.stores.name;
+    return row;
+  };
+
+  schedules.forEach((schedule) => ensureRow({
+    employeeId: schedule.employee_id,
+    storeId: schedule.store_id,
+    profile: schedule.profiles,
+    schedule,
+  }));
+
+  events.forEach((event) => {
+    const schedule = scheduleByEmployee.get(event.employee_id) || null;
+    const row = ensureRow({
+      employeeId: event.employee_id,
+      storeId: event.store_id || schedule?.store_id,
+      profile: event.profiles || schedule?.profiles,
+      schedule: event.store_id === schedule?.store_id ? schedule : null,
+    });
+    if (!row.storeName && event.stores?.name) row.storeName = event.stores.name;
+    if (event.source) row.sources.add(event.source);
+    const current = row.events[event.event_type];
+    const keepLatest = event.event_type === 'break_end' || event.event_type === 'clock_out';
+    if (!current || (keepLatest ? event.occurred_at > current.occurred_at : event.occurred_at < current.occurred_at)) {
+      row.events[event.event_type] = event;
+    }
+  });
+
+  return [...rows.values()].sort((a, b) => {
+    if (a.storeOrder !== b.storeOrder) return a.storeOrder - b.storeOrder;
+    const aStart = a.schedule?.starts_at || '99:99';
+    const bStart = b.schedule?.starts_at || '99:99';
+    return aStart.localeCompare(bStart)
+      || a.employeeName.localeCompare(b.employeeName, state.lang === 'zh' ? 'zh-CN' : 'es-ES')
+      || a.employeeNo.localeCompare(b.employeeNo);
+  });
+}
+
+function todayAttendanceStatus(row) {
+  if (row.events.clock_out) return { className: 'ok', label: L('已下班', 'Finalizado') };
+  if (row.events.break_start && !row.events.break_end) return { className: 'pending', label: L('休息中', 'En pausa') };
+  if (row.events.clock_in) return { className: 'ok', label: L('工作中', 'Trabajando') };
+  return { className: '', label: L('未上班', 'Sin entrada') };
+}
+
+function todayAttendanceSummary(events) {
+  const rows = todayAttendanceRows(events);
+  if (!rows.length) return `<div class="empty">${L('今天暂无排班和打卡记录', 'Hoy no hay horarios ni fichajes')}</div>`;
+  const groups = new Map();
+  rows.forEach((row) => {
+    const groupKey = row.storeId || row.storeName || 'unknown';
+    if (!groups.has(groupKey)) groups.set(groupKey, { name: row.storeName || L('未识别店铺', 'Tienda sin identificar'), rows: [] });
+    groups.get(groupKey).rows.push(row);
+  });
+
+  const timeCell = (event) => event ? `<b class="live-punch-time">${timeText(event.occurred_at)}</b>` : '<span class="live-punch-empty">—</span>';
+  const photoButtons = (row) => [
+    ['clock_in', L('上班照', 'Entrada')],
+    ['clock_out', L('下班照', 'Salida')],
+  ].map(([type, label]) => {
+    const event = row.events[type];
+    return event?.metadata?.photo_path
+      ? `<button class="ghost-btn photo-button" data-view-photo="${event.id}" type="button">${label}</button>`
+      : '';
+  }).filter(Boolean).join('');
+
+  return `<div class="live-store-list">${[...groups.values()].map((group) => `<section class="live-store-group">
+    <div class="live-store-head"><h3>${escapeHTML(group.name)}</h3><span>${group.rows.length} ${L('人', 'personas')}</span></div>
+    <div class="table-wrap live-summary-table"><table><thead><tr><th>${L('员工', 'Empleado')}</th><th>${L('排班', 'Horario')}</th><th>${L('上班', 'Entrada')}</th><th>${L('开始休息', 'Inicio pausa')}</th><th>${L('结束休息', 'Fin pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('当前状态', 'Estado')}</th><th>${L('方式', 'Origen')}</th><th>${L('现场照片', 'Fotos')}</th></tr></thead><tbody>${group.rows.map((row) => {
+      const status = todayAttendanceStatus(row);
+      const sources = [...row.sources].map((source) => source === 'kiosk' ? L('电脑', 'PC') : source.toUpperCase()).join(' + ');
+      const photos = photoButtons(row);
+      return `<tr><td class="live-employee"><b>${escapeHTML(row.employeeName)}</b><small>${escapeHTML(row.employeeNo)}</small></td><td>${row.schedule ? `${timeText(row.schedule.starts_at)}—${timeText(row.schedule.ends_at)}` : `<span class="status alert">${L('无排班', 'Sin horario')}</span>`}</td><td>${timeCell(row.events.clock_in)}</td><td>${timeCell(row.events.break_start)}</td><td>${timeCell(row.events.break_end)}</td><td>${timeCell(row.events.clock_out)}</td><td><span class="status ${status.className}">${status.label}</span></td><td>${sources ? `<span class="status ${row.sources.has('gps') ? 'pending' : 'ok'}">${escapeHTML(sources)}</span>` : '—'}</td><td><div class="live-photo-actions">${photos || '—'}</div></td></tr>`;
+    }).join('')}</tbody></table></div>
+  </section>`).join('')}</div>`;
 }
 
 function eventTable(items) {

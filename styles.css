@@ -112,6 +112,19 @@ tr:last-child td { border-bottom: 0; }
 .status.pending { color: #956413; background: #fff0cb; }
 .status.rejected, .status.alert { color: #9d3833; background: #fae3e1; }
 .status.annual-leave { color: #3d4f96; background: #e8ebff; }
+.live-store-list { display: grid; gap: 16px; margin-top: 18px; }
+.live-store-group { overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: #fff; }
+.live-store-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 16px; color: white; background: var(--green); }
+.live-store-head h3 { margin: 0; font-size: 16px; letter-spacing: 0; }
+.live-store-head span { color: #d8ebe3; font-size: 12px; font-weight: 800; white-space: nowrap; }
+.live-summary-table table { min-width: 1120px; }
+.live-summary-table th, .live-summary-table td { padding-top: 11px; padding-bottom: 11px; }
+.live-employee b, .live-employee small { display: block; }
+.live-employee small { margin-top: 3px; color: var(--muted); }
+.live-punch-time { font-variant-numeric: tabular-nums; }
+.live-punch-empty { color: #a6b0ac; }
+.live-photo-actions { display: flex; gap: 6px; min-width: 76px; }
+.live-photo-actions .ghost-btn { min-height: 30px; padding: 5px 8px; font-size: 11px; }
 .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
 .stat-card { padding: 18px; border: 1px solid var(--line); border-radius: 16px; background: var(--paper); }
 .stat-card small, .stat-card b { display: block; }
