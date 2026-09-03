@@ -9,7 +9,7 @@ const KIOSK_STORAGE = 'holaSevillaKioskV1';
 const LANG_STORAGE = 'holaSevillaLanguage';
 const FUNCTION_RELEASES = {
   'admin-api': '2026.09.03.1',
-  'kiosk-punch': '2026.09.03.1',
+  'kiosk-punch': '2026.09.03.2',
   'gps-punch': '2026.09.02.2',
 };
 const SCHEDULE_START_MONTH = '2026-09';
@@ -88,7 +88,7 @@ function errorText(error) {
     INVALID_SCHEDULE_TIME: L('排班结束时间必须晚于开始时间', 'El fin del turno debe ser posterior al inicio'),
     INVALID_MONTH: L('请选择有效的排班月份', 'Selecciona un mes válido'),
     INVALID_WEEK_PATTERN: L('请检查一周模板，每个工作日都要填写正确的店铺和时间', 'Revisa la plantilla semanal: cada día laborable necesita tienda y horario válidos'),
-    NO_SCHEDULE_TODAY: L('今天没有已发布的排班，不能使用手机打卡', 'No hay horario publicado para hoy. No puedes fichar con el móvil'),
+    NO_SCHEDULE_TODAY: L('今天没有已发布的排班，不能打卡', 'No hay horario publicado para hoy. No puedes fichar'),
     SCHEDULE_DAY_OFF: L('今天是排班休息日，不能打卡', 'Hoy es día libre según el horario. No puedes fichar'),
     INVALID_CORRECTION: L('请至少填写一个有效的修正时间', 'Indica al menos una hora válida para corregir'),
     NO_GPS_PERMISSION: L('当前没有有效的手机GPS打卡授权', 'No tienes autorización GPS vigente'),
@@ -516,7 +516,7 @@ function renderKiosk() {
 }
 
 function renderEmployeeChoices(employees, selected) {
-  if (!employees.length) return `<div class="empty">${L('今天此店没有可打卡员工', 'No hay empleados disponibles hoy')}</div>`;
+  if (!employees.length) return `<div class="empty">${L('今天没有排在此店的员工，请检查已发布排班', 'No hay empleados asignados hoy a esta tienda. Revisa el horario publicado')}</div>`;
   return employees.map((employee) => `<button class="employee-choice ${selected?.user_id === employee.user_id ? 'active' : ''}" type="button" data-employee="${employee.user_id}"><b>${escapeHTML(employee.full_name)}</b><small>${escapeHTML(employee.employee_no)} · ${employee.events.length ? eventLabel(employee.events.at(-1).event_type) + ' ' + timeText(employee.events.at(-1).occurred_at) : L('尚未打卡', 'Sin fichar')}</small></button>`).join('');
 }
 
