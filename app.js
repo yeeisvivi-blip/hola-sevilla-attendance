@@ -193,9 +193,26 @@ function dateText(value) {
   }).format(date);
 }
 
-function shiftDurationText(item) {
+function attendanceSchedule(item) {
+  return (state.data.schedules || []).find((schedule) => schedule.employee_id === item?.employee_id
+    && schedule.work_date === item?.work_date && scheduleKind(schedule) === 'work') || null;
+}
+
+function countedStart(item, schedule = attendanceSchedule(item)) {
+  if (!item?.clock_in) return null;
+  const clockIn = new Date(item.clock_in);
+  const scheduledStart = schedule?.starts_at ? new Date(schedule.starts_at) : null;
+  if (Number.isNaN(clockIn.getTime())) return null;
+  if (scheduledStart && !Number.isNaN(scheduledStart.getTime()) && clockIn < scheduledStart) return scheduledStart;
+  return clockIn;
+}
+
+function shiftDurationText(item, schedule = attendanceSchedule(item)) {
   if (!item?.clock_in || !item?.clock_out) return '—';
-  const minutes = Math.max(0, Math.round((new Date(item.clock_out) - new Date(item.clock_in)) / 60000));
+  const start = countedStart(item, schedule);
+  const end = new Date(item.clock_out);
+  if (!start || Number.isNaN(end.getTime()) || end < start) return '—';
+  const minutes = Math.max(0, Math.round((end - start) / 60000));
   return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`;
 }
 
@@ -671,10 +688,11 @@ async function checkSystemHealth() {
 async function loadEmployeeData() {
   const today = madridDate();
   const monthStart = `${today.slice(0, 7)}-01`;
+  const scheduleStart = monthStart < addDays(today, -7) ? monthStart : addDays(today, -7);
   const now = new Date().toISOString();
   const [stores, schedules, attendance, requests, permissions] = await Promise.all([
     client.from('stores').select('*').eq('active', true).order('name'),
-    client.from('schedules').select('*, stores(name,address)').gte('work_date', addDays(today, -7)).lte('work_date', addDays(today, 14)).order('work_date'),
+    client.from('schedules').select('*, stores(name,address)').gte('work_date', scheduleStart).lte('work_date', addDays(today, 14)).order('work_date'),
     client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(50),
     client.from('gps_permissions').select('*, stores(name,address,latitude,longitude,radius_m)').eq('active', true).lte('valid_from', now).gte('valid_until', now).order('valid_until'),
@@ -689,6 +707,8 @@ async function loadManagerData() {
   const scheduleMonth = currentScheduleMonth();
   const scheduleStart = addDays(`${scheduleMonth}-01`, -7);
   const scheduleEnd = monthLastDate(scheduleMonth);
+  const scheduleQueryStart = scheduleStart < monthStart ? scheduleStart : monthStart;
+  const scheduleQueryEnd = scheduleEnd > today ? scheduleEnd : today;
   const leaveYear = scheduleMonth.slice(0, 4);
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
@@ -696,7 +716,7 @@ async function loadManagerData() {
   const [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents, annualLeave] = await Promise.all([
     client.from('stores').select('*').order('name'),
     client.from('profiles').select('*, stores(name)').eq('role', 'employee').order('full_name'),
-    client.from('schedules').select('*, stores(name)').gte('work_date', scheduleStart).lte('work_date', scheduleEnd).order('work_date'),
+    client.from('schedules').select('*, stores(name)').gte('work_date', scheduleQueryStart).lte('work_date', scheduleQueryEnd).order('work_date'),
     client.from('schedules').select('*, stores(name)').eq('work_date', today).order('starts_at'),
     client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(100),
@@ -817,7 +837,7 @@ function renderRecords() {
 
 function attendanceTable(items, showEmployee = true) {
   if (!items.length) return `<div class="empty">${L('暂无考勤记录', 'No hay registros')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('班次时长', 'Duración')}</th><th>${L('状态', 'Estado')}</th></tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${shiftDurationText(item)}</td><td><span class="status ${item.corrected ? 'pending' : 'ok'}">${item.corrected ? L('已审计修正', 'Corregido') : L('原始记录', 'Original')}</span></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效在岗', 'Presencia computada')}</th><th>${L('状态', 'Estado')}</th></tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${shiftDurationText(item)}</td><td><span class="status ${item.corrected ? 'pending' : 'ok'}">${item.corrected ? L('已审计修正', 'Corregido') : L('原始记录', 'Original')}</span></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function renderEmployeeRequests() {
@@ -1504,8 +1524,11 @@ async function saveCorrection(event) {
 
 function csvCell(value) { return `"${String(value ?? '').replaceAll('"', '""')}"`; }
 function exportCsv() {
-  const header = ['employee_no', 'employee', 'date', 'store', 'clock_in', 'break_start', 'break_end', 'clock_out', 'shift_duration', 'break_duration', 'corrected', 'correction_reason'];
-  const rows = state.data.attendance.map((item) => [item.employee_no, item.employee_name, item.work_date, item.store_name, timeText(item.clock_in), timeText(item.break_start), timeText(item.break_end), timeText(item.clock_out), shiftDurationText(item), breakDurationText(item), item.corrected ? 'YES' : 'NO', item.correction_reason || '']);
+  const header = ['employee_no', 'employee', 'date', 'store', 'clock_in_raw', 'scheduled_start', 'counted_start', 'break_start', 'break_end', 'clock_out', 'counted_presence', 'break_duration', 'corrected', 'correction_reason'];
+  const rows = state.data.attendance.map((item) => {
+    const schedule = attendanceSchedule(item);
+    return [item.employee_no, item.employee_name, item.work_date, item.store_name, timeText(item.clock_in), timeText(schedule?.starts_at), timeText(countedStart(item, schedule)), timeText(item.break_start), timeText(item.break_end), timeText(item.clock_out), shiftDurationText(item, schedule), breakDurationText(item), item.corrected ? 'YES' : 'NO', item.correction_reason || ''];
+  });
   const csv = '\uFEFF' + [header, ...rows].map((row) => row.map(csvCell).join(';')).join('\r\n');
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
   const link = document.createElement('a'); link.href = url; link.download = `HOLA_SEVILLA_attendance_${madridDate().slice(0,7)}.csv`; link.click();
@@ -1534,13 +1557,24 @@ function monthlyReportRow(date, schedule, attendance) {
   const hasPunch = Boolean(attendance && (attendance.clock_in || attendance.break_start || attendance.break_end || attendance.clock_out));
   const dayOff = Boolean(schedule?.is_day_off);
   const annualLeave = scheduleKind(schedule) === 'annual_leave';
-  const presenceMinutes = durationMinutes(attendance?.clock_in, attendance?.clock_out);
-  const breakMinutes = durationMinutes(attendance?.break_start, attendance?.break_end);
-  const sequenceValid = presenceMinutes !== null && breakMinutes !== null
+  const rawPresenceMinutes = durationMinutes(attendance?.clock_in, attendance?.clock_out);
+  const countedClockIn = countedStart(attendance, schedule);
+  const presenceMinutes = durationMinutes(countedClockIn, attendance?.clock_out);
+  const rawBreakMinutes = durationMinutes(attendance?.break_start, attendance?.break_end);
+  const sequenceValid = rawPresenceMinutes !== null && presenceMinutes !== null && rawBreakMinutes !== null
     && new Date(attendance.clock_in) <= new Date(attendance.break_start)
     && new Date(attendance.break_end) <= new Date(attendance.clock_out)
-    && breakMinutes <= presenceMinutes;
+    && rawBreakMinutes <= rawPresenceMinutes;
+  const effectiveBreakStart = sequenceValid && new Date(attendance.break_start) < countedClockIn
+    ? countedClockIn
+    : new Date(attendance?.break_start);
+  const breakMinutes = sequenceValid
+    ? Math.max(0, durationMinutes(effectiveBreakStart, attendance.break_end) ?? 0)
+    : null;
   const effectiveMinutes = sequenceValid ? presenceMinutes - breakMinutes : null;
+  const earlyArrivalMinutes = schedule?.starts_at && attendance?.clock_in
+    ? durationMinutes(attendance.clock_in, schedule.starts_at)
+    : null;
   const issues = [];
   let hasIncident = false;
 
@@ -1567,6 +1601,7 @@ function monthlyReportRow(date, schedule, attendance) {
 
       const late = schedule?.starts_at && attendance?.clock_in ? durationMinutes(schedule.starts_at, attendance.clock_in) : null;
       const early = schedule?.ends_at && attendance?.clock_out ? durationMinutes(attendance.clock_out, schedule.ends_at) : null;
+      if (earlyArrivalMinutes > 0) issues.push(`提前打卡 / Entrada anticipada ${earlyArrivalMinutes}m（不计工时 / no computa）`);
       if (late > 0) { issues.push(`迟到 / Retraso ${late}m`); hasIncident = true; }
       if (early > 0) { issues.push(`早退 / Salida anticipada ${early}m`); hasIncident = true; }
       if (attendance?.corrected) issues.push(`已修正 / Corregido${attendance.correction_reason ? `：${attendance.correction_reason}` : ''}`);
@@ -1608,9 +1643,9 @@ function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
   return `<article class="monthly-report-sheet">
     <header class="report-header"><div><b>HOLA!SEVILLA</b><small>NOVAKEEPS S.L.</small></div><div><h1>Registro mensual de jornada</h1><p>月度工时签字表 · ${escapeHTML(monthLabel)}</p></div></header>
     <div class="report-meta"><span><b>Empleado / 员工：</b>${escapeHTML(employee.full_name)}</span><span><b>N.º empleado / 编号：</b>${escapeHTML(employee.employee_no || '—')}</span><span><b>Periodo / 统计截止：</b>${escapeHTML(month)}-01 — ${escapeHTML(reportEnd)}</span></div>
-    <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Entrada<br><small>上班</small></th><th>Inicio pausa<br><small>午休开始</small></th><th>Fin pausa<br><small>午休结束</small></th><th>Salida<br><small>下班</small></th><th>Presencia<br><small>在岗</small></th><th>Pausa<br><small>休息</small></th><th>Horas netas<br><small>净工时</small></th><th>Incidencias / 备注</th></tr></thead><tbody>${rowHtml}</tbody></table>
+    <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Entrada real<br><small>实际打卡</small></th><th>Inicio pausa<br><small>午休开始</small></th><th>Fin pausa<br><small>午休结束</small></th><th>Salida<br><small>下班</small></th><th>Presencia computada<br><small>有效在岗</small></th><th>Pausa<br><small>休息</small></th><th>Horas netas<br><small>净工时</small></th><th>Incidencias / 备注</th></tr></thead><tbody>${rowHtml}</tbody></table>
     <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Presencia total / 在岗合计</small><b>${reportDuration(presenceTotal)}</b></span><span><small>Pausas / 午休合计</small><b>${reportDuration(breakTotal)}</b></span><span><small>Horas netas / 净工时</small><b>${reportDuration(effectiveTotal)}</b></span><span class="${incidentCount ? 'alert' : ''}"><small>Incidencias / 异常</small><b>${incidentCount}</b></span></div>
-    <p class="report-note">Presencia = salida − entrada. Horas netas = presencia − pausa registrada. Las filas incompletas no se incluyen en el total neto hasta su corrección.<br>在岗时长＝下班－上班；净工时＝在岗时长－已记录午休。打卡不完整的日期修正前不计入净工时。</p>
+    <p class="report-note">La entrada anticipada queda registrada, pero el cómputo empieza a la hora prevista. Horas netas = presencia computada − pausa registrada. Las filas incompletas no se incluyen hasta su corrección.<br>提前打卡保留原始时间和照片，但有效计时从排班上班时间开始；净工时＝有效在岗－已记录午休。打卡不完整的日期修正前不计入净工时。</p>
     <div class="report-signatures"><div><span>Firma del trabajador / 员工签字</span><i></i><small>Fecha / 日期：________________</small></div><div><span>Firma de la empresa / 公司签字</span><i></i><small>Fecha / 日期：________________</small></div></div>
     <footer>El trabajador confirma la recepción y revisión de este registro, sin renunciar a comunicar discrepancias. / 员工签字表示已收到并核对本表，如有差异仍可书面提出。</footer>
   </article>`;
