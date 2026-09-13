@@ -207,12 +207,24 @@ function countedStart(item, schedule = attendanceSchedule(item)) {
   return clockIn;
 }
 
-function shiftDurationText(item, schedule = attendanceSchedule(item)) {
-  if (!item?.clock_in || !item?.clock_out) return '—';
+function countedWorkMinutes(item, schedule = attendanceSchedule(item)) {
+  if (!item?.clock_in || !item?.break_start || !item?.break_end || !item?.clock_out) return null;
   const start = countedStart(item, schedule);
+  const clockIn = new Date(item.clock_in);
+  const breakStart = new Date(item.break_start);
+  const breakEnd = new Date(item.break_end);
   const end = new Date(item.clock_out);
-  if (!start || Number.isNaN(end.getTime()) || end < start) return '—';
-  const minutes = Math.max(0, Math.round((end - start) / 60000));
+  if (!start || [clockIn, breakStart, breakEnd, end].some((value) => Number.isNaN(value.getTime()))) return null;
+  if (clockIn > breakStart || breakStart > breakEnd || breakEnd > end || end < start) return null;
+  const presenceMinutes = Math.round((end - start) / 60000);
+  const countedBreakStart = breakStart < start ? start : breakStart;
+  const breakMinutes = breakEnd <= countedBreakStart ? 0 : Math.round((breakEnd - countedBreakStart) / 60000);
+  return Math.max(0, presenceMinutes - breakMinutes);
+}
+
+function shiftDurationText(item, schedule = attendanceSchedule(item)) {
+  const minutes = countedWorkMinutes(item, schedule);
+  if (minutes === null) return '—';
   return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`;
 }
 
@@ -837,7 +849,7 @@ function renderRecords() {
 
 function attendanceTable(items, showEmployee = true) {
   if (!items.length) return `<div class="empty">${L('暂无考勤记录', 'No hay registros')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效在岗', 'Presencia computada')}</th><th>${L('状态', 'Estado')}</th></tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${shiftDurationText(item)}</td><td><span class="status ${item.corrected ? 'pending' : 'ok'}">${item.corrected ? L('已审计修正', 'Corregido') : L('原始记录', 'Original')}</span></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th><th>${L('状态', 'Estado')}</th></tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${shiftDurationText(item)}</td><td><span class="status ${item.corrected ? 'pending' : 'ok'}">${item.corrected ? L('已审计修正', 'Corregido') : L('原始记录', 'Original')}</span></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function renderEmployeeRequests() {
@@ -1524,7 +1536,7 @@ async function saveCorrection(event) {
 
 function csvCell(value) { return `"${String(value ?? '').replaceAll('"', '""')}"`; }
 function exportCsv() {
-  const header = ['employee_no', 'employee', 'date', 'store', 'clock_in_raw', 'scheduled_start', 'counted_start', 'break_start', 'break_end', 'clock_out', 'counted_presence', 'break_duration', 'corrected', 'correction_reason'];
+  const header = ['employee_no', 'employee', 'date', 'store', 'clock_in_raw', 'scheduled_start', 'counted_start', 'break_start', 'break_end', 'clock_out', 'effective_work', 'break_duration', 'corrected', 'correction_reason'];
   const rows = state.data.attendance.map((item) => {
     const schedule = attendanceSchedule(item);
     return [item.employee_no, item.employee_name, item.work_date, item.store_name, timeText(item.clock_in), timeText(schedule?.starts_at), timeText(countedStart(item, schedule)), timeText(item.break_start), timeText(item.break_end), timeText(item.clock_out), shiftDurationText(item, schedule), breakDurationText(item), item.corrected ? 'YES' : 'NO', item.correction_reason || ''];
@@ -1643,9 +1655,9 @@ function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
   return `<article class="monthly-report-sheet">
     <header class="report-header"><div><b>HOLA!SEVILLA</b><small>NOVAKEEPS S.L.</small></div><div><h1>Registro mensual de jornada</h1><p>月度工时签字表 · ${escapeHTML(monthLabel)}</p></div></header>
     <div class="report-meta"><span><b>Empleado / 员工：</b>${escapeHTML(employee.full_name)}</span><span><b>N.º empleado / 编号：</b>${escapeHTML(employee.employee_no || '—')}</span><span><b>Periodo / 统计截止：</b>${escapeHTML(month)}-01 — ${escapeHTML(reportEnd)}</span></div>
-    <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Entrada real<br><small>实际打卡</small></th><th>Inicio pausa<br><small>午休开始</small></th><th>Fin pausa<br><small>午休结束</small></th><th>Salida<br><small>下班</small></th><th>Presencia computada<br><small>有效在岗</small></th><th>Pausa<br><small>休息</small></th><th>Horas netas<br><small>净工时</small></th><th>Incidencias / 备注</th></tr></thead><tbody>${rowHtml}</tbody></table>
-    <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Presencia total / 在岗合计</small><b>${reportDuration(presenceTotal)}</b></span><span><small>Pausas / 午休合计</small><b>${reportDuration(breakTotal)}</b></span><span><small>Horas netas / 净工时</small><b>${reportDuration(effectiveTotal)}</b></span><span class="${incidentCount ? 'alert' : ''}"><small>Incidencias / 异常</small><b>${incidentCount}</b></span></div>
-    <p class="report-note">La entrada anticipada queda registrada, pero el cómputo empieza a la hora prevista. Horas netas = presencia computada − pausa registrada. Las filas incompletas no se incluyen hasta su corrección.<br>提前打卡保留原始时间和照片，但有效计时从排班上班时间开始；净工时＝有效在岗－已记录午休。打卡不完整的日期修正前不计入净工时。</p>
+    <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Entrada real<br><small>实际打卡</small></th><th>Inicio pausa<br><small>午休开始</small></th><th>Fin pausa<br><small>午休结束</small></th><th>Salida<br><small>下班</small></th><th>Presencia computada<br><small>计时跨度</small></th><th>Pausa<br><small>午休</small></th><th>Horas efectivas<br><small>有效工时</small></th><th>Incidencias / 备注</th></tr></thead><tbody>${rowHtml}</tbody></table>
+    <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Presencia computada / 计时跨度</small><b>${reportDuration(presenceTotal)}</b></span><span><small>Pausas / 午休合计</small><b>${reportDuration(breakTotal)}</b></span><span><small>Horas efectivas / 有效工时</small><b>${reportDuration(effectiveTotal)}</b></span><span class="${incidentCount ? 'alert' : ''}"><small>Incidencias / 异常</small><b>${incidentCount}</b></span></div>
+    <p class="report-note">La entrada anticipada queda registrada, pero el cómputo empieza a la hora prevista. Horas efectivas = presencia computada − pausa registrada. Las filas incompletas no se incluyen hasta su corrección.<br>提前打卡保留原始时间和照片，但计时从排班上班时间开始；有效工时＝计时跨度－已登记午休。打卡不完整的日期修正前不计入有效工时。</p>
     <div class="report-signatures"><div><span>Firma del trabajador / 员工签字</span><i></i><small>Fecha / 日期：________________</small></div><div><span>Firma de la empresa / 公司签字</span><i></i><small>Fecha / 日期：________________</small></div></div>
     <footer>El trabajador confirma la recepción y revisión de este registro, sin renunciar a comunicar discrepancias. / 员工签字表示已收到并核对本表，如有差异仍可书面提出。</footer>
   </article>`;
