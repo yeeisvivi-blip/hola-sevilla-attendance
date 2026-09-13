@@ -208,15 +208,20 @@ function countedStart(item, schedule = attendanceSchedule(item)) {
 }
 
 function countedWorkMinutes(item, schedule = attendanceSchedule(item)) {
-  if (!item?.clock_in || !item?.break_start || !item?.break_end || !item?.clock_out) return null;
+  if (!item?.clock_in || !item?.clock_out) return null;
+  const hasBreakStart = Boolean(item.break_start);
+  const hasBreakEnd = Boolean(item.break_end);
+  if (hasBreakStart !== hasBreakEnd) return null;
   const start = countedStart(item, schedule);
   const clockIn = new Date(item.clock_in);
+  const end = new Date(item.clock_out);
+  if (!start || [clockIn, end].some((value) => Number.isNaN(value.getTime())) || end < start) return null;
+  const presenceMinutes = Math.round((end - start) / 60000);
+  if (!hasBreakStart) return Math.max(0, presenceMinutes);
   const breakStart = new Date(item.break_start);
   const breakEnd = new Date(item.break_end);
-  const end = new Date(item.clock_out);
-  if (!start || [clockIn, breakStart, breakEnd, end].some((value) => Number.isNaN(value.getTime()))) return null;
+  if ([breakStart, breakEnd].some((value) => Number.isNaN(value.getTime()))) return null;
   if (clockIn > breakStart || breakStart > breakEnd || breakEnd > end || end < start) return null;
-  const presenceMinutes = Math.round((end - start) / 60000);
   const countedBreakStart = breakStart < start ? start : breakStart;
   const breakMinutes = breakEnd <= countedBreakStart ? 0 : Math.round((breakEnd - countedBreakStart) / 60000);
   return Math.max(0, presenceMinutes - breakMinutes);
@@ -229,7 +234,8 @@ function shiftDurationText(item, schedule = attendanceSchedule(item)) {
 }
 
 function breakDurationText(item) {
-  if (!item?.break_start || !item?.break_end) return '0m';
+  if (!item?.break_start && !item?.break_end) return '0m';
+  if (!item?.break_start || !item?.break_end) return '—';
   const minutes = Math.max(0, Math.round((new Date(item.break_end) - new Date(item.break_start)) / 60000));
   return `${minutes}m`;
 }
@@ -1572,17 +1578,22 @@ function monthlyReportRow(date, schedule, attendance) {
   const rawPresenceMinutes = durationMinutes(attendance?.clock_in, attendance?.clock_out);
   const countedClockIn = countedStart(attendance, schedule);
   const presenceMinutes = durationMinutes(countedClockIn, attendance?.clock_out);
+  const hasBreakStart = Boolean(attendance?.break_start);
+  const hasBreakEnd = Boolean(attendance?.break_end);
+  const hasCompleteBreak = hasBreakStart && hasBreakEnd;
   const rawBreakMinutes = durationMinutes(attendance?.break_start, attendance?.break_end);
-  const sequenceValid = rawPresenceMinutes !== null && presenceMinutes !== null && rawBreakMinutes !== null
-    && new Date(attendance.clock_in) <= new Date(attendance.break_start)
-    && new Date(attendance.break_end) <= new Date(attendance.clock_out)
-    && rawBreakMinutes <= rawPresenceMinutes;
-  const effectiveBreakStart = sequenceValid && new Date(attendance.break_start) < countedClockIn
+  const breakPairValid = hasBreakStart === hasBreakEnd;
+  const sequenceValid = rawPresenceMinutes !== null && presenceMinutes !== null && breakPairValid
+    && (!hasCompleteBreak || (rawBreakMinutes !== null
+      && new Date(attendance.clock_in) <= new Date(attendance.break_start)
+      && new Date(attendance.break_end) <= new Date(attendance.clock_out)
+      && rawBreakMinutes <= rawPresenceMinutes));
+  const effectiveBreakStart = sequenceValid && hasCompleteBreak && new Date(attendance.break_start) < countedClockIn
     ? countedClockIn
     : new Date(attendance?.break_start);
-  const breakMinutes = sequenceValid
+  const breakMinutes = sequenceValid && hasCompleteBreak
     ? Math.max(0, durationMinutes(effectiveBreakStart, attendance.break_end) ?? 0)
-    : null;
+    : sequenceValid ? 0 : null;
   const effectiveMinutes = sequenceValid ? presenceMinutes - breakMinutes : null;
   const earlyArrivalMinutes = schedule?.starts_at && attendance?.clock_in
     ? durationMinutes(attendance.clock_in, schedule.starts_at)
@@ -1604,12 +1615,12 @@ function monthlyReportRow(date, schedule, attendance) {
     } else {
       const missing = [
         ['clock_in', '上班 / entrada'],
-        ['break_start', '午休开始 / inicio pausa'],
-        ['break_end', '午休结束 / fin pausa'],
         ['clock_out', '下班 / salida'],
       ].filter(([field]) => !attendance?.[field]).map(([, label]) => label);
       if (missing.length) { issues.push(`缺少 ${missing.join('、')}`); hasIncident = true; }
+      if (!breakPairValid) { issues.push('午休记录不完整 / Pausa incompleta'); hasIncident = true; }
       else if (!sequenceValid) { issues.push('时间顺序异常 / Orden incorrecto'); hasIncident = true; }
+      else if (!hasCompleteBreak) issues.push('未午休 / Sin pausa');
 
       const late = schedule?.starts_at && attendance?.clock_in ? durationMinutes(schedule.starts_at, attendance.clock_in) : null;
       const early = schedule?.ends_at && attendance?.clock_out ? durationMinutes(attendance.clock_out, schedule.ends_at) : null;
@@ -1657,7 +1668,7 @@ function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
     <div class="report-meta"><span><b>Empleado / 员工：</b>${escapeHTML(employee.full_name)}</span><span><b>N.º empleado / 编号：</b>${escapeHTML(employee.employee_no || '—')}</span><span><b>Periodo / 统计截止：</b>${escapeHTML(month)}-01 — ${escapeHTML(reportEnd)}</span></div>
     <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Entrada real<br><small>实际打卡</small></th><th>Inicio pausa<br><small>午休开始</small></th><th>Fin pausa<br><small>午休结束</small></th><th>Salida<br><small>下班</small></th><th>Presencia computada<br><small>计时跨度</small></th><th>Pausa<br><small>午休</small></th><th>Horas efectivas<br><small>有效工时</small></th><th>Incidencias / 备注</th></tr></thead><tbody>${rowHtml}</tbody></table>
     <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Presencia computada / 计时跨度</small><b>${reportDuration(presenceTotal)}</b></span><span><small>Pausas / 午休合计</small><b>${reportDuration(breakTotal)}</b></span><span><small>Horas efectivas / 有效工时</small><b>${reportDuration(effectiveTotal)}</b></span><span class="${incidentCount ? 'alert' : ''}"><small>Incidencias / 异常</small><b>${incidentCount}</b></span></div>
-    <p class="report-note">La entrada anticipada queda registrada, pero el cómputo empieza a la hora prevista. Horas efectivas = presencia computada − pausa registrada. Las filas incompletas no se incluyen hasta su corrección.<br>提前打卡保留原始时间和照片，但计时从排班上班时间开始；有效工时＝计时跨度－已登记午休。打卡不完整的日期修正前不计入有效工时。</p>
+    <p class="report-note">La entrada anticipada queda registrada, pero el cómputo empieza a la hora prevista. Si hay una pausa completa, se descuenta; si no hubo pausa, se computa todo el periodo. Una pausa incompleta debe corregirse.<br>提前打卡保留原始时间和照片，但计时从排班上班时间开始；有完整午休记录则扣除午休，没有午休则按全部计时跨度计算。只记录午休开始或结束时，必须先修正。</p>
     <div class="report-signatures"><div><span>Firma del trabajador / 员工签字</span><i></i><small>Fecha / 日期：________________</small></div><div><span>Firma de la empresa / 公司签字</span><i></i><small>Fecha / 日期：________________</small></div></div>
     <footer>El trabajador confirma la recepción y revisión de este registro, sin renunciar a comunicar discrepancias. / 员工签字表示已收到并核对本表，如有差异仍可书面提出。</footer>
   </article>`;
