@@ -8,7 +8,7 @@ const MADRID_TZ = config.timezone || 'Europe/Madrid';
 const KIOSK_STORAGE = 'holaSevillaKioskV1';
 const LANG_STORAGE = 'holaSevillaLanguage';
 const FUNCTION_RELEASES = {
-  'admin-api': '2026.09.03.2',
+  'admin-api': '2026.09.13.1',
   'kiosk-punch': '2026.09.03.2',
   'gps-punch': '2026.09.02.2',
 };
@@ -93,6 +93,8 @@ function errorText(error) {
     NO_SCHEDULE_TODAY: L('今天没有已发布的排班，不能打卡', 'No hay horario publicado para hoy. No puedes fichar'),
     SCHEDULE_DAY_OFF: L('今天是排班休息日或年假，不能打卡', 'Hoy es día libre o de vacaciones según el horario. No puedes fichar'),
     INVALID_CORRECTION: L('请至少填写一个有效的修正时间', 'Indica al menos una hora válida para corregir'),
+    INVALID_CORRECTION_KIND: L('请选择有效的考勤处理类型', 'Selecciona un tipo de corrección válido'),
+    INVALID_ABSENCE_TIMES: L('登记缺勤时不应填写打卡时间', 'No introduzcas horas al registrar una ausencia'),
     NO_GPS_PERMISSION: L('当前没有有效的手机GPS打卡授权', 'No tienes autorización GPS vigente'),
     NO_ALLOWED_EVENTS: L('请至少选择一种允许的GPS打卡动作', 'Selecciona al menos un tipo de fichaje GPS'),
     OUTSIDE_AUTHORIZED_AREA: L('当前位置距离排班店铺超过100米，不能打卡', 'Estás a más de 100 metros de la tienda asignada. No puedes fichar'),
@@ -855,7 +857,7 @@ function renderRecords() {
 
 function attendanceTable(items, showEmployee = true) {
   if (!items.length) return `<div class="empty">${L('暂无考勤记录', 'No hay registros')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th><th>${L('状态', 'Estado')}</th></tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${shiftDurationText(item)}</td><td><span class="status ${item.corrected ? 'pending' : 'ok'}">${item.corrected ? L('已审计修正', 'Corregido') : L('原始记录', 'Original')}</span></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th><th>${L('状态', 'Estado')}</th></tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${item.correction_kind === 'absence' ? '0h 00m' : shiftDurationText(item)}</td><td><span class="status ${item.correction_kind === 'absence' ? 'alert' : item.corrected ? 'pending' : 'ok'}">${item.correction_kind === 'absence' ? L('缺勤', 'Ausencia') : item.corrected ? L('已审计修正', 'Corregido') : L('原始记录', 'Original')}</span></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function renderEmployeeRequests() {
@@ -1130,7 +1132,7 @@ function renderExport() {
   const canCorrect = state.data.employees.length > 0;
   return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">MONTHLY EXPORT</p><h2>${L('导出本月正式考勤', 'Exportar control horario mensual')}</h2><p>${L('CSV包含员工、日期、店铺、上班、休息、下班及是否审计修正，可由Excel直接打开。', 'El CSV incluye empleado, fecha, tienda, entrada, pausa, salida y correcciones auditadas; se abre directamente en Excel.')}</p></div><div><button class="primary-btn" id="exportCsv" type="button" style="background:white;color:#153f35">${L('下载CSV', 'Descargar CSV')}</button></div></article><article class="card summary-card"><p class="eyebrow">RETENTION</p><h3>${L('保存与审计', 'Conservación y auditoría')}</h3><p>${L('原始打卡事件不可修改或删除。人工修正另存，并记录VIVI、原因和时间。正式记录按西班牙要求保留4年。', 'Los eventos originales no se modifican ni eliminan. Cada corrección guarda quién, motivo y hora. Los registros oficiales se conservan 4 años.')}</p></article></div>
   <article class="card report-generator"><div class="section-head"><div><p class="eyebrow">MONTHLY SIGNATURE SHEET</p><h2>${L('月度工时签字表', 'Registro mensual para firma')}</h2></div><span class="status ok">A4 · ${L('横向', 'Horizontal')}</span></div><p>${L('每位员工单独一份，显示每天上班、午休、下班、在岗时长和净工时。缺少打卡的日期会标记，修正后再打印签字交给会计。', 'Una hoja por empleado con entrada, pausa, salida, presencia y horas netas. Corrige los fichajes incompletos antes de imprimir y firmar para la gestoría.')}</p>${canCorrect ? `<form id="monthlyReportForm" class="report-controls"><label>${L('统计月份', 'Mes')}<input id="reportMonth" type="month" min="${SCHEDULE_START_MONTH}" max="${currentMonth}" value="${currentMonth}" required></label><label>${L('员工', 'Empleado')}<select id="reportEmployee">${employeeOptions(false)}</select></label><div class="form-actions"><button class="primary-btn" id="previewEmployeeReport" type="submit">${L('生成所选员工', 'Generar empleado')}</button><button class="secondary-btn" id="previewAllReports" type="button">${L('生成全部员工', 'Generar todos')}</button></div></form>` : `<div class="empty">${L('尚无员工账号', 'No hay empleados')}</div>`}</article>
-  <div class="split"><article class="card sticky-card"><p class="eyebrow">AUDITED CORRECTION</p><h2>${L('人工修正考勤', 'Corrección manual')}</h2><p>${L('不会覆盖原始打卡，只会新增一条带原因和操作人的修正记录。', 'No sobrescribe el fichaje original; crea una corrección nueva con motivo y responsable.')}</p>${canCorrect ? `<form id="correctionForm" class="stack-form"><label>${L('员工', 'Empleado')}<select id="correctionEmployee">${employeeOptions(false)}</select></label><label>${L('日期', 'Fecha')}<input id="correctionDate" type="date" value="${today}" required></label><div class="form-row"><label>${L('上班', 'Entrada')}<input id="correctionClockIn" type="time"></label><label>${L('下班', 'Salida')}<input id="correctionClockOut" type="time"></label></div><div class="form-row"><label>${L('开始休息', 'Inicio pausa')}<input id="correctionBreakStart" type="time"></label><label>${L('结束休息', 'Fin pausa')}<input id="correctionBreakEnd" type="time"></label></div><label>${L('修正原因（必填）', 'Motivo obligatorio')}<textarea id="correctionReason" minlength="5" required></textarea></label><button class="primary-btn" type="submit">${L('保存审计修正', 'Guardar corrección')}</button></form>` : `<div class="callout warning"><b>${L('尚无员工账号', 'No hay empleados')}</b><span>${L('创建员工后才能新增考勤修正。', 'Crea un empleado antes de añadir una corrección.')}</span></div>`}</article><article class="card"><h2>${L('本月预览', 'Vista previa del mes')}</h2>${attendanceTable(state.data.attendance, true)}</article></div>
+  <div class="split"><article class="card sticky-card"><p class="eyebrow">AUDITED CORRECTION</p><h2>${L('人工修正考勤', 'Corrección manual')}</h2><p>${L('不会覆盖原始打卡，只会新增一条带原因和操作人的修正记录。缺勤按0工时保存。', 'No sobrescribe el fichaje original; crea una corrección nueva con motivo y responsable. La ausencia se guarda con 0 horas.')}</p>${canCorrect ? `<form id="correctionForm" class="stack-form"><label>${L('处理类型', 'Tipo')}<select id="correctionKind"><option value="attendance">${L('补充／修正打卡', 'Añadir / corregir fichajes')}</option><option value="absence">${L('缺勤', 'Ausencia')}</option></select></label><label>${L('员工', 'Empleado')}<select id="correctionEmployee">${employeeOptions(false)}</select></label><label>${L('日期', 'Fecha')}<input id="correctionDate" type="date" value="${today}" required></label><div id="correctionTimeFields"><div class="form-row"><label>${L('上班', 'Entrada')}<input id="correctionClockIn" type="time"></label><label>${L('下班', 'Salida')}<input id="correctionClockOut" type="time"></label></div><div class="form-row"><label>${L('开始休息', 'Inicio pausa')}<input id="correctionBreakStart" type="time"></label><label>${L('结束休息', 'Fin pausa')}<input id="correctionBreakEnd" type="time"></label></div></div><label>${L('原因（必填）', 'Motivo obligatorio')}<textarea id="correctionReason" minlength="5" required></textarea></label><button class="primary-btn" type="submit">${L('保存审计记录', 'Guardar registro')}</button></form>` : `<div class="callout warning"><b>${L('尚无员工账号', 'No hay empleados')}</b><span>${L('创建员工后才能新增考勤修正。', 'Crea un empleado antes de añadir una corrección.')}</span></div>`}</article><article class="card"><h2>${L('本月预览', 'Vista previa del mes')}</h2>${attendanceTable(state.data.attendance, true)}</article></div>
   <article class="card"><div class="section-head"><div><p class="eyebrow">PHOTO EVIDENCE · 30 DAYS</p><h2>${L('最近30天电脑打卡照片', 'Fotos de fichaje de los últimos 30 días')}</h2></div><span class="status ok">${L('私有存储', 'Almacenamiento privado')}</span></div><p>${L('只有上班和下班打卡拍照。点击“查看照片”时生成短时有效链接，照片不会下载到店铺电脑。', 'Solo se fotografían la entrada y la salida. “Ver foto” crea un enlace temporal; la foto no se descarga en el ordenador de tienda.')}</p>${eventTable(state.data.photoEvents || [])}</article>
   <article class="card"><p class="eyebrow">AUDIT LOG</p><h2>${L('最近100条管理操作', 'Últimas 100 acciones')}</h2>${auditTable()}</article>`;
 }
@@ -1168,7 +1170,9 @@ function bindPortal() {
   $('#exportCsv')?.addEventListener('click', exportCsv);
   $('#monthlyReportForm')?.addEventListener('submit', (event) => generateMonthlyReports(event, false));
   $('#previewAllReports')?.addEventListener('click', (event) => generateMonthlyReports(event, true));
+  $('#correctionKind')?.addEventListener('change', toggleCorrectionFields);
   $('#correctionForm')?.addEventListener('submit', saveCorrection);
+  toggleCorrectionFields();
 }
 
 async function logout() {
@@ -1518,34 +1522,49 @@ async function viewAttendancePhoto(button) {
   }
 }
 
+function toggleCorrectionFields() {
+  const kind = $('#correctionKind');
+  const fields = $('#correctionTimeFields');
+  if (!kind || !fields) return;
+  const absence = kind.value === 'absence';
+  fields.hidden = absence;
+  fields.querySelectorAll('input').forEach((input) => {
+    input.disabled = absence;
+    if (absence) input.value = '';
+  });
+}
+
 async function saveCorrection(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const button = form.querySelector('button[type="submit"]');
   const date = $('#correctionDate').value;
+  const correctionKind = $('#correctionKind').value;
   const iso = (selector) => $(selector).value ? madridLocalToIso(date, $(selector).value) : null;
-  if (!$('#correctionClockIn').value && !$('#correctionClockOut').value && !$('#correctionBreakStart').value && !$('#correctionBreakEnd').value) {
+  if (correctionKind === 'attendance' && !$('#correctionClockIn').value && !$('#correctionClockOut').value && !$('#correctionBreakStart').value && !$('#correctionBreakEnd').value) {
     toast(L('请至少填写一个修正时间', 'Indica al menos una hora corregida'), true); return;
   }
-  const suppliedTimes = [$('#correctionClockIn').value, $('#correctionBreakStart').value, $('#correctionBreakEnd').value, $('#correctionClockOut').value].filter(Boolean);
+  const suppliedTimes = correctionKind === 'attendance'
+    ? [$('#correctionClockIn').value, $('#correctionBreakStart').value, $('#correctionBreakEnd').value, $('#correctionClockOut').value].filter(Boolean)
+    : [];
   if (suppliedTimes.some((value, index) => index > 0 && value <= suppliedTimes[index - 1])) {
     toast(errorText('INVALID_TIME_RANGE'), true); return;
   }
   if (button.disabled) return;
   button.disabled = true;
   try {
-    await adminAction({ action: 'correct_attendance', employeeId: $('#correctionEmployee').value, workDate: date, clockIn: iso('#correctionClockIn'), breakStart: iso('#correctionBreakStart'), breakEnd: iso('#correctionBreakEnd'), clockOut: iso('#correctionClockOut'), reason: $('#correctionReason').value });
-    await finishMutation(L('审计修正已保存，原始记录未改变', 'Corrección guardada; el original no se ha modificado'));
+    await adminAction({ action: 'correct_attendance', correctionKind, employeeId: $('#correctionEmployee').value, workDate: date, clockIn: correctionKind === 'absence' ? null : iso('#correctionClockIn'), breakStart: correctionKind === 'absence' ? null : iso('#correctionBreakStart'), breakEnd: correctionKind === 'absence' ? null : iso('#correctionBreakEnd'), clockOut: correctionKind === 'absence' ? null : iso('#correctionClockOut'), reason: $('#correctionReason').value });
+    await finishMutation(correctionKind === 'absence' ? L('缺勤已登记，工时为0', 'Ausencia registrada con 0 horas') : L('审计修正已保存，原始记录未改变', 'Corrección guardada; el original no se ha modificado'));
   } catch (error) { toast(errorText(error), true); }
   finally { button.disabled = false; }
 }
 
 function csvCell(value) { return `"${String(value ?? '').replaceAll('"', '""')}"`; }
 function exportCsv() {
-  const header = ['employee_no', 'employee', 'date', 'store', 'clock_in_raw', 'scheduled_start', 'counted_start', 'break_start', 'break_end', 'clock_out', 'effective_work', 'break_duration', 'corrected', 'correction_reason'];
+  const header = ['employee_no', 'employee', 'date', 'store', 'clock_in_raw', 'scheduled_start', 'counted_start', 'break_start', 'break_end', 'clock_out', 'effective_work', 'break_duration', 'record_kind', 'corrected', 'correction_reason'];
   const rows = state.data.attendance.map((item) => {
     const schedule = attendanceSchedule(item);
-    return [item.employee_no, item.employee_name, item.work_date, item.store_name, timeText(item.clock_in), timeText(schedule?.starts_at), timeText(countedStart(item, schedule)), timeText(item.break_start), timeText(item.break_end), timeText(item.clock_out), shiftDurationText(item, schedule), breakDurationText(item), item.corrected ? 'YES' : 'NO', item.correction_reason || ''];
+    return [item.employee_no, item.employee_name, item.work_date, item.store_name, timeText(item.clock_in), timeText(schedule?.starts_at), timeText(countedStart(item, schedule)), timeText(item.break_start), timeText(item.break_end), timeText(item.clock_out), item.correction_kind === 'absence' ? '0h 00m' : shiftDurationText(item, schedule), item.correction_kind === 'absence' ? '0m' : breakDurationText(item), item.correction_kind || 'attendance', item.corrected ? 'YES' : 'NO', item.correction_reason || ''];
   });
   const csv = '\uFEFF' + [header, ...rows].map((row) => row.map(csvCell).join(';')).join('\r\n');
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
@@ -1572,6 +1591,7 @@ function reportDateText(dateString) {
 }
 
 function monthlyReportRow(date, schedule, attendance) {
+  const absence = attendance?.correction_kind === 'absence';
   const hasPunch = Boolean(attendance && (attendance.clock_in || attendance.break_start || attendance.break_end || attendance.clock_out));
   const dayOff = Boolean(schedule?.is_day_off);
   const annualLeave = scheduleKind(schedule) === 'annual_leave';
@@ -1601,7 +1621,10 @@ function monthlyReportRow(date, schedule, attendance) {
   const issues = [];
   let hasIncident = false;
 
-  if (annualLeave && !hasPunch) {
+  if (absence) {
+    issues.push(`缺勤 / Ausencia${attendance.correction_reason ? `：${attendance.correction_reason}` : ''}`);
+    hasIncident = true;
+  } else if (annualLeave && !hasPunch) {
     issues.push('年假 / Vacaciones');
   } else if (dayOff && !hasPunch) {
     issues.push('休息 / Libre');
@@ -1638,12 +1661,13 @@ function monthlyReportRow(date, schedule, attendance) {
     breakStart: timeText(attendance?.break_start),
     breakEnd: timeText(attendance?.break_end),
     clockOut: timeText(attendance?.clock_out),
-    presenceMinutes,
-    breakMinutes: sequenceValid ? breakMinutes : null,
-    effectiveMinutes,
+    presenceMinutes: absence ? 0 : presenceMinutes,
+    breakMinutes: absence ? 0 : sequenceValid ? breakMinutes : null,
+    effectiveMinutes: absence ? 0 : effectiveMinutes,
     note: issues.join('；') || '正常 / Correcto',
     hasIncident,
     annualLeave,
+    absence,
   };
 }
 
@@ -1657,7 +1681,7 @@ function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
   const presenceTotal = rows.reduce((sum, row) => sum + (row.presenceMinutes ?? 0), 0);
   const breakTotal = rows.reduce((sum, row) => sum + (row.breakMinutes ?? 0), 0);
   const effectiveTotal = rows.reduce((sum, row) => sum + (row.effectiveMinutes ?? 0), 0);
-  const completeDays = rows.filter((row) => row.effectiveMinutes !== null).length;
+  const completeDays = rows.filter((row) => !row.absence && row.effectiveMinutes !== null).length;
   const annualLeaveDays = rows.filter((row) => row.annualLeave).length;
   const incidentCount = rows.filter((row) => row.hasIncident).length;
   const monthLabel = new Intl.DateTimeFormat('es-ES', { timeZone: 'UTC', year: 'numeric', month: 'long' }).format(new Date(`${month}-15T12:00:00Z`));
