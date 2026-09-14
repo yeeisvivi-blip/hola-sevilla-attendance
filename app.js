@@ -138,7 +138,23 @@ function errorText(error) {
   if (messages[normalized]) return messages[normalized];
   if (/FAILED TO (SEND|FETCH)|FAILED TO FETCH|NETWORK|LOAD FAILED/i.test(code)) return messages.NETWORK_ERROR;
   if (/JWT|TOKEN.*EXPIRED|SESSION.*EXPIRED/i.test(code)) return messages.SESSION_EXPIRED;
-  if (/DUPLICATE|ALREADY (REGISTERED|EXISTS)|UNIQUE CONSTRAINT/i.test(code)) return L('手机号已存在，请检查是否重复创建', 'El teléfono ya existe. Comprueba si la cuenta está duplicada');
+  const detail = [code, error?.message, error?.error].filter(Boolean).join(' ');
+  if (normalized === 'PHONE_EXISTS' || normalized === 'PHONE_ALREADY_EXISTS' || normalized === 'PHONE_EXISTS_IN_AUTH'
+    || (/phone/i.test(detail) && /DUPLICATE|ALREADY (REGISTERED|EXISTS)|UNIQUE CONSTRAINT/i.test(detail))) {
+    return L('手机号已存在，请检查是否重复创建', 'El teléfono ya existe. Comprueba si la cuenta está duplicada');
+  }
+  if (normalized === '23505' || /DUPLICATE|ALREADY (REGISTERED|EXISTS)|UNIQUE CONSTRAINT/i.test(detail)) {
+    return L('保存失败：记录存在唯一性冲突，请检查后台约束（23505）', 'No se pudo guardar: conflicto de unicidad. Revisa las restricciones del servidor (23505)');
+  }
+  if (normalized === '23502' || /null value.*not-null constraint/i.test(detail)) {
+    return L('保存失败：数据库不允许必填字段为空，请检查排班字段约束（23502）', 'No se pudo guardar: un campo obligatorio está vacío. Revisa las restricciones del horario (23502)');
+  }
+  if (normalized === '23514' || /violates check constraint/i.test(detail)) {
+    return L('保存失败：数据不符合数据库校验规则（23514）', 'No se pudo guardar: los datos incumplen una restricción de validación (23514)');
+  }
+  if (normalized === '42P10' || /no unique or exclusion constraint matching/i.test(detail)) {
+    return L('保存失败：数据库缺少保存操作所需的唯一约束（42P10）', 'No se pudo guardar: falta la restricción única necesaria para esta operación (42P10)');
+  }
   if (normalized.startsWith('INVALID_')) return messages.INVALID_INPUT;
   console.error('Unhandled application error:', error);
   return messages.OPERATION_FAILED;
@@ -499,7 +515,7 @@ async function functionRequest(name, body, { authenticated = false, timeoutMs = 
   }
   if (!response.ok || result?.error) {
     const requestError = new Error(result?.error || `HTTP_${response.status}`);
-    Object.assign(requestError, { status: response.status, detail: result?.detail, recordCounts: result?.recordCounts });
+    Object.assign(requestError, { status: response.status, code: result?.code, detail: result?.detail, recordCounts: result?.recordCounts });
     throw requestError;
   }
   return result;
