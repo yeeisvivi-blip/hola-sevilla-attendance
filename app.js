@@ -220,13 +220,10 @@ function attendanceSchedule(item) {
     && schedule.work_date === item?.work_date && scheduleKind(schedule) === 'work') || null;
 }
 
-function countedStart(item, schedule = attendanceSchedule(item)) {
+function countedStart(item) {
   if (!item?.clock_in) return null;
   const clockIn = new Date(item.clock_in);
-  const scheduledStart = schedule?.starts_at ? new Date(schedule.starts_at) : null;
-  if (Number.isNaN(clockIn.getTime())) return null;
-  if (!item.corrected && scheduledStart && !Number.isNaN(scheduledStart.getTime()) && clockIn < scheduledStart) return scheduledStart;
-  return clockIn;
+  return Number.isNaN(clockIn.getTime()) ? null : clockIn;
 }
 
 function countedWorkMinutes(item, schedule = attendanceSchedule(item)) {
@@ -1725,7 +1722,7 @@ function monthlyReportRow(date, schedule, attendance) {
 
       const late = schedule?.starts_at && attendance?.clock_in ? durationMinutes(schedule.starts_at, attendance.clock_in) : null;
       const early = schedule?.ends_at && attendance?.clock_out ? durationMinutes(attendance.clock_out, schedule.ends_at) : null;
-      if (!attendance?.corrected && earlyArrivalMinutes > 0) issues.push(`提前打卡 / Entrada anticipada ${earlyArrivalMinutes}m（不计工时 / no computa）`);
+      if (!attendance?.corrected && earlyArrivalMinutes > 0) issues.push(`提前打卡 / Entrada anticipada ${earlyArrivalMinutes}m（计入工时 / computa）`);
       if (late > 0) { issues.push(`迟到 / Retraso ${late}m`); hasIncident = true; }
       if (early > 0) { issues.push(`早退 / Salida anticipada ${early}m`); hasIncident = true; }
       if (attendance?.corrected) issues.push(`已修正 / Corregido${attendance.correction_reason ? `：${attendance.correction_reason}` : ''}`);
@@ -1770,7 +1767,7 @@ function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
     <div class="report-meta"><span><b>Empleado / 员工：</b>${escapeHTML(employee.full_name)}</span><span><b>N.º empleado / 编号：</b>${escapeHTML(employee.employee_no || '—')}</span><span><b>Periodo / 统计截止：</b>${escapeHTML(month)}-01 — ${escapeHTML(reportEnd)}</span></div>
     <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Entrada real<br><small>实际打卡</small></th><th>Inicio pausa<br><small>午休开始</small></th><th>Fin pausa<br><small>午休结束</small></th><th>Salida<br><small>下班</small></th><th>Presencia computada<br><small>计时跨度</small></th><th>Pausa<br><small>午休</small></th><th>Horas efectivas<br><small>有效工时</small></th><th>Incidencias / 备注</th></tr></thead><tbody>${rowHtml}</tbody></table>
     <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Presencia computada / 计时跨度</small><b>${reportDuration(presenceTotal)}</b></span><span><small>Pausas / 午休合计</small><b>${reportDuration(breakTotal)}</b></span><span><small>Horas efectivas / 有效工时</small><b>${reportDuration(effectiveTotal)}</b></span><span class="${incidentCount ? 'alert' : ''}"><small>Incidencias / 异常</small><b>${incidentCount}</b></span></div>
-    <p class="report-note">Las correcciones se calculan desde la entrada corregida. Sin corrección, la entrada anticipada se computa desde la hora prevista. Si hay una pausa completa, se descuenta; si no hubo pausa, se computa todo el periodo. Una pausa incompleta debe corregirse.<br>人工修正按修正后的上班时间计时；未经修正的提前打卡从排班上班时间计时；有完整午休记录则扣除午休，没有午休则按全部计时跨度计算。只记录午休开始或结束时，必须先修正。</p>
+    <p class="report-note">El tiempo se calcula desde el fichaje real de entrada, aunque sea anterior al horario previsto. Si hay una corrección, se usa la entrada corregida. Si hay una pausa completa, se descuenta; si no hubo pausa, se computa todo el periodo. Una pausa incompleta debe corregirse.<br>按实际上班打卡时间计时，提前打卡也计入工时；有审计修正时，使用修正后的上班时间；有完整午休记录则扣除午休，没有午休则按全部计时跨度计算。只记录午休开始或结束时，必须先修正。</p>
     <div class="report-signatures"><div><span>Firma del trabajador / 员工签字</span><i></i><small>Fecha / 日期：________________</small></div><div><span>Firma de la empresa / 公司签字</span><i></i><small>Fecha / 日期：________________</small></div></div>
     <footer>El trabajador confirma la recepción y revisión de este registro, sin renunciar a comunicar discrepancias. / 员工签字表示已收到并核对本表，如有差异仍可书面提出。</footer>
   </article>`;
