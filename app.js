@@ -8,7 +8,7 @@ const MADRID_TZ = config.timezone || 'Europe/Madrid';
 const KIOSK_STORAGE = 'holaSevillaKioskV1';
 const LANG_STORAGE = 'holaSevillaLanguage';
 const FUNCTION_RELEASES = {
-  'admin-api': '2026.09.13.1',
+  'admin-api': '2026.09.14.3',
   'kiosk-punch': '2026.09.03.2',
   'gps-punch': '2026.09.02.2',
 };
@@ -132,6 +132,10 @@ function errorText(error) {
     REQUEST_TIMEOUT: L('服务器响应超时，请稍后重试', 'El servidor tardó demasiado. Inténtalo de nuevo'),
     INVALID_SERVER_RESPONSE: L('服务器返回异常，请刷新后重试', 'Respuesta no válida del servidor. Actualiza e inténtalo de nuevo'),
     DATA_LOAD_FAILED: L('数据加载失败，请检查网络并刷新', 'No se pudieron cargar los datos. Comprueba la red y actualiza'),
+    PGRST202: L('缺少审计修复函数，请先执行配套SQL', 'Falta la función de corrección. Ejecuta primero el SQL de reparación'),
+    MULTIPLE_CORRECTIONS_REQUIRE_SCHEMA_REVIEW: L('当天有多条修正记录，需要检查数据库结构', 'Hay varias correcciones para el día; revisa el esquema de la base de datos'),
+    CORRECTION_KIND_REQUIRES_SCHEMA_REVIEW: L('当前记录的修正类型需要检查数据库结构', 'El tipo de corrección requiere revisar el esquema'),
+    INVALID_CORRECTION_KIND: L('当前后端暂不支持此修正类型', 'El servidor no admite este tipo de corrección'),
     OPERATION_FAILED: L('操作未完成，请刷新后重试', 'La operación no se completó. Actualiza e inténtalo de nuevo'),
   };
   const normalized = code.toUpperCase().replace(/\s+/g, '_');
