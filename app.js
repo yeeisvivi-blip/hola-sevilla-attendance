@@ -1175,7 +1175,7 @@ function bindPortal() {
   $('#loadCorrection')?.addEventListener('click', () => loadCorrectionRecord());
   $('#correctionEmployee')?.addEventListener('change', () => loadCorrectionRecord());
   $('#correctionDate')?.addEventListener('change', () => loadCorrectionRecord());
-  $('[data-edit-attendance]').forEach((button) => button.addEventListener('click', () => {
+  $$('[data-edit-attendance]').forEach((button) => button.addEventListener('click', () => {
     const employee = $('#correctionEmployee');
     if (!employee || ![...employee.options].some((option) => option.value === button.dataset.editAttendance)) {
       toast(L('该员工不在当前可选列表中', 'El empleado no está en la lista actual'), true); return;
