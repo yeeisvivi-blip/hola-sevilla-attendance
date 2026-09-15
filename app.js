@@ -9,8 +9,8 @@ const KIOSK_STORAGE = 'holaSevillaKioskV1';
 const LANG_STORAGE = 'holaSevillaLanguage';
 const FUNCTION_RELEASES = {
   'admin-api': '2026.09.15.3',
-  'kiosk-punch': '2026.09.03.2',
-  'gps-punch': '2026.09.02.2',
+  'kiosk-punch': '2026.09.15.4',
+  'gps-punch': '2026.09.15.1',
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -84,6 +84,7 @@ function errorText(error) {
     INVALID_EVENT_SEQUENCE: L('打卡顺序不正确，请刷新后重试', 'Secuencia de fichaje incorrecta'),
     INVALID_INPUT: L('填写的信息不完整或格式不正确', 'Faltan datos o el formato no es válido'),
     INVALID_TIME_RANGE: L('结束时间必须晚于开始时间', 'La hora final debe ser posterior a la inicial'),
+    TOO_EARLY_TO_CLOCK_IN: L('还未到打卡时间，上班卡只能在排班开始前5分钟内打', 'Aún es pronto. La entrada solo puede ficharse desde 5 minutos antes del turno.'),
     INVALID_WORKDATE: L('日期格式不正确，请重新选择日期', 'La fecha no es válida. Selecciónala de nuevo'),
     INVALID_SCHEDULE_TIME: L('排班结束时间必须晚于开始时间', 'El fin del turno debe ser posterior al inicio'),
     INVALID_MONTH: L('请选择有效的排班月份', 'Selecciona un mes válido'),
@@ -222,10 +223,13 @@ function attendanceSchedule(item) {
     && schedule.work_date === item?.work_date && scheduleKind(schedule) === 'work') || null;
 }
 
-function countedStart(item) {
+function countedStart(item, schedule = attendanceSchedule(item)) {
   if (!item?.clock_in) return null;
   const clockIn = new Date(item.clock_in);
-  return Number.isNaN(clockIn.getTime()) ? null : clockIn;
+  if (Number.isNaN(clockIn.getTime())) return null;
+  const scheduledStart = new Date(schedule?.starts_at);
+  if (Number.isNaN(scheduledStart.getTime())) return clockIn;
+  return clockIn < scheduledStart ? scheduledStart : clockIn;
 }
 
 function countedWorkMinutes(item, schedule = attendanceSchedule(item)) {
@@ -1879,7 +1883,7 @@ function monthlyReportRow(date, schedule, attendance) {
 
       const late = schedule?.starts_at && attendance?.clock_in ? durationMinutes(schedule.starts_at, attendance.clock_in) : null;
       const early = schedule?.ends_at && attendance?.clock_out ? durationMinutes(attendance.clock_out, schedule.ends_at) : null;
-      if (!attendance?.corrected && earlyArrivalMinutes > 0) issues.push(`提前打卡 / Entrada anticipada ${earlyArrivalMinutes}m（计入工时 / computa）`);
+      if (!attendance?.corrected && earlyArrivalMinutes > 0) issues.push(`提前打卡 / Entrada anticipada ${earlyArrivalMinutes}m（不计入工时 / no computa）`);
       if (late > 0) { issues.push(`迟到 / Retraso ${late}m`); hasIncident = true; }
       if (early > 0) { issues.push(`早退 / Salida anticipada ${early}m`); hasIncident = true; }
       if (attendance?.corrected) issues.push(`已修正 / Corregido${attendance.correction_reason ? `：${attendance.correction_reason}` : ''}`);
@@ -1924,7 +1928,7 @@ function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
     <div class="report-meta"><span><b>Empleado / 员工：</b>${escapeHTML(employee.full_name)}</span><span><b>N.º empleado / 编号：</b>${escapeHTML(employee.employee_no || '—')}</span><span><b>Periodo / 统计截止：</b>${escapeHTML(month)}-01 — ${escapeHTML(reportEnd)}</span></div>
     <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Entrada real<br><small>实际打卡</small></th><th>Inicio pausa<br><small>午休开始</small></th><th>Fin pausa<br><small>午休结束</small></th><th>Salida<br><small>下班</small></th><th>Presencia computada<br><small>计时跨度</small></th><th>Pausa<br><small>午休</small></th><th>Horas efectivas<br><small>有效工时</small></th><th>Incidencias / 备注</th></tr></thead><tbody>${rowHtml}</tbody></table>
     <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Presencia computada / 计时跨度</small><b>${reportDuration(presenceTotal)}</b></span><span><small>Pausas / 午休合计</small><b>${reportDuration(breakTotal)}</b></span><span><small>Horas efectivas / 有效工时</small><b>${reportDuration(effectiveTotal)}</b></span><span class="${incidentCount ? 'alert' : ''}"><small>Incidencias / 异常</small><b>${incidentCount}</b></span></div>
-    <p class="report-note">El tiempo se calcula desde el fichaje real de entrada, aunque sea anterior al horario previsto. Si hay una corrección, se usa la entrada corregida. Si hay una pausa completa, se descuenta; si no hubo pausa, se computa todo el periodo. Una pausa incompleta debe corregirse.<br>按实际上班打卡时间计时，提前打卡也计入工时；有审计修正时，使用修正后的上班时间；有完整午休记录则扣除午休，没有午休则按全部计时跨度计算。只记录午休开始或结束时，必须先修正。</p>
+    <p class="report-note">La entrada puede ficharse desde 5 minutos antes del turno, pero el tiempo efectivo empieza a la hora programada. Si se ficha tarde, empieza desde el fichaje real. Si hay una pausa completa, se descuenta; una pausa incompleta debe corregirse.<br>上班卡可在排班开始前5分钟内打，但有效工时从排班开始时间计算；迟到则从实际打卡时间计算。完整午休会扣除，午休记录不完整时必须先修正。</p>
     <div class="report-signatures"><div><span>Firma del trabajador / 员工签字</span><i></i><small>Fecha / 日期：________________</small></div><div><span>Firma de la empresa / 公司签字</span><i></i><small>Fecha / 日期：________________</small></div></div>
     <footer>El trabajador confirma la recepción y revisión de este registro, sin renunciar a comunicar discrepancias. / 员工签字表示已收到并核对本表，如有差异仍可书面提出。</footer>
   </article>`;
