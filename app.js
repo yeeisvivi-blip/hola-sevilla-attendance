@@ -1979,18 +1979,41 @@ function renderCurrent() {
 
 async function initialize() {
   document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : 'es';
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    navigator.serviceWorker.register('./sw.js?v=20260915-4').then((registration) => registration.update()).catch(() => {});
+  }
   if (!configured) { renderConfigurationError(); return; }
-  const { data } = await client.auth.getSession();
-  if (data.session?.user) {
-    const profile = await loadProfile(data.session.user.id);
-    if (profile?.active) {
-      state.session = data.session; state.profile = profile; await loadPortalData(); renderPortal();
-    } else { await client.auth.signOut(); renderAuth(); }
-  } else { renderAuth(); }
+  try {
+    const { data, error } = await client.auth.getSession();
+    if (error) throw error;
+    if (data.session?.user) {
+      const profile = await loadProfile(data.session.user.id);
+      if (profile?.active) {
+        state.session = data.session;
+        state.profile = profile;
+        await loadPortalData();
+        renderPortal();
+      } else {
+        await client.auth.signOut({ scope: 'local' }).catch(() => {});
+        renderAuth();
+      }
+    } else {
+      renderAuth();
+    }
+  } catch (error) {
+    console.error('Startup session recovery', error);
+    await client.auth.signOut({ scope: 'local' }).catch(() => {});
+    state.session = null;
+    state.profile = null;
+    state.data = {};
+    state.health = null;
+    state.busy = false;
+    renderAuth();
+    setTimeout(() => toast(L('登录状态已失效，请重新登录', 'La sesión ha caducado. Inicia sesión de nuevo.'), true), 0);
+  }
   client.auth.onAuthStateChange((event) => {
     if (event === 'SIGNED_OUT') { state.session = null; state.profile = null; state.data = {}; state.health = null; state.busy = false; }
   });
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(() => {});
 }
 
 setInterval(() => {
