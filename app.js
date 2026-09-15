@@ -8,7 +8,7 @@ const MADRID_TZ = config.timezone || 'Europe/Madrid';
 const KIOSK_STORAGE = 'holaSevillaKioskV1';
 const LANG_STORAGE = 'holaSevillaLanguage';
 const FUNCTION_RELEASES = {
-  'admin-api': '2026.09.14.3',
+  'admin-api': '2026.09.15.3',
   'kiosk-punch': '2026.09.03.2',
   'gps-punch': '2026.09.02.2',
 };
@@ -885,7 +885,7 @@ function renderRecords() {
 
 function attendanceTable(items, showEmployee = true, editable = false) {
   if (!items.length) return `<div class="empty">${L('暂无考勤记录', 'No hay registros')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th><th>${L('状态', 'Estado')}</th>${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${item.correction_kind === 'absence' ? '0h 00m' : shiftDurationText(item)}</td><td><span class="status ${item.correction_kind === 'absence' ? 'alert' : item.corrected ? 'pending' : 'ok'}">${item.correction_kind === 'absence' ? L('缺勤', 'Ausencia') : item.corrected ? L('已审计修正', 'Corregido') : L('原始记录', 'Original')}</span></td>${editable ? `<td><button type="button" class="ghost-btn" data-edit-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${item.corrected ? L('再次修改', 'Volver a corregir') : L('修改', 'Corregir')}</button></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th><th>${L('状态', 'Estado')}</th>${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${item.correction_kind === 'absence' ? '0h 00m' : shiftDurationText(item)}</td><td><span class="status ${item.correction_kind === 'absence' ? 'alert' : item.corrected ? 'pending' : 'ok'}">${item.correction_kind === 'absence' ? L('缺勤', 'Ausencia') : item.corrected ? L('已审计修正', 'Corregido') : L('原始记录', 'Original')}</span></td>${editable ? `<td><div class="button-row"><button type="button" class="ghost-btn" data-edit-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${item.corrected ? L('再次修改', 'Volver a corregir') : L('修改', 'Corregir')}</button>${item.corrected ? `<button type="button" class="ghost-btn danger" data-void-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${L('撤销修正', 'Anular corrección')}</button>` : ''}</div></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function renderEmployeeRequests() {
@@ -1224,6 +1224,40 @@ function openCorrectionDialog(employeeId, date) {
   loadCorrectionRecord();
 }
 
+
+function openVoidCorrectionDialog(employeeId, date) {
+  const employee = state.data.employees.find((item) => item.user_id === employeeId);
+  const record = state.data.attendance.find((item) => item.employee_id === employeeId && item.work_date === date);
+  if (!employee || !record?.corrected) return;
+  openEditDialog(L('撤销考勤修正', 'Anular corrección'), `<form id="voidCorrectionForm" class="stack-form">
+    <p><strong>${escapeHTML(employee.full_name)}</strong> · ${dateText(date)}</p>
+    <p>${L('撤销后将恢复该日原始打卡。修正记录和撤销原因仍会保留在审计历史中。', 'Se restaurarán los fichajes originales. La corrección y el motivo de anulación permanecerán en el historial de auditoría.')}</p>
+    <label>${L('撤销原因（必填）', 'Motivo de anulación (obligatorio)')}<textarea id="voidCorrectionReason" minlength="5" required placeholder="${L('请说明为什么撤销本次修正', 'Indica por qué se anula esta corrección')}"></textarea></label>
+    <p id="voidCorrectionStatus" class="save-status" role="status"></p>
+    <button class="primary-btn danger" type="submit">${L('确认撤销并恢复原始打卡', 'Anular y restaurar fichajes originales')}</button>
+  </form>`);
+  $('#voidCorrectionForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const reason = $('#voidCorrectionReason').value.trim();
+    if (reason.length < 5) {
+      toast(L('请填写至少5个字的撤销原因', 'Escribe un motivo de al menos 5 caracteres'), true);
+      return;
+    }
+    await editorSave(form, '#voidCorrectionStatus', {
+      action: 'correct_attendance',
+      correctionKind: 'void',
+      employeeId,
+      workDate: date,
+      clockIn: null,
+      breakStart: null,
+      breakEnd: null,
+      clockOut: null,
+      reason,
+    }, L('修正已撤销，已恢复原始打卡', 'Corrección anulada; se restauraron los fichajes originales'));
+  });
+}
+
 async function checkAdminConnection() {
   const button = $('#checkAdminConnection'), output = $('#connectionResult');
   button.disabled = true;output.textContent = L('正在检查…','Comprobando…');
@@ -1242,10 +1276,14 @@ async function refreshEditedRecord(body, successMessage) {
     const query = client.from(table).select(table === 'schedules' ? '*, stores(name)' : '*')
       .eq('employee_id',body.employeeId).eq('work_date',body.workDate).abortSignal(AbortSignal.timeout(8000));
     const result = await query.maybeSingle();
-    if(result.error || !result.data) throw result.error || new Error('RECORD_NOT_FOUND');
-    const record = result.data;
+    if(result.error) throw result.error;
     const field = table === 'schedules' ? 'schedules' : 'attendance';
     state.data[field] = state.data[field].filter(item=>item.employee_id !== body.employeeId || item.work_date !== body.workDate);
+    if(!result.data && body.action === 'correct_attendance' && body.correctionKind === 'void') {
+      renderPortal();toast(successMessage);return;
+    }
+    if(!result.data) throw new Error('RECORD_NOT_FOUND');
+    const record = result.data;
     state.data[field].push(record);
     if(table === 'schedules') {
       state.data.schedules.sort((a,b)=>a.work_date.localeCompare(b.work_date));
@@ -1326,7 +1364,8 @@ function bindPortal() {
   $('#monthlyReportForm')?.addEventListener('submit', (event) => generateMonthlyReports(event, !$('#reportEmployee').value));
   $('#previewAllReports')?.addEventListener('click', (event) => generateMonthlyReports(event, true));
   $('#newCorrection')?.addEventListener('click', () => openCorrectionDialog());
-  $$('[data-edit-attendance]').forEach(button => button.addEventListener('click', () => openCorrectionDialog(button.dataset.editAttendance,button.dataset.workDate)));
+  $('[data-edit-attendance]').forEach(button => button.addEventListener('click', () => openCorrectionDialog(button.dataset.editAttendance,button.dataset.workDate)));
+  $('[data-void-attendance]').forEach(button => button.addEventListener('click', () => openVoidCorrectionDialog(button.dataset.voidAttendance,button.dataset.workDate)));
   $('#reportEmployee')?.addEventListener('change', event => { state.attendanceEmployeeId = event.target.value; renderPortal(); });
   $('#reportMonth')?.addEventListener('change', async event => {
     state.attendanceMonth = event.target.value;
