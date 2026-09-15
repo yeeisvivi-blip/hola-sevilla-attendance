@@ -296,3 +296,38 @@ tr:last-child td { border-bottom: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+
+/* Contextual editing: daily work stays in the month or attendance list. */
+.compact-details > summary { cursor: pointer; font-weight: 700; font-size: 17px; padding: 4px 0; }
+.compact-details[open] > summary { margin-bottom: 18px; }
+.month-calendar { margin-top: 24px; }
+.calendar-weekdays,.calendar-grid { display: grid; grid-template-columns: repeat(7,minmax(0,1fr)); gap: 8px; }
+.calendar-weekdays { margin-bottom: 8px; text-align: center; color: var(--muted); font-size: 13px; }
+.calendar-day { display: flex; flex-direction: column; align-items: flex-start; text-align: left; gap: 7px; min-width: 0; min-height: 126px; border: 1px solid #dce5df; border-radius: 12px; padding: 12px; background: white; color: var(--ink); cursor: pointer; }
+.calendar-day:hover,.calendar-day:focus-visible { border-color: #20654c; box-shadow: 0 0 0 2px #20654c30; }
+.calendar-day > b { font-size: 20px; }
+.calendar-day > strong { font-size: 14px; line-height: 1.35; }
+.calendar-day > small { font-size: 12px; overflow-wrap: anywhere; color: #64726a; }
+.calendar-day > span { margin-top: auto; font-size: 11px; color: #256148; }
+.calendar-day.day_off { background: #f0f3ef; }
+.calendar-day.annual_leave { background: #fff3d8; border-color: #e4c880; }
+.calendar-day.empty { background: #fafbf9; border-style: dashed; }
+.edit-dialog .modal-head { margin-bottom: 20px; }
+.save-status { color: #843424; white-space: normal; overflow-wrap: anywhere; }
+.save-status:empty { display:none; }
+.save-status pre,#connectionResult { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.save-status details { margin-top: 12px; }
+.nav-extra { margin-top: 16px; padding-top: 12px; border-top: 1px solid #e1e6df; }
+.nav-extra summary { cursor:pointer; color:#66726a; padding:10px; }
+@media (max-width: 1050px) {
+  .calendar-day { padding: 8px; min-height: 118px; }
+  .calendar-day > strong { font-size: 12px; }
+}
+@media (max-width: 620px) {
+  .calendar-grid,.calendar-weekdays { gap: 4px; }
+  .calendar-day { padding: 5px; min-height: 106px; gap:4px; }
+  .calendar-day > b { font-size:16px; }
+  .calendar-day > strong,.calendar-day > small { font-size:10px; }
+  .calendar-day > span { display:none; }
+  .edit-dialog { padding:20px; }
+}
