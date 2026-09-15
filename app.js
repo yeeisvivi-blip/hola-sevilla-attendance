@@ -1368,8 +1368,8 @@ function bindPortal() {
   $('#monthlyReportForm')?.addEventListener('submit', (event) => generateMonthlyReports(event, !$('#reportEmployee').value));
   $('#previewAllReports')?.addEventListener('click', (event) => generateMonthlyReports(event, true));
   $('#newCorrection')?.addEventListener('click', () => openCorrectionDialog());
-  $('[data-edit-attendance]').forEach(button => button.addEventListener('click', () => openCorrectionDialog(button.dataset.editAttendance,button.dataset.workDate)));
-  $('[data-void-attendance]').forEach(button => button.addEventListener('click', () => openVoidCorrectionDialog(button.dataset.voidAttendance,button.dataset.workDate)));
+  $$('[data-edit-attendance]').forEach(button => button.addEventListener('click', () => openCorrectionDialog(button.dataset.editAttendance,button.dataset.workDate)));
+  $$('[data-void-attendance]').forEach(button => button.addEventListener('click', () => openVoidCorrectionDialog(button.dataset.voidAttendance,button.dataset.workDate)));
   $('#reportEmployee')?.addEventListener('change', event => { state.attendanceEmployeeId = event.target.value; renderPortal(); });
   $('#reportMonth')?.addEventListener('change', async event => {
     state.attendanceMonth = event.target.value;
