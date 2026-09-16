@@ -740,17 +740,45 @@ async function loadEmployeeData() {
   const monthStart = `${today.slice(0, 7)}-01`;
   const scheduleStart = monthStart < addDays(today, -7) ? monthStart : addDays(today, -7);
   const now = new Date().toISOString();
-  const [stores, schedules, attendance, requests, permissions] = await Promise.all([
+  const dayStart = madridLocalToIso(today, '00:00');
+  const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
+  const [stores, schedules, attendance, requests, permissions, todayEvents] = await Promise.all([
     client.from('stores').select('*').eq('active', true).order('name'),
     client.from('schedules').select('*, stores(name,address)').gte('work_date', scheduleStart).lte('work_date', addDays(today, 14)).order('work_date'),
     client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(50),
     client.from('gps_permissions').select('*, stores(name,address,latitude,longitude,radius_m)').eq('active', true).lte('valid_from', now).gte('valid_until', now).order('valid_until'),
+    client.from('attendance_events').select('employee_id,store_id,event_type,occurred_at')
+      .eq('employee_id', state.profile.user_id).gte('occurred_at', dayStart).lt('occurred_at', dayEnd)
+      .order('occurred_at'),
   ]);
   assertQueryResults([stores, schedules, attendance, requests, permissions]);
-  state.data = { stores: stores.data || [], schedules: schedules.data || [], attendance: attendance.data || [], requests: requests.data || [], permissions: permissions.data || [] };
+  const attendanceRows = attendance.data || [];
+  if (!todayEvents.error && todayEvents.data?.length) {
+    const existingIndex = attendanceRows.findIndex((item) => item.work_date === today);
+    const existing = existingIndex >= 0 ? attendanceRows[existingIndex] : {
+      employee_id: state.profile.user_id,
+      store_id: todayEvents.data[0]?.store_id || null,
+      work_date: today,
+    };
+    const merged = { ...existing };
+    for (const event of todayEvents.data) {
+      const field = ({ clock_in: 'clock_in', break_start: 'break_start', break_end: 'break_end', clock_out: 'clock_out' })[event.event_type];
+      if (field && !merged[field]) merged[field] = event.occurred_at;
+    }
+    if (existingIndex >= 0) attendanceRows[existingIndex] = merged;
+    else attendanceRows.unshift(merged);
+  } else if (todayEvents.error) {
+    console.warn('Attendance event fallback unavailable:', todayEvents.error);
+  }
+  state.data = {
+    stores: stores.data || [],
+    schedules: schedules.data || [],
+    attendance: attendanceRows,
+    requests: requests.data || [],
+    permissions: permissions.data || [],
+  };
 }
-
 async function loadManagerData() {
   const today = madridDate();
   const attendanceMonth = state.attendanceMonth || today.slice(0,7);
@@ -1453,12 +1481,18 @@ async function confirmEmployeePunch(eventType, previousValue) {
   const field = ({ clock_in: 'clock_in', break_start: 'break_start', break_end: 'break_end', clock_out: 'clock_out' })[eventType];
   if (!field) return null;
   await new Promise((resolve) => setTimeout(resolve, 700));
-  const { data, error } = await withTimeout(
-    client.from('attendance_daily').select(field).eq('work_date', madridDate()).maybeSingle(),
-    7_000,
-  );
-  if (error || !data?.[field] || data[field] === previousValue) return null;
-  return data[field];
+  const today = madridDate();
+  const dayStart = madridLocalToIso(today, '00:00');
+  const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
+  const [daily, events] = await withTimeout(Promise.all([
+    client.from('attendance_daily').select(field).eq('work_date', today).maybeSingle(),
+    client.from('attendance_events').select('occurred_at').eq('employee_id', state.profile.user_id)
+      .eq('event_type', eventType).gte('occurred_at', dayStart).lt('occurred_at', dayEnd)
+      .order('occurred_at', { ascending: false }).limit(1),
+  ]), 7_000);
+  const confirmedAt = daily.data?.[field] || events.data?.[0]?.occurred_at || null;
+  if (!confirmedAt || confirmedAt === previousValue) return null;
+  return confirmedAt;
 }
 
 async function gpsPunch(eventType, permissionId = null) {
@@ -2015,7 +2049,7 @@ function renderCurrent() {
 async function initialize() {
   document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : 'es';
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js?v=20260916-1').then((registration) => registration.update()).catch(() => {});
+    navigator.serviceWorker.register('./sw.js?v=20260916-2').then((registration) => registration.update()).catch(() => {});
   }
   if (!configured) { renderConfigurationError(); return; }
   try {
