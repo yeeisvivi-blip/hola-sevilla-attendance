@@ -14,6 +14,14 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
+
+function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('REQUEST_TIMEOUT')), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 const configured = /^https:\/\/[^/]+\.supabase\.co$/.test(config.supabaseUrl || '')
   && String(config.supabasePublishableKey || '').startsWith('sb_publishable_');
 
@@ -394,10 +402,10 @@ async function login(event) {
   const status = $('#authStatus');
   status.textContent = L('正在登录…', 'Iniciando sesión…');
   try {
-    const { data, error } = await client.auth.signInWithPassword({
+    const { data, error } = await withTimeout(client.auth.signInWithPassword({
       email: loginEmailFromPhone($('#loginPhone').value),
       password: $('#loginPassword').value,
-    });
+    }));
     if (error) throw error;
     const profile = await loadProfile(data.user.id);
     if (!profile || !profile.active || (desiredRole === 'manager' && profile.role !== 'manager') || (desiredRole === 'employee' && profile.role !== 'employee')) {
@@ -406,7 +414,7 @@ async function login(event) {
       return;
     }
     state.session = data.session; state.profile = profile; state.view = 'home';
-    await loadPortalData(); renderPortal();
+    await withTimeout(loadPortalData()); renderPortal();
   } catch (error) {
     if (state.profile) {
       state.session = null; state.profile = null; state.data = {};
@@ -419,7 +427,7 @@ async function login(event) {
 }
 
 async function loadProfile(userId) {
-  const { data, error } = await client.from('profiles').select('*, stores(id,name,address)').eq('user_id', userId).single();
+  const { data, error } = await withTimeout(client.from('profiles').select('*, stores(id,name,address)').eq('user_id', userId).single());
   if (error) {
     console.error('Profile load failed:', error);
     throw new Error('DATA_LOAD_FAILED');
@@ -436,10 +444,10 @@ async function startKioskConfiguration(event) {
   const status = $('#authStatus');
   status.textContent = L('正在验证VIVI身份…', 'Verificando a VIVI…');
   try {
-    const { data, error } = await client.auth.signInWithPassword({
+    const { data, error } = await withTimeout(client.auth.signInWithPassword({
       email: loginEmailFromPhone($('#kioskManagerPhone').value),
       password: $('#kioskManagerPassword').value,
-    });
+    }));
     if (error) throw error;
     const profile = await loadProfile(data.user.id);
     if (profile?.role !== 'manager' || !profile.active) {
@@ -1390,7 +1398,7 @@ async function logout() {
 }
 
 async function reloadPortal() {
-  await loadPortalData();
+  await withTimeout(loadPortalData());
   renderPortal();
 }
 
@@ -1441,11 +1449,25 @@ async function submitRequest(event) {
   }
 }
 
+async function confirmEmployeePunch(eventType, previousValue) {
+  const field = ({ clock_in: 'clock_in', break_start: 'break_start', break_end: 'break_end', clock_out: 'clock_out' })[eventType];
+  if (!field) return null;
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  const { data, error } = await withTimeout(
+    client.from('attendance_daily').select(field).eq('work_date', madridDate()).maybeSingle(),
+    7_000,
+  );
+  if (error || !data?.[field] || data[field] === previousValue) return null;
+  return data[field];
+}
+
 async function gpsPunch(eventType, permissionId = null) {
   if (!navigator.geolocation) { toast(L('此设备不支持定位', 'Este dispositivo no admite ubicación'), true); return; }
   if (state.busy) return;
   state.busy = true;
   $$('[data-gps-punch]').forEach((button) => { button.disabled = true; });
+  const currentRecord = (state.data.attendance || []).find((item) => item.work_date === madridDate());
+  const previousValue = currentRecord?.[eventType] || null;
   toast(L('正在确认你位于店铺100米内…', 'Comprobando que estás a menos de 100 m…'));
   try {
     const position = await new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, {
@@ -1461,7 +1483,20 @@ async function gpsPunch(eventType, permissionId = null) {
     await finishMutation(`${eventLabel(eventType)} · ${timeText(result.event.occurredAt)} · ${Math.round(result.distanceM)}m`);
   } catch (error) {
     const locationError = error?.code === 1 ? 'LOCATION_PERMISSION_DENIED' : [2, 3].includes(error?.code) ? 'LOCATION_UNAVAILABLE' : error;
-    toast(errorText(locationError), true);
+    const code = normalizedErrorCode(locationError);
+    const shouldConfirm = ['NETWORK_ERROR', 'REQUEST_TIMEOUT', 'INVALID_SERVER_RESPONSE', 'OPERATION_FAILED', 'INVALID_EVENT_SEQUENCE'].includes(code)
+      || code.startsWith('HTTP_');
+    let confirmedAt = null;
+    if (shouldConfirm) {
+      try { confirmedAt = await confirmEmployeePunch(eventType, previousValue); }
+      catch (confirmationError) { console.error('Punch confirmation failed:', confirmationError); }
+    }
+    if (confirmedAt) {
+      try { await reloadPortal(); } catch (refreshError) { console.error('Confirmed punch refresh failed:', refreshError); }
+      toast(`${eventLabel(eventType)} · ${timeText(confirmedAt)} · ${L('已确认打卡成功', 'Fichaje confirmado')}`);
+    } else {
+      toast(errorText(locationError), true);
+    }
   } finally {
     state.busy = false;
     $$('[data-gps-punch]').forEach((button) => { button.disabled = false; });
@@ -1980,18 +2015,18 @@ function renderCurrent() {
 async function initialize() {
   document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : 'es';
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js?v=20260915-4').then((registration) => registration.update()).catch(() => {});
+    navigator.serviceWorker.register('./sw.js?v=20260916-1').then((registration) => registration.update()).catch(() => {});
   }
   if (!configured) { renderConfigurationError(); return; }
   try {
-    const { data, error } = await client.auth.getSession();
+    const { data, error } = await withTimeout(client.auth.getSession());
     if (error) throw error;
     if (data.session?.user) {
       const profile = await loadProfile(data.session.user.id);
       if (profile?.active) {
         state.session = data.session;
         state.profile = profile;
-        await loadPortalData();
+        await withTimeout(loadPortalData());
         renderPortal();
       } else {
         await client.auth.signOut({ scope: 'local' }).catch(() => {});
@@ -2021,6 +2056,10 @@ setInterval(() => {
   const portalClock = $('#portalClock'); if (portalClock) portalClock.textContent = timeText(new Date());
 }, 1000);
 
-initialize().catch((error) => { app.innerHTML = `<main class="setup-page"><section class="setup-card"><h1>${L('应用启动失败', 'No se pudo iniciar')}</h1><p>${escapeHTML(errorText(error))}</p></section></main>`; });
+initialize().catch((error) => {
+  console.error('Application startup failed', error);
+  app.innerHTML = `<main class="setup-page"><section class="setup-card"><h1>${L('应用启动失败', 'No se pudo iniciar')}</h1><p>${escapeHTML(errorText(error))}</p><button class="primary-btn" id="startupRetry" type="button">${L('重新载入', 'Volver a cargar')}</button></section></main>`;
+  $('#startupRetry')?.addEventListener('click', () => location.reload());
+});
 
 
