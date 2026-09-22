@@ -7,6 +7,7 @@ const config = window.HOLA_CONFIG || {};
 const MADRID_TZ = config.timezone || 'Europe/Madrid';
 const KIOSK_STORAGE = 'holaSevillaKioskV1';
 const LANG_STORAGE = 'holaSevillaLanguage';
+const PUNCH_CACHE_STORAGE = 'holaSevillaRecentPunchesV1';
 const FUNCTION_RELEASES = {
   'admin-api': '2026.09.15.3',
   'kiosk-punch': '2026.09.15.4',
@@ -53,6 +54,24 @@ let kioskResetTimer;
 
 function readJSON(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
+}
+
+function rememberConfirmedPunch(eventType, occurredAt, storeId = null) {
+  if (!state.profile?.user_id || !occurredAt) return;
+  const workDate = madridDate(new Date(occurredAt));
+  const current = readJSON(PUNCH_CACHE_STORAGE, []);
+  const retained = Array.isArray(current) ? current.filter((item) =>
+    item?.employee_id && item?.work_date >= addDays(madridDate(), -2)
+    && !(item.employee_id === state.profile.user_id && item.work_date === workDate && item.event_type === eventType)
+  ) : [];
+  retained.push({
+    employee_id: state.profile.user_id,
+    store_id: storeId || null,
+    work_date: workDate,
+    event_type: eventType,
+    occurred_at: occurredAt,
+  });
+  localStorage.setItem(PUNCH_CACHE_STORAGE, JSON.stringify(retained.slice(-24)));
 }
 
 function escapeHTML(value) {
@@ -754,23 +773,29 @@ async function loadEmployeeData() {
   ]);
   assertQueryResults([stores, schedules, attendance, requests, permissions]);
   const attendanceRows = attendance.data || [];
-  if (!todayEvents.error && todayEvents.data?.length) {
+  const cachedEvents = readJSON(PUNCH_CACHE_STORAGE, []).filter((item) =>
+    item?.employee_id === state.profile.user_id && item?.work_date === today
+  );
+  const serverEvents = !todayEvents.error ? (todayEvents.data || []) : [];
+  const effectiveEvents = [...serverEvents, ...cachedEvents].sort((a, b) =>
+    String(a.occurred_at).localeCompare(String(b.occurred_at))
+  );
+  if (effectiveEvents.length) {
     const existingIndex = attendanceRows.findIndex((item) => item.work_date === today);
     const existing = existingIndex >= 0 ? attendanceRows[existingIndex] : {
       employee_id: state.profile.user_id,
-      store_id: todayEvents.data[0]?.store_id || null,
+      store_id: effectiveEvents[0]?.store_id || null,
       work_date: today,
     };
     const merged = { ...existing };
-    for (const event of todayEvents.data) {
+    for (const event of effectiveEvents) {
       const field = ({ clock_in: 'clock_in', break_start: 'break_start', break_end: 'break_end', clock_out: 'clock_out' })[event.event_type];
       if (field && !merged[field]) merged[field] = event.occurred_at;
     }
     if (existingIndex >= 0) attendanceRows[existingIndex] = merged;
     else attendanceRows.unshift(merged);
-  } else if (todayEvents.error) {
-    console.warn('Attendance event fallback unavailable:', todayEvents.error);
   }
+  if (todayEvents.error) console.warn('Attendance event fallback unavailable:', todayEvents.error);
   state.data = {
     stores: stores.data || [],
     schedules: schedules.data || [],
@@ -1514,6 +1539,7 @@ async function gpsPunch(eventType, permissionId = null) {
       accuracy: position.coords.accuracy,
       ...(permissionId ? { permissionId } : {}),
     }, { authenticated: true });
+    rememberConfirmedPunch(eventType, result.event.occurredAt, result.event.storeId || result.store?.id || null);
     await finishMutation(`${eventLabel(eventType)} · ${timeText(result.event.occurredAt)} · ${Math.round(result.distanceM)}m`);
   } catch (error) {
     const locationError = error?.code === 1 ? 'LOCATION_PERMISSION_DENIED' : [2, 3].includes(error?.code) ? 'LOCATION_UNAVAILABLE' : error;
@@ -1526,6 +1552,7 @@ async function gpsPunch(eventType, permissionId = null) {
       catch (confirmationError) { console.error('Punch confirmation failed:', confirmationError); }
     }
     if (confirmedAt) {
+      rememberConfirmedPunch(eventType, confirmedAt);
       try { await reloadPortal(); } catch (refreshError) { console.error('Confirmed punch refresh failed:', refreshError); }
       toast(`${eventLabel(eventType)} · ${timeText(confirmedAt)} · ${L('已确认打卡成功', 'Fichaje confirmado')}`);
     } else {
@@ -2049,7 +2076,7 @@ function renderCurrent() {
 async function initialize() {
   document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : 'es';
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js?v=20260916-2').then((registration) => registration.update()).catch(() => {});
+    navigator.serviceWorker.register('./sw.js?v=20260922-1').then((registration) => registration.update()).catch(() => {});
   }
   if (!configured) { renderConfigurationError(); return; }
   try {
