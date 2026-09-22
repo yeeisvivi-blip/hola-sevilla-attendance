@@ -1,1094 +1,23 @@
-import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.102.0/+esm';
-
-const $ = (selector, root = document) => root.querySelector(selector);
-const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-const app = $('#app');
-const config = window.HOLA_CONFIG || {};
-const MADRID_TZ = config.timezone || 'Europe/Madrid';
-const KIOSK_STORAGE = 'holaSevillaKioskV1';
-const LANG_STORAGE = 'holaSevillaLanguage';
-const PUNCH_CACHE_STORAGE = 'holaSevillaRecentPunchesV1';
-const FUNCTION_RELEASES = {
-  'admin-api': '2026.09.15.3',
-  'kiosk-punch': '2026.09.15.4',
-  'gps-punch': '2026.09.15.1',
-};
-const SCHEDULE_START_MONTH = '2026-09';
-const REQUEST_TIMEOUT_MS = 20_000;
-
-function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error('REQUEST_TIMEOUT')), timeoutMs);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-const configured = /^https:\/\/[^/]+\.supabase\.co$/.test(config.supabaseUrl || '')
-  && String(config.supabasePublishableKey || '').startsWith('sb_publishable_');
-
-const client = configured
-  ? createClient(config.supabaseUrl, config.supabasePublishableKey, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
-    })
-  : null;
-
-const state = {
-  lang: localStorage.getItem(LANG_STORAGE) || (navigator.language?.toLowerCase().startsWith('zh') ? 'zh' : 'es'),
-  entry: 'employee',
-  session: null,
-  profile: null,
-  view: 'home',
-  data: {},
-  kiosk: readJSON(KIOSK_STORAGE, null),
-  kioskEmployees: [],
-  kioskStore: null,
-  kioskSelected: null,
-  kioskSuccess: null,
-  health: null,
-  busy: false,
-  scheduleMonth: null,
-  scheduleEmployeeId: null,
-};
-
-let kioskResetTimer;
-
-function readJSON(key, fallback) {
-  try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
-}
-
-function rememberConfirmedPunch(eventType, occurredAt, storeId = null) {
-  if (!state.profile?.user_id || !occurredAt) return;
-  const workDate = madridDate(new Date(occurredAt));
-  const current = readJSON(PUNCH_CACHE_STORAGE, []);
-  const retained = Array.isArray(current) ? current.filter((item) =>
-    item?.employee_id && item?.work_date >= addDays(madridDate(), -2)
-    && !(item.employee_id === state.profile.user_id && item.work_date === workDate && item.event_type === eventType)
-  ) : [];
-  retained.push({
-    employee_id: state.profile.user_id,
-    store_id: storeId || null,
-    work_date: workDate,
-    event_type: eventType,
-    occurred_at: occurredAt,
-  });
-  localStorage.setItem(PUNCH_CACHE_STORAGE, JSON.stringify(retained.slice(-24)));
-}
-
-function escapeHTML(value) {
-  return String(value ?? '').replace(/[&<>'"]/g, (character) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
-  })[character]);
-}
-
-function L(zh, es) { return state.lang === 'zh' ? zh : es; }
-function setLang(lang) {
-  state.lang = lang === 'zh' ? 'zh' : 'es';
-  localStorage.setItem(LANG_STORAGE, state.lang);
-  document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : 'es';
-  renderCurrent();
-}
-
-let toastTimer;
-function toast(message, error = false) {
-  const element = $('#toast');
-  clearTimeout(toastTimer);
-  element.textContent = message;
-  element.style.background = error ? '#8f332f' : '#15221e';
-  element.classList.add('show');
-  toastTimer = setTimeout(() => element.classList.remove('show'), 3200);
-}
-
-function errorText(error) {
-  const code = String(error?.code || error?.message || error?.error || error || 'UNKNOWN_ERROR');
-  const messages = {
-    INVALID_LOGIN_CREDENTIALS: L('æ‰‹æœºå·æˆ–å¯†ç ä¸æ­£ç¡®', 'TelÃ©fono o contraseÃ±a incorrectos'),
-    INVALID_PHONE: L('æ‰‹æœºå·æ ¼å¼ä¸æ­£ç¡®ï¼Œè¯·å¡«å†™å®Œæ•´å·ç ï¼Œä¾‹å¦‚ +34 600 000 000', 'El telÃ©fono no es vÃ¡lido. Usa el formato completo, por ejemplo +34 600 000 000'),
-    INVALID_PIN: L('ä¸ªäººPINä¸æ­£ç¡®', 'PIN personal incorrecto'),
-    PIN_MUST_BE_6_DIGITS: L('PINå¿…é¡»æ˜¯6ä½æ•°å­—', 'El PIN debe tener 6 cifras'),
-    PIN_NOT_CONFIGURED: L('è¯¥å‘˜å·¥å°šæœªè®¾ç½®PINï¼Œè¯·ç”±VIVIé‡è®¾PIN', 'Este empleado no tiene PIN. VIVI debe restablecerlo'),
-    PIN_TEMPORARILY_LOCKED: L('PINé”™è¯¯æ¬¡æ•°è¿‡å¤šï¼Œè¯·15åˆ†é’Ÿåé‡è¯•', 'Demasiados intentos. Prueba en 15 minutos'),
-    NOT_ASSIGNED_TO_THIS_STORE: L('ä½ ä»Šå¤©æœªè¢«å®‰æ’åœ¨æ­¤åº—', 'Hoy no estÃ¡s asignado a esta tienda'),
-    INVALID_EVENT_SEQUENCE: L('æ‰“å¡é¡ºåºä¸æ­£ç¡®ï¼Œè¯·åˆ·æ–°åé‡è¯•', 'Secuencia de fichaje incorrecta'),
-    INVALID_INPUT: L('å¡«å†™çš„ä¿¡æ¯ä¸å®Œæ•´æˆ–æ ¼å¼ä¸æ­£ç¡®', 'Faltan datos o el formato no es vÃ¡lido'),
-    INVALID_TIME_RANGE: L('ç»“æŸæ—¶é—´å¿…é¡»æ™šäºå¼€å§‹æ—¶é—´', 'La hora final debe ser posterior a la inicial'),
-    TOO_EARLY_TO_CLOCK_IN: L('è¿˜æœªåˆ°æ‰“å¡æ—¶é—´ï¼Œä¸Šç­å¡åªèƒ½åœ¨æ’ç­å¼€å§‹å‰5åˆ†é’Ÿå†…æ‰“', 'AÃºn es pronto. La entrada solo puede ficharse desde 5 minutos antes del turno.'),
-    INVALID_WORKDATE: L('æ—¥æœŸæ ¼å¼ä¸æ­£ç¡®ï¼Œè¯·é‡æ–°é€‰æ‹©æ—¥æœŸ', 'La fecha no es vÃ¡lida. SelecciÃ³nala de nuevo'),
-    INVALID_SCHEDULE_TIME: L('æ’ç­ç»“æŸæ—¶é—´å¿…é¡»æ™šäºå¼€å§‹æ—¶é—´', 'El fin del turno debe ser posterior al inicio'),
-    INVALID_MONTH: L('è¯·é€‰æ‹©æœ‰æ•ˆçš„æ’ç­æœˆä»½', 'Selecciona un mes vÃ¡lido'),
-    INVALID_WEEK_PATTERN: L('è¯·æ£€æŸ¥ä¸€å‘¨æ¨¡æ¿ï¼Œæ¯ä¸ªå·¥ä½œæ—¥éƒ½è¦å¡«å†™æ­£ç¡®çš„åº—é“ºå’Œæ—¶é—´', 'Revisa la plantilla semanal: cada dÃ­a laborable necesita tienda y horario vÃ¡lidos'),
-    INVALID_SCHEDULE_KIND: L('è¯·é€‰æ‹©å·¥ä½œã€ä¼‘æ¯æˆ–å¹´å‡', 'Selecciona trabajo, descanso o vacaciones'),
-    ANNUAL_LEAVE_LIMIT_REACHED: L('è¯¥å‘˜å·¥æœ¬å¹´åº¦å·²è¾¾åˆ°30å¤©å¹´å‡ä¸Šé™', 'Este empleado ya ha alcanzado el lÃ­mite anual de 30 dÃ­as de vacaciones'),
-    NO_SCHEDULE_TODAY: L('ä»Šå¤©æ²¡æœ‰å·²å‘å¸ƒçš„æ’ç­ï¼Œä¸èƒ½æ‰“å¡', 'No hay horario publicado para hoy. No puedes fichar'),
-    SCHEDULE_DAY_OFF: L('ä»Šå¤©æ˜¯æ’ç­ä¼‘æ¯æ—¥æˆ–å¹´å‡ï¼Œä¸èƒ½æ‰“å¡', 'Hoy es dÃ­a libre o de vacaciones segÃºn el horario. No puedes fichar'),
-    INVALID_CORRECTION: L('è¯·è‡³å°‘å¡«å†™ä¸€ä¸ªæœ‰æ•ˆçš„ä¿®æ­£æ—¶é—´', 'Indica al menos una hora vÃ¡lida para corregir'),
-    INVALID_CORRECTION_KIND: L('è¯·é€‰æ‹©æœ‰æ•ˆçš„è€ƒå‹¤å¤„ç†ç±»å‹', 'Selecciona un tipo de correcciÃ³n vÃ¡lido'),
-    INVALID_ABSENCE_TIMES: L('ç™»è®°ç¼ºå‹¤æ—¶ä¸åº”å¡«å†™æ‰“å¡æ—¶é—´', 'No introduzcas horas al registrar una ausencia'),
-    NO_GPS_PERMISSION: L('å½“å‰æ²¡æœ‰æœ‰æ•ˆçš„æ‰‹æœºGPSæ‰“å¡æˆæƒ', 'No tienes autorizaciÃ³n GPS vigente'),
-    NO_ALLOWED_EVENTS: L('è¯·è‡³å°‘é€‰æ‹©ä¸€ç§å…è®¸çš„GPSæ‰“å¡åŠ¨ä½œ', 'Selecciona al menos un tipo de fichaje GPS'),
-    OUTSIDE_AUTHORIZED_AREA: L('å½“å‰ä½ç½®è·ç¦»æ’ç­åº—é“ºè¶…è¿‡20ç±³ï¼Œä¸èƒ½æ‰“å¡', 'EstÃ¡s a mÃ¡s de 20 metros de la tienda asignada. No puedes fichar'),
-    LOCATION_NOT_ACCURATE_ENOUGH: L('å®šä½ç²¾åº¦ä¸è¶³ï¼Œè¯·åˆ°å¼€é˜”ä½ç½®é‡è¯•', 'La ubicaciÃ³n no es suficientemente precisa'),
-    LOCATION_PERMISSION_DENIED: L('æµè§ˆå™¨æ²¡æœ‰å®šä½æƒé™ï¼Œè¯·åœ¨åœ°å€æ å…è®¸ä½ç½®æƒé™', 'El navegador no tiene permiso de ubicaciÃ³n. ActÃ­valo en la barra de direcciones'),
-    LOCATION_UNAVAILABLE: L('æš‚æ—¶æ— æ³•å–å¾—å‡†ç¡®ä½ç½®ï¼Œè¯·æ‰“å¼€æ‰‹æœºå®šä½åé‡è¯•', 'No se pudo obtener la ubicaciÃ³n. Activa el GPS e intÃ©ntalo de nuevo'),
-    STORE_GPS_NOT_CONFIGURED: L('VIVIå°šæœªé…ç½®è¯¥åº—GPSåæ ‡', 'La tienda todavÃ­a no tiene coordenadas GPS'),
-    STORE_NOT_FOUND: L('åº—é“ºä¸å­˜åœ¨ï¼Œè¯·åˆ·æ–°åé‡è¯•', 'La tienda no existe. Actualiza e intÃ©ntalo de nuevo'),
-    STORE_NOT_ACTIVE: L('è¯¥åº—é“ºå·²åœç”¨ï¼Œä¸èƒ½æ‰§è¡Œæ­¤æ“ä½œ', 'La tienda estÃ¡ desactivada'),
-    EMPLOYEE_DISABLED: L('è´¦å·å·²åœç”¨ï¼Œè¯·è”ç³»VIVI', 'Cuenta desactivada. Contacta con VIVI'),
-    EMPLOYEE_NOT_ACTIVE: L('è¯¥å‘˜å·¥ä¸å­˜åœ¨æˆ–å·²åœç”¨', 'El empleado no existe o estÃ¡ desactivado'),
-    DELETE_REQUIRES_DEACTIVATION: L('è¯·å…ˆåœç”¨è¯¥å‘˜å·¥ï¼Œå†åˆ é™¤è¯¯å»ºè´¦å·', 'Desactiva primero al empleado antes de eliminar la cuenta errÃ³nea'),
-    EMPLOYEE_HAS_RECORDS: L('è¯¥å‘˜å·¥å·²æœ‰æ’ç­ã€æ‰“å¡ã€GPSæˆæƒã€ç”³è¯·æˆ–ä¿®æ­£è®°å½•ï¼Œåªèƒ½åœç”¨ï¼Œä¸èƒ½åˆ é™¤', 'Este empleado ya tiene registros. Solo se puede desactivar, no eliminar'),
-    EMPLOYEE_NOT_FOUND: L('å‘˜å·¥è´¦å·ä¸å­˜åœ¨ï¼Œå¯èƒ½å·²è¢«åˆ é™¤', 'La cuenta no existe o ya fue eliminada'),
-    EMPLOYEE_DELETE_FAILED: L('è´¦å·åˆ é™¤å¤±è´¥ï¼Œè¯·ç¡®è®¤è¯¥å‘˜å·¥æ²¡æœ‰ä»»ä½•æ­£å¼è®°å½•', 'No se pudo eliminar. Comprueba que no tenga registros oficiales'),
-    DEVICE_DISABLED: L('æ­¤åº—é“ºç”µè„‘æœªæˆæƒæˆ–å·²åœç”¨', 'Este ordenador no estÃ¡ autorizado'),
-    DEVICE_DENIED: L('æ­¤ç”µè„‘å‡­è¯ä¸æ­£ç¡®ï¼Œè¯·ç”±VIVIé‡æ–°ç»‘å®š', 'La credencial de este ordenador no es vÃ¡lida. VIVI debe vincularlo de nuevo'),
-    DEVICE_REQUIRED: L('æ­¤ç”µè„‘å°šæœªç»‘å®šåº—é“º', 'Este ordenador todavÃ­a no estÃ¡ vinculado'),
-    CAMERA_PERMISSION_DENIED: L('å¿…é¡»å…è®¸æ‘„åƒå¤´æƒé™æ‰èƒ½å®Œæˆä¸Šä¸‹ç­æ‰“å¡', 'Debes permitir el acceso a la cÃ¡mara para fichar la entrada o la salida'),
-    CAMERA_UNAVAILABLE: L('æ— æ³•ä½¿ç”¨ç”µè„‘æ‘„åƒå¤´ï¼Œè¯·æ£€æŸ¥æ‘„åƒå¤´åé‡è¯•ï¼Œæˆ–ä½¿ç”¨æœ¬äººæ‰‹æœºåœ¨åº—é“º20ç±³å†…æ‰“å¡', 'No se puede usar la cÃ¡mara. CompruÃ©bala o ficha con tu mÃ³vil dentro de 20 m'),
-    CAMERA_CANCELLED: L('å·²å–æ¶ˆæ‹ç…§ï¼Œæœ¬æ¬¡æ‰“å¡æ²¡æœ‰æäº¤', 'Foto cancelada. El fichaje no se ha enviado'),
-    PHOTO_REQUIRED: L('ä¸Šä¸‹ç­æ‰“å¡å¿…é¡»æ‹æ‘„ç°åœºç…§ç‰‡', 'La entrada y la salida requieren una foto en el momento'),
-    PHOTO_INVALID: L('ç°åœºç…§ç‰‡æ— æ•ˆï¼Œè¯·é‡æ–°æ‹æ‘„', 'La foto no es vÃ¡lida. Hazla de nuevo'),
-    PHOTO_STALE: L('ç…§ç‰‡å·²è¶…æ—¶ï¼Œè¯·é‡æ–°æ‹æ‘„', 'La foto ha caducado. Hazla de nuevo'),
-    PHOTO_TOO_LARGE: L('ç…§ç‰‡æ–‡ä»¶è¿‡å¤§ï¼Œè¯·é‡æ–°æ‹æ‘„', 'La foto es demasiado grande. Hazla de nuevo'),
-    PHOTO_UPLOAD_FAILED: L('ç…§ç‰‡ä¸Šä¼ å¤±è´¥ï¼Œæœ¬æ¬¡æ‰“å¡æœªè®°å½•ï¼Œè¯·æ£€æŸ¥ç½‘ç»œåé‡è¯•', 'No se pudo subir la foto y el fichaje no se registrÃ³. Comprueba la red'),
-    PHOTO_STORAGE_UNAVAILABLE: L('ç…§ç‰‡å­˜å‚¨æš‚æ—¶ä¸å¯ç”¨ï¼Œæœ¬æ¬¡æ‰“å¡æœªè®°å½•', 'El almacenamiento de fotos no estÃ¡ disponible y el fichaje no se registrÃ³'),
-    PHOTO_NOT_FOUND: L('ç…§ç‰‡ä¸å­˜åœ¨æˆ–å·²è¶…è¿‡30å¤©è‡ªåŠ¨åˆ é™¤', 'La foto no existe o se eliminÃ³ automÃ¡ticamente despuÃ©s de 30 dÃ­as'),
-    REQUEST_ALREADY_REVIEWED: L('è¯¥ç”³è¯·å·²å¤„ç†ï¼Œè¯·åˆ·æ–°æŸ¥çœ‹æœ€æ–°çŠ¶æ€', 'La solicitud ya fue revisada. Actualiza para ver el estado'),
-    RECORD_NOT_FOUND: L('è®°å½•ä¸å­˜åœ¨æˆ–å·²å‘ç”Ÿå˜åŒ–ï¼Œè¯·åˆ·æ–°åé‡è¯•', 'El registro no existe o ha cambiado. Actualiza e intÃ©ntalo de nuevo'),
-    UNAUTHENTICATED: L('ç™»å½•å·²è¿‡æœŸï¼Œè¯·é‡æ–°ç™»å½•', 'La sesiÃ³n ha caducado. Inicia sesiÃ³n de nuevo'),
-    SESSION_EXPIRED: L('ç™»å½•å·²è¿‡æœŸï¼Œè¯·é‡æ–°ç™»å½•', 'La sesiÃ³n ha caducado. Inicia sesiÃ³n de nuevo'),
-    FORBIDDEN: L('å½“å‰è´¦å·æ²¡æœ‰æ‰§è¡Œæ­¤æ“ä½œçš„æƒé™', 'Esta cuenta no tiene permiso para realizar esta acciÃ³n'),
-    NETWORK_ERROR: L('æ— æ³•è¿æ¥æœåŠ¡å™¨ï¼Œè¯·æ£€æŸ¥ç½‘ç»œåé‡è¯•', 'No se pudo conectar con el servidor. Comprueba la red'),
-    REQUEST_TIMEOUT: L('æœåŠ¡å™¨å“åº”è¶…æ—¶ï¼Œè¯·ç¨åé‡è¯•', 'El servidor tardÃ³ demasiado. IntÃ©ntalo de nuevo'),
-    INVALID_SERVER_RESPONSE: L('æœåŠ¡å™¨è¿”å›å¼‚å¸¸ï¼Œè¯·åˆ·æ–°åé‡è¯•', 'Respuesta no vÃ¡lida del servidor. Actualiza e intÃ©ntalo de nuevo'),
-    DATA_LOAD_FAILED: L('æ•°æ®åŠ è½½å¤±è´¥ï¼Œè¯·æ£€æŸ¥ç½‘ç»œå¹¶åˆ·æ–°', 'No se pudieron cargar los datos. Comprueba la red y actualiza'),
-    PGRST202: L('ç¼ºå°‘å®¡è®¡ä¿®å¤å‡½æ•°ï¼Œè¯·å…ˆæ‰§è¡Œé…å¥—SQL', 'Falta la funciÃ³n de correcciÃ³n. Ejecuta primero el SQL de reparaciÃ³n'),
-    MULTIPLE_CORRECTIONS_REQUIRE_SCHEMA_REVIEW: L('å½“å¤©æœ‰å¤šæ¡ä¿®æ­£è®°å½•ï¼Œéœ€è¦æ£€æŸ¥æ•°æ®åº“ç»“æ„', 'Hay varias correcciones para el dÃ­a; revisa el esquema de la base de datos'),
-    CORRECTION_KIND_REQUIRES_SCHEMA_REVIEW: L('å½“å‰è®°å½•çš„ä¿®æ­£ç±»å‹éœ€è¦æ£€æŸ¥æ•°æ®åº“ç»“æ„', 'El tipo de correcciÃ³n requiere revisar el esquema'),
-    INVALID_CORRECTION_KIND: L('å½“å‰åç«¯æš‚ä¸æ”¯æŒæ­¤ä¿®æ­£ç±»å‹', 'El servidor no admite este tipo de correcciÃ³n'),
-    OPERATION_FAILED: L('æ“ä½œæœªå®Œæˆï¼Œè¯·åˆ·æ–°åé‡è¯•', 'La operaciÃ³n no se completÃ³. Actualiza e intÃ©ntalo de nuevo'),
-  };
-  const normalized = code.toUpperCase().replace(/\s+/g, '_');
-  if (messages[normalized]) return messages[normalized];
-  const messageCode = String(error?.message || '').toUpperCase().replace(/\s+/g,'_');
-  if (messages[messageCode]) return messages[messageCode];
-  if (/FAILED TO (SEND|FETCH)|FAILED TO FETCH|NETWORK|LOAD FAILED/i.test(code)) return messages.NETWORK_ERROR;
-  if (/JWT|TOKEN.*EXPIRED|SESSION.*EXPIRED/i.test(code)) return messages.SESSION_EXPIRED;
-  const detail = [code, error?.message, error?.error].filter(Boolean).join(' ');
-  if (normalized === 'PHONE_EXISTS' || normalized === 'PHONE_ALREADY_EXISTS' || normalized === 'PHONE_EXISTS_IN_AUTH'
-    || (/phone/i.test(detail) && /DUPLICATE|ALREADY (REGISTERED|EXISTS)|UNIQUE CONSTRAINT/i.test(detail))) {
-    return L('æ‰‹æœºå·å·²å­˜åœ¨ï¼Œè¯·æ£€æŸ¥æ˜¯å¦é‡å¤åˆ›å»º', 'El telÃ©fono ya existe. Comprueba si la cuenta estÃ¡ duplicada');
-  }
-  if (normalized === '23505' || /DUPLICATE|ALREADY (REGISTERED|EXISTS)|UNIQUE CONSTRAINT/i.test(detail)) {
-    return L('ä¿å­˜å¤±è´¥ï¼šè®°å½•å­˜åœ¨å”¯ä¸€æ€§å†²çªï¼Œè¯·æ£€æŸ¥åå°çº¦æŸï¼ˆ23505ï¼‰', 'No se pudo guardar: conflicto de unicidad. Revisa las restricciones del servidor (23505)');
-  }
-  if (normalized === '23502' || /null value.*not-null constraint/i.test(detail)) {
-    return L('ä¿å­˜å¤±è´¥ï¼šæ•°æ®åº“ä¸å…è®¸å¿…å¡«å­—æ®µä¸ºç©ºï¼Œè¯·æ£€æŸ¥æ’ç­å­—æ®µçº¦æŸï¼ˆ23502ï¼‰', 'No se pudo guardar: un campo obligatorio estÃ¡ vacÃ­o. Revisa las restricciones del horario (23502)');
-  }
-  if (normalized === '23514' || /violates check constraint/i.test(detail)) {
-    return L('ä¿å­˜å¤±è´¥ï¼šæ•°æ®ä¸ç¬¦åˆæ•°æ®åº“æ ¡éªŒè§„åˆ™ï¼ˆ23514ï¼‰', 'No se pudo guardar: los datos incumplen una restricciÃ³n de validaciÃ³n (23514)');
-  }
-  if (normalized === '42P10' || /no unique or exclusion constraint matching/i.test(detail)) {
-    return L('ä¿å­˜å¤±è´¥ï¼šæ•°æ®åº“ç¼ºå°‘ä¿å­˜æ“ä½œæ‰€éœ€çš„å”¯ä¸€çº¦æŸï¼ˆ42P10ï¼‰', 'No se pudo guardar: falta la restricciÃ³n Ãºnica necesaria para esta operaciÃ³n (42P10)');
-  }
-  if (normalized.startsWith('INVALID_')) return messages.INVALID_INPUT;
-  console.error('Unhandled application error:', error);
-  return messages.OPERATION_FAILED;
-}
-
-function normalizedErrorCode(error) {
-  return String(error?.code || error?.message || error?.error || error || 'UNKNOWN_ERROR').toUpperCase().replace(/\s+/g, '_');
-}
-
-function forgetKioskIfInvalid(error) {
-  const code = normalizedErrorCode(error);
-  if (!['DEVICE_DISABLED', 'DEVICE_DENIED', 'DEVICE_REQUIRED'].includes(code)) return false;
-  localStorage.removeItem(KIOSK_STORAGE);
-  state.kiosk = null;
-  return true;
-}
-
-function normalizePhone(value) {
-  let digits = String(value || '').replace(/\D/g, '');
-  if (digits.startsWith('00')) digits = digits.slice(2);
-  if (digits.length === 9) digits = `34${digits}`;
-  return digits ? `+${digits}` : '';
-}
-
-function loginEmailFromPhone(value) {
-  const digits = normalizePhone(value).replace(/\D/g, '');
-  return `p${digits}@attendance.invalid`;
-}
-
-function madridDate(date = new Date()) {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: MADRID_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
-}
-
-function madridDisplay(date = new Date(), withSeconds = false) {
-  return new Intl.DateTimeFormat(state.lang === 'zh' ? 'zh-CN' : 'es-ES', {
-    timeZone: MADRID_TZ,
-    weekday: 'short', year: 'numeric', month: 'short', day: 'numeric',
-    ...(withSeconds ? { hour: '2-digit', minute: '2-digit', second: '2-digit' } : {}),
-  }).format(date);
-}
-
-function timeText(value) {
-  if (!value) return 'â€”';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return 'â€”';
-  return new Intl.DateTimeFormat('es-ES', { timeZone: MADRID_TZ, hour: '2-digit', minute: '2-digit' }).format(date);
-}
-
-function dateText(value) {
-  if (!value) return 'â€”';
-  const date = new Date(`${String(value).slice(0, 10)}T12:00:00Z`);
-  return new Intl.DateTimeFormat(state.lang === 'zh' ? 'zh-CN' : 'es-ES', {
-    timeZone: 'UTC', weekday: 'short', day: '2-digit', month: 'short',
-  }).format(date);
-}
-
-function attendanceSchedule(item) {
-  return (state.data.schedules || []).find((schedule) => schedule.employee_id === item?.employee_id
-    && schedule.work_date === item?.work_date && scheduleKind(schedule) === 'work') || null;
-}
-
-function countedStart(item, schedule = attendanceSchedule(item)) {
-  if (!item?.clock_in) return null;
-  const clockIn = new Date(item.clock_in);
-  if (Number.isNaN(clockIn.getTime())) return null;
-  const scheduledStart = new Date(schedule?.starts_at);
-  if (Number.isNaN(scheduledStart.getTime())) return clockIn;
-  return clockIn < scheduledStart ? scheduledStart : clockIn;
-}
-
-function countedWorkMinutes(item, schedule = attendanceSchedule(item)) {
-  if (!item?.clock_in || !item?.clock_out) return null;
-  const hasBreakStart = Boolean(item.break_start);
-  const hasBreakEnd = Boolean(item.break_end);
-  if (hasBreakStart !== hasBreakEnd) return null;
-  const start = countedStart(item, schedule);
-  const clockIn = new Date(item.clock_in);
-  const end = new Date(item.clock_out);
-  if (!start || [clockIn, end].some((value) => Number.isNaN(value.getTime())) || end < start) return null;
-  const presenceMinutes = Math.round((end - start) / 60000);
-  if (!hasBreakStart) return Math.max(0, presenceMinutes);
-  const breakStart = new Date(item.break_start);
-  const breakEnd = new Date(item.break_end);
-  if ([breakStart, breakEnd].some((value) => Number.isNaN(value.getTime()))) return null;
-  if (clockIn > breakStart || breakStart > breakEnd || breakEnd > end || end < start) return null;
-  const countedBreakStart = breakStart < start ? start : breakStart;
-  const breakMinutes = breakEnd <= countedBreakStart ? 0 : Math.round((breakEnd - countedBreakStart) / 60000);
-  return Math.max(0, presenceMinutes - breakMinutes);
-}
-
-function shiftDurationText(item, schedule = attendanceSchedule(item)) {
-  const minutes = countedWorkMinutes(item, schedule);
-  if (minutes === null) return 'â€”';
-  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`;
-}
-
-function breakDurationText(item) {
-  if (!item?.break_start && !item?.break_end) return '0m';
-  if (!item?.break_start || !item?.break_end) return 'â€”';
-  const minutes = Math.max(0, Math.round((new Date(item.break_end) - new Date(item.break_start)) / 60000));
-  return `${minutes}m`;
-}
-
-function addDays(dateString, amount) {
-  const date = new Date(`${dateString}T12:00:00Z`);
-  date.setUTCDate(date.getUTCDate() + amount);
-  return date.toISOString().slice(0, 10);
-}
-
-function monthLastDate(monthString) {
-  const [year, month] = String(monthString).split('-').map(Number);
-  if (!year || month < 1 || month > 12) return '';
-  return new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
-}
-
-function currentScheduleMonth() {
-  const current = madridDate().slice(0, 7);
-  return state.scheduleMonth || (current < SCHEDULE_START_MONTH ? SCHEDULE_START_MONTH : current);
-}
-
-function madridTimeValue(value, fallback) {
-  if (!value) return fallback;
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return fallback;
-  return new Intl.DateTimeFormat('en-GB', {
-    timeZone: MADRID_TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  }).format(date);
-}
-
-function madridLocalToIso(dateString, timeString) {
-  const [year, month, day] = dateString.split('-').map(Number);
-  const [hour, minute] = timeString.split(':').map(Number);
-  let guess = Date.UTC(year, month - 1, day, hour, minute);
-  for (let count = 0; count < 3; count += 1) {
-    const parts = new Intl.DateTimeFormat('en-GB', {
-      timeZone: MADRID_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-    }).formatToParts(new Date(guess));
-    const get = (type) => Number(parts.find((part) => part.type === type)?.value);
-    const represented = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'));
-    guess += Date.UTC(year, month - 1, day, hour, minute) - represented;
-  }
-  return new Date(guess).toISOString();
-}
-
-function languageButton() {
-  return `<button class="language-btn" id="languageToggle" type="button">${state.lang === 'zh' ? 'ES' : 'ä¸­æ–‡'}</button>`;
-}
-
-function renderConfigurationError() {
-  app.innerHTML = `<main class="setup-page"><section class="setup-card">
-    <span class="brand-mark">H</span><p class="eyebrow">CONFIGURATION REQUIRED</p>
-    <h1>${L('ç­‰å¾…è¿æ¥æ–°é¡¹ç›®', 'Falta conectar el nuevo proyecto')}</h1>
-    <p>${L('è¯·å…ˆåœ¨ config.js ä¸­å¡«å†™æ–°çš„ Supabase Project URL å’Œ sb_publishable å…¬é’¥ã€‚ä¸è¦å¡«å†™ä»»ä½•ç®¡ç†å‘˜å¯†é’¥ã€‚', 'AÃ±ade en config.js la URL del nuevo proyecto y su clave sb_publishable. Nunca aÃ±adas una clave de administrador.')}</p>
-    <div class="callout warning"><b>${L('å®‰å…¨', 'Seguridad')}</b><span>${L('service_roleã€sb_secret å’Œæ•°æ®åº“å¯†ç åªèƒ½ä¿å­˜åœ¨æœåŠ¡å™¨ç«¯ã€‚', 'service_role, sb_secret y la contraseÃ±a de base de datos son solo para el servidor.')}</span></div>
-  </section></main>`;
-}
-
-function renderAuth() {
-  const kioskReady = Boolean(state.kiosk?.deviceId && state.kiosk?.deviceSecret);
-  app.innerHTML = `<main class="auth-shell">
-    <section class="auth-story">
-      <div class="brand-lockup"><span class="brand-mark">H</span><span><b>HOLA!SEVILLA</b><small>CONTROL HORARIO OFICIAL</small></span></div>
-      <div><p class="eyebrow">NOVAKEEPS S.L.</p><h1>${L('æ¯ä¸€æ¬¡åˆ°å²—ï¼Œæ¸…æ¥šè®°å½•ã€‚', 'Cada jornada, claramente registrada.')}</h1><p>${L('å››åº—ç»Ÿä¸€æ’ç­ã€è€ƒå‹¤ã€ç”³è¯·ä¸å®¡è®¡ã€‚å‘˜å·¥æ‰‹æœºå¯åœ¨å½“å¤©æ’ç­åº—é“º20ç±³å†…å®šä½æ‰“å¡ï¼Œè·¨åº—ç­‰ç‰¹æ®Šæƒ…å†µç”±VIVIä¸´æ—¶æˆæƒã€‚', 'Horarios, fichajes, solicitudes y auditorÃ­a para las cuatro tiendas. El mÃ³vil permite fichar a menos de 20 m de la tienda asignada; las excepciones requieren autorizaciÃ³n de VIVI.')}</p></div>
-      <div class="auth-facts"><div><b>4</b><span>${L('å®¶åº—é“º', 'tiendas')}</span></div><div><b>20'</b><span>${L('ä¼‘æ¯', 'descanso')}</span></div><div><b>7h</b><span>${L('æ¯æ—¥ç­æ¬¡', 'jornada')}</span></div></div>
-    </section>
-    <section class="auth-panel">
-      <div class="top-actions" style="justify-content:flex-end;margin-bottom:24px">${languageButton()}</div>
-      <p class="eyebrow">ACCESS / ACCESO</p><h2>${L('é€‰æ‹©ä½¿ç”¨æ–¹å¼', 'Elige cÃ³mo acceder')}</h2>
-      <p>${L('å‘˜å·¥æ‰‹æœºã€åº—é“ºå›ºå®šç”µè„‘å’ŒVIVIç®¡ç†åå°ä½¿ç”¨ä¸åŒæƒé™ã€‚', 'El mÃ³vil del empleado, el ordenador de tienda y el panel de VIVI tienen permisos distintos.')}</p>
-      <div class="entry-tabs">
-        <button type="button" data-entry="employee" class="${state.entry === 'employee' ? 'active' : ''}">${L('å‘˜å·¥æ‰‹æœº', 'Empleado')}</button>
-        <button type="button" data-entry="kiosk" class="${state.entry === 'kiosk' ? 'active' : ''}">${L('åº—é“ºç”µè„‘', 'Ordenador')}</button>
-        <button type="button" data-entry="manager" class="${state.entry === 'manager' ? 'active' : ''}">VIVI</button>
-      </div>
-      <div id="entryContent">
-        ${state.entry === 'kiosk' ? renderKioskEntry(kioskReady) : renderLoginForm(state.entry)}
-      </div>
-      <p class="form-status" id="authStatus"></p>
-    </section>
-  </main>`;
-  bindAuth();
-}
-
-function renderLoginForm(role) {
-  return `<form id="loginForm" class="stack-form" data-role="${role}">
-    <label>${L('æ‰‹æœºå·', 'TelÃ©fono')}<input id="loginPhone" type="tel" placeholder="+34 600 000 000" required autocomplete="username"></label>
-    <label>${L('ç™»å½•å¯†ç ', 'ContraseÃ±a')}<input id="loginPassword" type="password" minlength="8" required autocomplete="current-password"></label>
-    <button class="primary-btn" type="submit">${role === 'manager' ? L('è¿›å…¥å››åº—ç®¡ç†åå°', 'Entrar al panel de VIVI') : L('ç™»å½•æŸ¥çœ‹æˆ‘çš„ä¿¡æ¯', 'Entrar a mi cuenta')}</button>
-    <div class="callout"><b>${L('è¯´æ˜', 'Nota')}</b><span>${role === 'manager' ? L('åªæœ‰VIVIç®¡ç†å‘˜è´¦å·å¯ä»¥è¿›å…¥ã€‚', 'Solo puede acceder la cuenta administradora de VIVI.') : L('æ‰‹æœºå¯æŸ¥çœ‹æ’ç­å’Œç”³è¯·ï¼Œä¹Ÿå¯åœ¨å½“å¤©æ’ç­åº—é“º20ç±³å†…å®šä½æ‰“å¡ã€‚', 'Puedes consultar horarios y solicitudes y fichar con ubicaciÃ³n a menos de 20 m de la tienda asignada.')}</span></div>
-  </form>`;
-}
-
-function renderKioskEntry(ready) {
-  if (ready) {
-    return `<div class="stack-form"><div class="callout"><b>${L('å·²é…ç½®', 'Configurado')}</b><span>${escapeHTML(state.kiosk.storeName || L('åº—é“ºç”µè„‘', 'Ordenador de tienda'))}</span></div>
-      <button class="primary-btn" id="openKiosk" type="button">${L('æ‰“å¼€å›ºå®šæ‰“å¡ç•Œé¢', 'Abrir pantalla de fichaje')}</button>
-      <button class="ghost-btn" id="clearKiosk" type="button">${L('è§£é™¤æ­¤ç”µè„‘é…ç½®', 'Quitar configuraciÃ³n')}</button></div>`;
-  }
-  return `<form id="kioskManagerLogin" class="stack-form">
-    <p class="muted">${L('ç¬¬ä¸€æ¬¡éœ€è¦VIVIåœ¨è¿™å°åº—é“ºç”µè„‘ä¸Šç™»å½•å¹¶ç»‘å®šåº—é“ºã€‚ç»‘å®šåå‘˜å·¥åªéœ€é€‰æ‹©å§“åå¹¶è¾“å…¥6ä½PINã€‚', 'La primera vez VIVI debe iniciar sesiÃ³n y vincular este ordenador a una tienda. DespuÃ©s el empleado solo elige su nombre e introduce su PIN de 6 cifras.')}</p>
-    <label>${L('VIVIæ‰‹æœºå·', 'TelÃ©fono de VIVI')}<input id="kioskManagerPhone" type="tel" required></label>
-    <label>${L('VIVIç™»å½•å¯†ç ', 'ContraseÃ±a de VIVI')}<input id="kioskManagerPassword" type="password" minlength="8" required></label>
-    <button class="primary-btn" type="submit">${L('éªŒè¯å¹¶é…ç½®æ­¤ç”µè„‘', 'Verificar y configurar')}</button>
-  </form>`;
-}
-
-function bindAuth() {
-  $('#languageToggle')?.addEventListener('click', () => setLang(state.lang === 'zh' ? 'es' : 'zh'));
-  $$('[data-entry]').forEach((button) => button.addEventListener('click', () => {
-    state.entry = button.dataset.entry;
-    renderAuth();
-  }));
-  $('#loginForm')?.addEventListener('submit', login);
-  $('#openKiosk')?.addEventListener('click', () => openKiosk());
-  $('#clearKiosk')?.addEventListener('click', () => {
-    if (!confirm(L('ç¡®å®šè§£é™¤è¿™å°ç”µè„‘çš„åº—é“ºç»‘å®šï¼Ÿ', 'Â¿Quitar la vinculaciÃ³n de este ordenador?'))) return;
-    localStorage.removeItem(KIOSK_STORAGE); state.kiosk = null; renderAuth();
-  });
-  $('#kioskManagerLogin')?.addEventListener('submit', startKioskConfiguration);
-}
-
-async function login(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const button = form.querySelector('button[type="submit"]');
-  if (button.disabled) return;
-  button.disabled = true;
-  const desiredRole = form.dataset.role;
-  const status = $('#authStatus');
-  status.textContent = L('æ­£åœ¨ç™»å½•â€¦', 'Iniciando sesiÃ³nâ€¦');
-  try {
-    const { data, error } = await withTimeout(client.auth.signInWithPassword({
-      email: loginEmailFromPhone($('#loginPhone').value),
-      password: $('#loginPassword').value,
-    }));
-    if (error) throw error;
-    const profile = await loadProfile(data.user.id);
-    if (!profile || !profile.active || (desiredRole === 'manager' && profile.role !== 'manager') || (desiredRole === 'employee' && profile.role !== 'employee')) {
-      await client.auth.signOut();
-      status.textContent = desiredRole === 'manager' ? L('æ­¤è´¦å·ä¸æ˜¯VIVIç®¡ç†å‘˜', 'Esta cuenta no es administradora') : L('æ­¤è´¦å·ä¸æ˜¯å‘˜å·¥è´¦å·', 'Esta cuenta no es de empleado');
-      return;
-    }
-    state.session = data.session; state.profile = profile; state.view = 'home';
-    await withTimeout(loadPortalData()); renderPortal();
-  } catch (error) {
-    if (state.profile) {
-      state.session = null; state.profile = null; state.data = {};
-      await client.auth.signOut().catch(() => {});
-    }
-    status.textContent = errorText(error);
-  } finally {
-    button.disabled = false;
-  }
-}
-
-async function loadProfile(userId) {
-  const { data, error } = await withTimeout(client.from('profiles').select('*, stores(id,name,address)').eq('user_id', userId).single());
-  if (error) {
-    console.error('Profile load failed:', error);
-    throw new Error('DATA_LOAD_FAILED');
-  }
-  return data;
-}
-
-async function startKioskConfiguration(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const button = form.querySelector('button[type="submit"]');
-  if (button.disabled) return;
-  button.disabled = true;
-  const status = $('#authStatus');
-  status.textContent = L('æ­£åœ¨éªŒè¯VIVIèº«ä»½â€¦', 'Verificando a VIVIâ€¦');
-  try {
-    const { data, error } = await withTimeout(client.auth.signInWithPassword({
-      email: loginEmailFromPhone($('#kioskManagerPhone').value),
-      password: $('#kioskManagerPassword').value,
-    }));
-    if (error) throw error;
-    const profile = await loadProfile(data.user.id);
-    if (profile?.role !== 'manager' || !profile.active) {
-      await client.auth.signOut(); status.textContent = L('åªæœ‰VIVIå¯ä»¥é…ç½®åº—é“ºç”µè„‘', 'Solo VIVI puede configurar el ordenador'); return;
-    }
-    const { data: stores, error: storeError } = await client.from('stores').select('*').eq('active', true).order('name');
-    if (storeError) throw new Error('DATA_LOAD_FAILED');
-    if (!stores?.length) throw new Error('STORE_NOT_FOUND');
-    $('#entryContent').innerHTML = `<form id="finishKioskSetup" class="stack-form">
-      <label>${L('ç»‘å®šåº—é“º', 'Tienda vinculada')}<select id="kioskStore">${stores.map((store) => `<option value="${store.id}">${escapeHTML(store.name)}</option>`).join('')}</select></label>
-      <label>${L('ç”µè„‘åç§°', 'Nombre del ordenador')}<input id="kioskName" value="${L('åº—é“ºæ”¶é“¶ç”µè„‘', 'Ordenador de caja')}" required minlength="2"></label>
-      <button class="primary-btn" type="submit">${L('å®Œæˆç»‘å®š', 'Completar vinculaciÃ³n')}</button>
-    </form>`;
-    $('#finishKioskSetup').addEventListener('submit', finishKioskConfiguration);
-    status.textContent = '';
-  } catch (error) {
-    await client.auth.signOut().catch(() => {});
-    state.session = null;
-    state.profile = null;
-    status.textContent = errorText(error);
-  } finally {
-    button.disabled = false;
-  }
-}
-
-async function finishKioskConfiguration(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const button = form.querySelector('button[type="submit"]');
-  if (button.disabled) return;
-  button.disabled = true;
-  const status = $('#authStatus');
-  status.textContent = L('æ­£åœ¨ç”Ÿæˆæ­¤ç”µè„‘çš„ç‹¬ç«‹å‡­è¯â€¦', 'Creando credencial del ordenadorâ€¦');
-  try {
-    const storeId = $('#kioskStore').value;
-    const result = await adminAction({ action: 'create_kiosk', storeId, name: $('#kioskName').value });
-    const { data: store } = await client.from('stores').select('name').eq('id', storeId).maybeSingle();
-    state.kiosk = { deviceId: result.deviceId, deviceSecret: result.deviceSecret, storeName: store?.name || '' };
-    localStorage.setItem(KIOSK_STORAGE, JSON.stringify(state.kiosk));
-    await client.auth.signOut(); state.session = null; state.profile = null;
-    await openKiosk();
-  } catch (error) {
-    status.textContent = errorText(error);
-  } finally {
-    button.disabled = false;
-  }
-}
-
-async function functionRequest(name, body, { authenticated = false, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
-  const started = Date.now();
-  let stage = 'session';
-  const headers = { 'Content-Type': 'application/json', apikey: config.supabasePublishableKey };
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  let abortHandler;
-  const aborted = new Promise((_, reject) => {
-    abortHandler = () => reject(new Error('REQUEST_TIMEOUT'));
-    controller.signal.addEventListener('abort', abortHandler, {once:true});
-  });
-  try {
-    if (authenticated) {
-      const { data, error } = await Promise.race([client.auth.getSession(),aborted]);
-      if (error || !data?.session?.access_token) throw new Error('SESSION_EXPIRED');
-      headers.Authorization = `Bearer ${data.session.access_token}`;
-    }
-    stage = 'request';
-    const response = await Promise.race([fetch(`${config.supabaseUrl}/functions/v1/${name}`, {
-      method:'POST',headers,body:JSON.stringify(body),signal:controller.signal,cache:'no-store',
-    }),aborted]);
-    stage = 'response';
-    const responseText = await Promise.race([response.text(),aborted]);
-    let result;
-    try { result = JSON.parse(responseText); }
-    catch { throw new Error('INVALID_SERVER_RESPONSE'); }
-    if (!response.ok || result?.error) {
-      const error = new Error(result?.error || `HTTP_${response.status}`);
-      Object.assign(error,{status:response.status,code:result?.code,detail:result?.detail,recordCounts:result?.recordCounts});throw error;
-    }
-    return result;
-  } catch(original) {
-    const error = controller.signal.aborted || original?.name === 'AbortError' ? new Error('REQUEST_TIMEOUT')
-      : original instanceof TypeError ? new Error('NETWORK_ERROR') : original;
-    error.diagnostic = {service:name,action:body.action || 'punch',stage,elapsedMs:Date.now()-started,status:error.status || null,code:normalizedErrorCode(error)};
-    throw error;
-  } finally { clearTimeout(timeout);controller.signal.removeEventListener('abort',abortHandler); }
-}
-
-async function rawFunction(name, body) {
-  return functionRequest(name, body);
-}
-
-async function openKiosk() {
-  clearTimeout(kioskResetTimer);
-  if (!state.kiosk) { state.entry = 'kiosk'; renderAuth(); return; }
-  state.kioskSuccess = null; state.kioskSelected = null;
-  app.innerHTML = `<div class="boot"><span class="brand-mark">H</span><p>${L('æ­£åœ¨åŠ è½½ä»Šæ—¥å‘˜å·¥â€¦', 'Cargando empleados de hoyâ€¦')}</p></div>`;
-  try {
-    const result = await rawFunction('kiosk-punch', { action: 'list', ...state.kiosk });
-    state.kioskEmployees = result.employees || []; state.kioskStore = result.store;
-    renderKiosk();
-  } catch (error) {
-    forgetKioskIfInvalid(error);
-    toast(errorText(error), true); renderAuth();
-  }
-}
-
-function eventLabel(type) {
-  return ({ clock_in: L('ä¸Šç­', 'Entrada'), break_start: L('å¼€å§‹ä¼‘æ¯', 'Inicio pausa'), break_end: L('ç»“æŸä¼‘æ¯', 'Fin pausa'), clock_out: L('ä¸‹ç­', 'Salida') })[type] || type;
-}
-
-function nextActionsFromRecord(record) {
-  if (!record?.clock_in) return ['clock_in'];
-  if (record.clock_out) return [];
-  if (record.break_start && !record.break_end) return ['break_end'];
-  if (!record.break_start) return ['break_start', 'clock_out'];
-  return ['clock_out'];
-}
-
-function renderKiosk() {
-  const selected = state.kioskEmployees.find((item) => item.user_id === state.kioskSelected);
-  app.innerHTML = `<main class="kiosk-shell">
-    <header class="kiosk-top"><div class="brand-lockup"><span class="brand-mark">H</span><span><b>HOLA!SEVILLA</b><small>${escapeHTML(state.kioskStore?.name || state.kiosk?.storeName || '')}</small></span></div><div class="kiosk-clock"><b id="kioskTime">${timeText(new Date())}</b><small>${madridDisplay()}</small></div></header>
-    <section class="kiosk-card">
-      ${state.kioskSuccess ? `<div class="success-panel"><b>âœ“ ${escapeHTML(state.kioskSuccess.name)}</b><span>${escapeHTML(eventLabel(state.kioskSuccess.eventType))} Â· ${escapeHTML(timeText(state.kioskSuccess.occurredAt))}</span><p>${state.kioskSuccess.photoCaptured ? L('æ‰“å¡å·²è®°å½•ï¼Œç°åœºç…§ç‰‡å·²å®‰å…¨ä¸Šä¼ ä¸”ä¸ä¼šä¿å­˜åœ¨ç”µè„‘ä¸­ã€‚', 'Fichaje registrado. La foto se subiÃ³ de forma segura y no se guardÃ³ en el ordenador.') : L('æ‰“å¡å·²è®°å½•ï¼Œç³»ç»Ÿå°†è‡ªåŠ¨é€€å‡ºã€‚', 'Fichaje registrado. La pantalla se cerrarÃ¡ automÃ¡ticamente.')}</p></div>` : `
-        <p class="eyebrow">FICHAJE EN TIENDA</p><h1>${L('é€‰æ‹©ä½ çš„å§“å', 'Elige tu nombre')}</h1><p>${L('ç¡®è®¤å§“ååè¾“å…¥ä¸ªäºº6ä½PINã€‚ä¸Šç­å’Œä¸‹ç­ä¼šè‡ªåŠ¨æ‹æ‘„ç°åœºç…§ç‰‡ï¼›ç…§ç‰‡ä¸ä¼šä¿å­˜åœ¨è¿™å°ç”µè„‘ä¸­ã€‚', 'DespuÃ©s introduce tu PIN personal de 6 cifras. En la entrada y la salida se harÃ¡ una foto automÃ¡tica que no se guardarÃ¡ en este ordenador.')}</p>
-        <input id="employeeSearch" type="search" placeholder="${L('æœç´¢å§“åâ€¦', 'Buscar nombreâ€¦')}" autocomplete="off">
-        <div class="employee-picker" id="employeePicker">${renderEmployeeChoices(state.kioskEmployees, selected)}</div>
-        ${selected ? `<div class="pin-box"><label>${L('ä¸ªäºº6ä½PIN', 'PIN personal de 6 cifras')}<input id="kioskPin" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" autofocus></label></div>
-          <div class="punch-actions">${selected.nextActions.map((action) => `<button class="${action === 'clock_out' ? 'secondary-btn' : 'primary-btn'}" type="button" data-punch="${action}">${eventLabel(action)}</button>`).join('') || `<p>${L('ä»Šå¤©å·²ç»å®Œæˆæ‰“å¡', 'La jornada de hoy ya estÃ¡ completa')}</p>`}</div>` : ''}
-      `}
-    </section>
-    <footer class="kiosk-footer"><button class="link-btn" id="kioskRefresh" type="button">â†» ${L('åˆ·æ–°', 'Actualizar')}</button><button class="link-btn" id="exitKiosk" type="button">${L('è¿”å›ç™»å½•', 'Volver al acceso')}</button></footer>
-  </main>`;
-  bindKiosk();
-}
-
-function renderEmployeeChoices(employees, selected) {
-  if (!employees.length) return `<div class="empty">${L('ä»Šå¤©æ²¡æœ‰æ’åœ¨æ­¤åº—çš„å‘˜å·¥ï¼Œè¯·æ£€æŸ¥å·²å‘å¸ƒæ’ç­', 'No hay empleados asignados hoy a esta tienda. Revisa el horario publicado')}</div>`;
-  return employees.map((employee) => `<button class="employee-choice ${selected?.user_id === employee.user_id ? 'active' : ''}" type="button" data-employee="${employee.user_id}"><b>${escapeHTML(employee.full_name)}</b><small>${escapeHTML(employee.employee_no)} Â· ${employee.events.length ? eventLabel(employee.events.at(-1).event_type) + ' ' + timeText(employee.events.at(-1).occurred_at) : L('å°šæœªæ‰“å¡', 'Sin fichar')}</small></button>`).join('');
-}
-
-function bindKiosk() {
-  $('#exitKiosk')?.addEventListener('click', () => { clearTimeout(kioskResetTimer); renderAuth(); });
-  $('#kioskRefresh')?.addEventListener('click', openKiosk);
-  $('#employeeSearch')?.addEventListener('input', (event) => {
-    const term = event.target.value.trim().toLowerCase();
-    const list = state.kioskEmployees.filter((employee) => `${employee.full_name} ${employee.employee_no}`.toLowerCase().includes(term));
-    $('#employeePicker').innerHTML = renderEmployeeChoices(list, state.kioskEmployees.find((item) => item.user_id === state.kioskSelected));
-    bindEmployeeChoices();
-  });
-  bindEmployeeChoices();
-  $$('[data-punch]').forEach((button) => button.addEventListener('click', () => kioskPunch(button.dataset.punch)));
-}
-
-function bindEmployeeChoices() {
-  $$('[data-employee]').forEach((button) => button.addEventListener('click', () => {
-    state.kioskSelected = button.dataset.employee; renderKiosk();
-  }));
-}
-
-function kioskPhotoRequired(eventType) {
-  return eventType === 'clock_in' || eventType === 'clock_out';
-}
-
-function waitMs(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function captureKioskPhoto(eventType) {
-  if (!navigator.mediaDevices?.getUserMedia) throw new Error('CAMERA_UNAVAILABLE');
-  const modalRoot = $('#modalRoot');
-  let stream = null;
-  let video = null;
-  try {
-    modalRoot.innerHTML = `<section class="modal camera-modal" role="dialog" aria-modal="true" aria-labelledby="cameraTitle">
-      <div class="modal-head"><div><p class="eyebrow">LIVE PHOTO</p><h2 id="cameraTitle">${eventLabel(eventType)} Â· ${L('ç°åœºæ‹ç…§', 'Foto en directo')}</h2></div><button class="close-btn" id="cameraCancel" type="button" aria-label="${L('å–æ¶ˆ', 'Cancelar')}">Ã—</button></div>
-      <p>${L('è¯·æœ¬äººæ­£å¯¹æ‘„åƒå¤´ã€‚ç”»é¢å°†åœ¨2ç§’åè‡ªåŠ¨æ‹æ‘„ï¼Œç…§ç‰‡ä¸ä¼šä¿å­˜åœ¨ç”µè„‘é‡Œã€‚', 'Mira de frente a la cÃ¡mara. La foto se harÃ¡ automÃ¡ticamente en 2 segundos y no se guardarÃ¡ en el ordenador.')}</p>
-      <div class="camera-frame"><video id="kioskCamera" autoplay muted playsinline></video><strong id="cameraCountdown">â€¦</strong></div>
-      <p class="camera-status" id="cameraStatus">${L('æ­£åœ¨å¯åŠ¨æ‘„åƒå¤´â€¦', 'Iniciando la cÃ¡maraâ€¦')}</p>
-    </section>`;
-    $('#cameraCancel')?.addEventListener('click', () => { modalRoot.innerHTML = ''; });
-
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
-        audio: false,
-      });
-    } catch (error) {
-      if (error?.name === 'NotAllowedError' || error?.name === 'SecurityError') throw new Error('CAMERA_PERMISSION_DENIED');
-      throw new Error('CAMERA_UNAVAILABLE');
-    }
-    video = $('#kioskCamera');
-    if (!video) throw new Error('CAMERA_CANCELLED');
-    video.srcObject = stream;
-    if (video.readyState < 2) {
-      await Promise.race([
-        new Promise((resolve, reject) => {
-          video.addEventListener('loadeddata', resolve, { once: true });
-          video.addEventListener('error', () => reject(new Error('CAMERA_UNAVAILABLE')), { once: true });
-        }),
-        waitMs(10_000).then(() => { throw new Error('CAMERA_UNAVAILABLE'); }),
-      ]);
-    }
-    await video.play();
-    for (const number of [2, 1]) {
-      if (!video.isConnected) throw new Error('CAMERA_CANCELLED');
-      $('#cameraCountdown').textContent = String(number);
-      $('#cameraStatus').textContent = L('è¯·ä¿æŒæ­£å¯¹æ‘„åƒå¤´', 'MantÃ©n la mirada hacia la cÃ¡mara');
-      await waitMs(1000);
-    }
-    if (!video.isConnected || !video.videoWidth || !video.videoHeight) throw new Error('CAMERA_UNAVAILABLE');
-
-    const scale = Math.min(1, 640 / video.videoWidth, 480 / video.videoHeight);
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
-    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
-    const context = canvas.getContext('2d', { alpha: false });
-    if (!context) throw new Error('CAMERA_UNAVAILABLE');
-    context.translate(canvas.width, 0);
-    context.scale(-1, 1);
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const photoDataUrl = canvas.toDataURL('image/jpeg', 0.72);
-    canvas.width = 1;
-    canvas.height = 1;
-    if (!photoDataUrl.startsWith('data:image/jpeg;base64,') || photoDataUrl.length > 600_100) throw new Error('PHOTO_TOO_LARGE');
-    $('#cameraCountdown').textContent = 'âœ“';
-    $('#cameraStatus').textContent = L('ç…§ç‰‡å·²æ‹æ‘„ï¼Œæ­£åœ¨å®‰å…¨ä¸Šä¼ â€¦', 'Foto realizada. Subiendo de forma seguraâ€¦');
-    return { photoDataUrl, photoCapturedAt: new Date().toISOString() };
-  } finally {
-    stream?.getTracks().forEach((track) => track.stop());
-    if (video) video.srcObject = null;
-    if (modalRoot) modalRoot.innerHTML = '';
-  }
-}
-
-async function kioskPunch(eventType) {
-  const pin = $('#kioskPin')?.value || '';
-  if (!/^\d{6}$/.test(pin)) { toast(L('è¯·è¾“å…¥6ä½PIN', 'Introduce el PIN de 6 cifras'), true); return; }
-  if (state.busy) return;
-  state.busy = true;
-  $$('[data-punch]').forEach((button) => { button.disabled = true; });
-  try {
-    const photo = kioskPhotoRequired(eventType) ? await captureKioskPhoto(eventType) : null;
-    const result = await rawFunction('kiosk-punch', {
-      action: 'punch', ...state.kiosk, employeeId: state.kioskSelected, pin, eventType,
-      ...(photo || {}),
-    });
-    state.kioskSuccess = { name: result.employee.name, eventType, occurredAt: result.event.occurredAt, photoCaptured: result.photoCaptured };
-    renderKiosk();
-    kioskResetTimer = setTimeout(() => openKiosk(), 5000);
-  } catch (error) {
-    if (forgetKioskIfInvalid(error)) { toast(errorText(error), true); renderAuth(); return; }
-    toast(errorText(error), true);
-    const pinInput = $('#kioskPin');
-    if (pinInput) { pinInput.value = ''; pinInput.focus(); }
-  }
-  finally {
-    state.busy = false;
-    $$('[data-punch]').forEach((button) => { button.disabled = false; });
-  }
-}
-
-async function loadPortalData() {
-  if (!state.profile) return;
-  if (state.profile.role === 'manager') await loadManagerData(); else await loadEmployeeData();
-}
-
-function assertQueryResults(results) {
-  const failed = results.find((result) => result?.error);
-  if (!failed) return;
-  console.error('Supabase data query failed:', failed.error);
-  throw new Error('DATA_LOAD_FAILED');
-}
-
-async function checkSystemHealth() {
-  const functionNames = ['admin-api', 'kiosk-punch', 'gps-punch'];
-  const checks = await Promise.all(functionNames.map(async (name) => {
-    try {
-      const result = await functionRequest(name, { action: 'health' }, { timeoutMs: 8_000 });
-      return { name, ok: result?.release === FUNCTION_RELEASES[name], release: result?.release || '' };
-    } catch (error) {
-      return { name, ok: false, error: errorText(error) };
-    }
-  }));
-  state.health = checks;
-}
-
-async function loadEmployeeData() {
-  const today = madridDate();
-  const monthStart = `${today.slice(0, 7)}-01`;
-  const scheduleStart = monthStart < addDays(today, -7) ? monthStart : addDays(today, -7);
-  const now = new Date().toISOString();
-  const dayStart = madridLocalToIso(today, '00:00');
-  const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
-  const [stores, schedules, attendance, requests, permissions, todayEvents] = await Promise.all([
-    client.from('stores').select('*').eq('active', true).order('name'),
-    client.from('schedules').select('*, stores(name,address)').gte('work_date', scheduleStart).lte('work_date', addDays(today, 14)).order('work_date'),
-    client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
-    client.from('requests').select('*').order('created_at', { ascending: false }).limit(50),
-    client.from('gps_permissions').select('*, stores(name,address,latitude,longitude,radius_m)').eq('active', true).lte('valid_from', now).gte('valid_until', now).order('valid_until'),
-    client.from('attendance_events').select('employee_id,store_id,event_type,occurred_at')
-      .eq('employee_id', state.profile.user_id).gte('occurred_at', dayStart).lt('occurred_at', dayEnd)
-      .order('occurred_at'),
-  ]);
-  assertQueryResults([stores, schedules, attendance, requests, permissions]);
-  const attendanceRows = attendance.data || [];
-  const cachedEvents = readJSON(PUNCH_CACHE_STORAGE, []).filter((item) =>
-    item?.employee_id === state.profile.user_id && item?.work_date === today
-  );
-  const serverEvents = !todayEvents.error ? (todayEvents.data || []) : [];
-  const effectiveEvents = [...serverEvents, ...cachedEvents].sort((a, b) =>
-    String(a.occurred_at).localeCompare(String(b.occurred_at))
-  );
-  if (effectiveEvents.length) {
-    const existingIndex = attendanceRows.findIndex((item) => item.work_date === today);
-    const existing = existingIndex >= 0 ? attendanceRows[existingIndex] : {
-      employee_id: state.profile.user_id,
-      store_id: effectiveEvents[0]?.store_id || null,
-      work_date: today,
-    };
-    const merged = { ...existing };
-    for (const event of effectiveEvents) {
-      const field = ({ clock_in: 'clock_in', break_start: 'break_start', break_end: 'break_end', clock_out: 'clock_out' })[event.event_type];
-      if (field && !merged[field]) merged[field] = event.occurred_at;
-    }
-    if (existingIndex >= 0) attendanceRows[existingIndex] = merged;
-    else attendanceRows.unshift(merged);
-  }
-  if (todayEvents.error) console.warn('Attendance event fallback unavailable:', todayEvents.error);
-  state.data = {
-    stores: stores.data || [],
-    schedules: schedules.data || [],
-    attendance: attendanceRows,
-    requests: requests.data || [],
-    permissions: permissions.data || [],
-  };
-}
-async function loadManagerData() {
-  const today = madridDate();
-  const attendanceMonth = state.attendanceMonth || today.slice(0,7);
-  const monthStart = `${attendanceMonth}-01`;
-  const attendanceEnd = attendanceMonth === today.slice(0,7) ? today : monthLastDate(attendanceMonth);
-  const scheduleMonth = currentScheduleMonth();
-  const scheduleStart = addDays(`${scheduleMonth}-01`, -7);
-  const scheduleEnd = monthLastDate(scheduleMonth);
-  const scheduleQueryStart = scheduleStart < monthStart ? scheduleStart : monthStart;
-  const scheduleQueryEnd = scheduleEnd > today ? scheduleEnd : today;
-  const leaveYear = scheduleMonth.slice(0, 4);
-  const dayStart = madridLocalToIso(today, '00:00');
-  const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
-  const photoStart = new Date(Date.now() - 30 * 86_400_000).toISOString();
-  const [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents, annualLeave] = await Promise.all([
-    client.from('stores').select('*').order('name'),
-    client.from('profiles').select('*, stores(name)').eq('role', 'employee').order('full_name'),
-    client.from('schedules').select('*, stores(name)').gte('work_date', scheduleQueryStart).lte('work_date', scheduleQueryEnd).order('work_date'),
-    client.from('schedules').select('*, stores(name)').eq('work_date', today).order('starts_at'),
-    client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
-    client.from('requests').select('*').order('created_at', { ascending: false }).limit(100),
-    client.from('gps_permissions').select('*, stores(name)').eq('active', true).gte('valid_until', new Date().toISOString()).order('valid_until'),
-    client.from('kiosk_devices').select('*, stores(name)').order('created_at', { ascending: false }),
-    client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', attendanceEnd).order('work_date', { ascending: false }),
-    client.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(100),
-    client.from('attendance_events').select('id, employee_id, store_id, event_type, source, occurred_at, metadata, stores(name)')
-      .eq('source', 'kiosk').in('event_type', ['clock_in', 'clock_out']).gte('occurred_at', photoStart)
-      .order('occurred_at', { ascending: false }).limit(1500),
-    client.from('schedules').select('employee_id, work_date').eq('schedule_kind', 'annual_leave').eq('published', true)
-      .gte('work_date', `${leaveYear}-01-01`).lte('work_date', `${leaveYear}-12-31`).order('work_date'),
-  ]);
-  const results = [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents];
-  assertQueryResults(results);
-  const employeeById = new Map((employees.data || []).map((employee) => [employee.user_id, employee]));
-  const attachEmployee = (items) => (items || []).map((item) => ({ ...item, profiles: employeeById.get(item.employee_id) || null }));
-  state.data = {
-    stores: stores.data || [],
-    employees: employees.data || [],
-    schedules: attachEmployee(schedules.data),
-    todaySchedules: attachEmployee(todaySchedules.data),
-    events: attachEmployee(events.data),
-    requests: attachEmployee(requests.data),
-    permissions: attachEmployee(permissions.data),
-    devices: devices.data || [],
-    attendance: attendance.data || [],
-    audits: audits.data || [],
-    photoEvents: attachEmployee(photoEvents.data),
-    annualLeave: annualLeave.data || [],
-    annualLeaveReady: !annualLeave.error,
-  };
-  if (!state.health) await checkSystemHealth();
-}
-
-function navItems() {
-  return state.profile.role === 'manager'
-    ? [['home', L('å››åº—æ€»è§ˆ', 'Resumen')], ['employees', L('å‘˜å·¥è´¦å·', 'Empleados')], ['schedule', L('æ’ç­', 'Horarios')], ['requests', L('ç”³è¯·å®¡æ‰¹', 'Solicitudes')], ['gps', L('GPSæˆæƒ', 'Permisos GPS')], ['stores', L('åº—é“ºè®¾ç½®', 'Tiendas')], ['export', L('è€ƒå‹¤ä¸æŠ¥è¡¨', 'Jornada e informes')]]
-    : [['home', L('æˆ‘çš„é¦–é¡µ', 'Mi inicio')], ['records', L('è€ƒå‹¤è®°å½•', 'Mis fichajes')], ['requests', L('æäº¤ç”³è¯·', 'Solicitudes')], ['profile', L('ä¸ªäººèµ„æ–™', 'Mi perfil')]];
-}
-
-function renderNavigation(items) {
-  const button = ([view,label]) => `<button class="nav-btn ${state.view === view ? 'active' : ''}" data-view="${view}">${label}</button>`;
-  if (state.profile.role !== 'manager') return items.map(button).join('');
-  const daily = ['home','schedule','export','requests','employees'].map(view=>items.find(item=>item[0]===view)).filter(Boolean);
-  const extra = items.filter(item=>!daily.includes(item));
-  return daily.map(button).join('') + `<details class="nav-extra" ${extra.some(item=>item[0]===state.view) ? 'open' : ''}><summary>${L('æ›´å¤šè®¾ç½®','MÃ¡s ajustes')}</summary>${extra.map(button).join('')}</details>`;
-}
-
-function renderPortal() {
-  const items = navItems();
-  if (!items.some(([view]) => view === state.view)) state.view = 'home';
-  const currentTitle = items.find(([view]) => view === state.view)?.[1] || '';
-  app.innerHTML = `<div class="app-layout">
-    <aside class="sidebar"><div class="brand-lockup"><span class="brand-mark">H</span><span><b>HOLA!SEVILLA</b><small>CONTROL HORARIO</small></span></div>
-      <nav>${renderNavigation(items)}</nav>
-      <div class="sidebar-bottom"><div class="account-chip"><b>${escapeHTML(state.profile.full_name)}</b><small>${state.profile.role === 'manager' ? 'VIVI Â· MANAGER' : `${escapeHTML(state.profile.employee_no)} Â· ${escapeHTML(state.profile.stores?.name || '')}`}</small></div><button class="ghost-btn" id="logout" type="button">${L('é€€å‡ºç™»å½•', 'Cerrar sesiÃ³n')}</button></div>
-    </aside>
-    <main class="main-area"><header class="topbar"><div><p class="eyebrow">${state.profile.role === 'manager' ? 'VIVI Â· 4 STORES' : escapeHTML(state.profile.stores?.name || 'HOLA!SEVILLA')}</p><h1>${currentTitle}</h1></div><div class="top-actions">${languageButton()}<button class="ghost-btn" id="refreshData" type="button">â†»</button><div class="date-chip"><b id="portalClock">${timeText(new Date())}</b><small>${madridDisplay()}</small></div></div></header>
-      <section class="view">${renderPortalView()}</section></main>
-    <nav class="mobile-nav">${items.map(([view, label]) => `<button class="${state.view === view ? 'active' : ''}" data-view="${view}" type="button">${label}</button>`).join('')}</nav>
-  </div>`;
-  bindPortal();
-}
-
-function renderPortalView() {
-  if (state.profile.role === 'manager') {
-    return ({ home: renderManagerHome, employees: renderEmployees, schedule: renderSchedule, requests: renderManagerRequests, gps: renderGpsAdmin, stores: renderStores, export: renderExport })[state.view]?.() || '';
-  }
-  return ({ home: renderEmployeeHome, records: renderRecords, requests: renderEmployeeRequests, profile: renderProfile })[state.view]?.() || '';
-}
-
-function renderEmployeeHome() {
-  const today = madridDate();
-  const schedule = state.data.schedules.find((item) => item.work_date === today);
-  const record = state.data.attendance.find((item) => item.work_date === today);
-  const permissions = state.data.permissions || [];
-  const annualLeave = scheduleKind(schedule) === 'annual_leave';
-  const status = record?.clock_out ? L('ä»Šæ—¥å·²å®Œæˆ', 'Jornada completada') : record?.clock_in ? L('å·¥ä½œè¿›è¡Œä¸­', 'Jornada en curso') : annualLeave ? L('ä»Šå¤©å¹´å‡', 'Vacaciones') : schedule?.is_day_off ? L('ä»Šå¤©ä¼‘æ¯', 'DÃ­a libre') : L('ç­‰å¾…åˆ°åº—', 'Pendiente de entrada');
-  return `<div class="page-grid">
-    <article class="card hero-card"><div><p class="eyebrow">${dateText(today)}</p><h2>${escapeHTML(state.profile.full_name)}ï¼Œ${status}</h2><p>${schedule ? (annualLeave ? L('æ’ç­ï¼šå¹´å‡', 'Horario: vacaciones') : schedule.is_day_off ? L('æ’ç­ï¼šä¼‘æ¯', 'Horario: descanso') : `${escapeHTML(schedule.stores?.name || '')} Â· ${timeText(schedule.starts_at)}â€”${timeText(schedule.ends_at)}`) : L('VIVIå°šæœªå‘å¸ƒä»Šå¤©çš„æ’ç­', 'VIVI todavÃ­a no ha publicado el horario de hoy')}</p></div><div class="hero-meta"><span>${L('æ‰‹æœºå®šä½ï¼šåº—é“º20ç±³å†…æ‰“å¡', 'MÃ³vil: fichaje dentro de 20 m')}</span><span>${L('åº—é“ºç”µè„‘ï¼šPINæ‰“å¡', 'Ordenador: fichaje con PIN')}</span></div></article>
-    <article class="card summary-card"><div class="metric"><span>${L('ä¸Šç­', 'Entrada')}</span><b>${timeText(record?.clock_in)}</b></div><div class="metric"><span>${L('ä¼‘æ¯', 'Pausa')}</span><b>${timeText(record?.break_start)}â€“${timeText(record?.break_end)}</b></div><div class="metric"><span>${L('ä¸‹ç­', 'Salida')}</span><b>${timeText(record?.clock_out)}</b></div></article>
-  </div>
-  ${renderScheduledMobilePunch(schedule, record)}
-  ${permissions.map((permission) => renderGpsCard(permission, record)).join('')}
-  <article class="card"><div class="section-head"><div><p class="eyebrow">NEXT 7 DAYS</p><h2>${L('è¿‘æœŸæ’ç­', 'PrÃ³ximos turnos')}</h2></div></div>${scheduleTable(state.data.schedules.filter((item) => item.work_date >= today).slice(0, 7), false)}</article>`;
-}
-
-function renderScheduledMobilePunch(schedule, record) {
-  const nextActions = nextActionsFromRecord(record);
-  let content;
-  if (!schedule) {
-    content = `<div class="callout warning"><b>${L('ä¸èƒ½æ‰“å¡', 'No disponible')}</b><span>${L('ä»Šå¤©æ²¡æœ‰å·²å‘å¸ƒçš„æ’ç­ï¼Œè¯·è”ç³»VIVIã€‚', 'No hay horario publicado para hoy. Contacta con VIVI.')}</span></div>`;
-  } else if (schedule.is_day_off) {
-    content = scheduleKind(schedule) === 'annual_leave'
-      ? `<div class="callout"><b>${L('ä»Šæ—¥å¹´å‡', 'Vacaciones')}</b><span>${L('å¹´å‡æœŸé—´ä¸æ˜¾ç¤ºæ‰“å¡æŒ‰é’®ã€‚', 'No se muestran botones de fichaje durante las vacaciones.')}</span></div>`
-      : `<div class="callout"><b>${L('ä»Šæ—¥ä¼‘æ¯', 'DÃ­a libre')}</b><span>${L('ä¼‘æ¯æ—¥ä¸æ˜¾ç¤ºæ‰“å¡æŒ‰é’®ã€‚', 'No se muestran botones de fichaje en un dÃ­a libre.')}</span></div>`;
-  } else if (!nextActions.length) {
-    content = `<span class="status ok">${L('ä»Šå¤©å·²ç»å®Œæˆæ‰“å¡', 'La jornada de hoy ya estÃ¡ completa')}</span>`;
-  } else {
-    content = `<div class="button-row">${nextActions.map((event) => `<button class="${event === 'clock_out' ? 'secondary-btn' : 'primary-btn'}" data-gps-punch="${event}" type="button">${eventLabel(event)}</button>`).join('')}</div>`;
-  }
-  return `<article class="card"><p class="eyebrow">MOBILE GPS PUNCH</p><h2>${L('åº—é“º20ç±³å†…æ‰‹æœºæ‰“å¡', 'Fichaje mÃ³vil dentro de 20 m')}</h2><p>${schedule && !schedule.is_day_off ? `${escapeHTML(schedule.stores?.name || '')}<br>${escapeHTML(schedule.stores?.address || '')}` : L('æ‰‹æœºæ‰“å¡å¿…é¡»å¯¹åº”å½“å¤©å·²å‘å¸ƒçš„æ’ç­ã€‚', 'El fichaje mÃ³vil debe corresponder al horario publicado de hoy.')}</p>${content}<div class="callout"><b>GPS Â· 20m</b><span>${L('ç‚¹å‡»æ‰“å¡æ—¶åªè¯»å–ä¸€æ¬¡ä½ç½®ã€‚å¿…é¡»å…è®¸ç²¾ç¡®å®šä½ï¼›ç³»ç»Ÿä¸ä¼šæŒç»­è¿½è¸ªã€‚', 'La ubicaciÃ³n se obtiene una sola vez al fichar. Debes permitir ubicaciÃ³n precisa; no hay seguimiento continuo.')}</span></div></article>`;
-}
-
-function renderGpsCard(permission, record) {
-  const used = permission.used_events || [];
-  const nextActions = nextActionsFromRecord(record);
-  const allowed = (permission.allowed_events || []).filter((event) => !used.includes(event) && nextActions.includes(event));
-  return `<article class="card"><p class="eyebrow">TEMPORARY GPS AUTHORIZATION</p><h2>${L('ç‰¹æ®Šæƒ…å†µæ‰‹æœºGPSæ‰“å¡å·²æˆæƒ', 'Fichaje GPS autorizado temporalmente')}</h2><p>${escapeHTML(permission.stores?.name || '')}<br>${madridDisplay(new Date(permission.valid_from), true)} â†’ ${madridDisplay(new Date(permission.valid_until), true)}<br>${escapeHTML(permission.reason)}</p><div class="button-row">${allowed.map((event) => `<button class="primary-btn" data-gps-punch="${event}" data-gps-permission="${permission.id}" type="button">${eventLabel(event)}</button>`).join('') || `<span class="status ok">${nextActions.length ? L('å½“å‰æ²¡æœ‰ç¬¦åˆé¡ºåºçš„å¯ç”¨åŠ¨ä½œ', 'No hay una acciÃ³n disponible en este momento') : L('ä»Šå¤©å·²ç»å®Œæˆæ‰“å¡', 'La jornada de hoy ya estÃ¡ completa')}</span>`}</div><div class="callout"><b>GPS Â· 20m</b><span>${L('ä¸´æ—¶è·¨åº—æ‰“å¡ä¹Ÿå¿…é¡»åœ¨æˆæƒåº—é“º20ç±³å†…ã€‚', 'El fichaje excepcional tambiÃ©n debe realizarse a menos de 20 m de la tienda autorizada.')}</span></div></article>`;
-}
-
-function scheduleKind(item) {
-  if (item?.schedule_kind === 'annual_leave') return 'annual_leave';
-  return item?.is_day_off ? 'day_off' : 'work';
-}
-
-function scheduleTable(items, showEmployee = true, editable = false) {
-  if (!items.length) return `<div class="empty">${L('æš‚æ— æ’ç­', 'No hay horarios')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('å‘˜å·¥', 'Empleado')}</th>` : ''}<th>${L('æ—¥æœŸ', 'Fecha')}</th><th>${L('åº—é“º', 'Tienda')}</th><th>${L('æ—¶é—´', 'Horario')}</th>${editable ? `<th>${L('æ“ä½œ', 'AcciÃ³n')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td><b>${escapeHTML(item.profiles?.full_name || '')}</b><br><small>${escapeHTML(item.profiles?.employee_no || '')}</small></td>` : ''}<td>${dateText(item.work_date)}</td><td>${scheduleKind(item) === 'annual_leave' ? 'â€”' : escapeHTML(item.stores?.name || '')}</td><td>${scheduleKind(item) === 'annual_leave' ? `<span class="status annual-leave">${L('å¹´å‡', 'Vacaciones')}</span>` : item.is_day_off ? `<span class="status">${L('ä¼‘æ¯', 'Libre')}</span>` : `${timeText(item.starts_at)}â€”${timeText(item.ends_at)}`}</td>${editable ? `<td>${item.profiles?.active === false ? 'â€”' : `<button class="ghost-btn" data-edit-schedule="${item.id}" type="button">${L('ä¿®æ”¹', 'Modificar')}</button>`}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
-}
-
-function renderRecords() {
-  return `<article class="card"><div class="section-head"><div><p class="eyebrow">OFFICIAL RECORDS</p><h2>${L('æœ¬æœˆè€ƒå‹¤è®°å½•', 'Registros de este mes')}</h2></div></div>${attendanceTable(state.data.attendance, false)}</article>`;
-}
-
-function attendanceTable(items, showEmployee = true, editable = false) {
-  if (!items.length) return `<div class="empty">${L('æš‚æ— è€ƒå‹¤è®°å½•', 'No hay registros')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('å‘˜å·¥', 'Empleado')}</th>` : ''}<th>${L('æ—¥æœŸ', 'Fecha')}</th><th>${L('åº—é“º', 'Tienda')}</th><th>${L('ä¸Šç­', 'Entrada')}</th><th>${L('ä¼‘æ¯', 'Pausa')}</th><th>${L('ä¸‹ç­', 'Salida')}</th><th>${L('æœ‰æ•ˆå·¥æ—¶', 'Horas efectivas')}</th><th>${L('çŠ¶æ€', 'Estado')}</th>${editable ? `<th>${L('æ“ä½œ', 'AcciÃ³n')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}â€“${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${item.correction_kind === 'absence' ? '0h 00m' : shiftDurationText(item)}</td><td><span class="status ${item.correction_kind === 'absence' ? 'alert' : item.corrected ? 'pending' : 'ok'}">${item.correction_kind === 'absence' ? L('ç¼ºå‹¤', 'Ausencia') : item.corrected ? L('å·²å®¡è®¡ä¿®æ­£', 'Corregido') : L('åŸå§‹è®°å½•', 'Original')}</span></td>${editable ? `<td><div class="button-row"><button type="button" class="ghost-btn" data-edit-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${item.corrected ? L('å†æ¬¡ä¿®æ”¹', 'Volver a corregir') : L('ä¿®æ”¹', 'Corregir')}</button>${item.corrected ? `<button type="button" class="ghost-btn danger" data-void-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${L('æ’¤é”€ä¿®æ­£', 'Anular correcciÃ³n')}</button>` : ''}</div></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
-}
-
-function renderEmployeeRequests() {
-  const today = madridDate();
-  return `<div class="split"><article class="card sticky-card"><p class="eyebrow">NEW REQUEST</p><h2>${L('æäº¤ç”³è¯·', 'Nueva solicitud')}</h2><p>${L('è¡¥å¡ã€è¯·å‡ã€GPSå¼‚å¸¸æˆ–è·¨åº—æ”¯æ´å‡åœ¨æ­¤æäº¤ã€‚', 'Solicita correcciÃ³n de fichaje, permiso, incidencia GPS o apoyo en otra tienda.')}</p><form id="requestForm" class="stack-form">
-    <label>${L('ç±»å‹', 'Tipo')}<select id="requestType"><option value="missed_punch">${L('è¡¥å¡ç”³è¯·', 'CorrecciÃ³n de fichaje')}</option><option value="leave">${L('è¯·å‡ç”³è¯·', 'Permiso / ausencia')}</option><option value="gps_issue">${L('GPSå¼‚å¸¸', 'Incidencia GPS')}</option><option value="cross_store">${L('è·¨åº—æ”¯æ´', 'Apoyo en otra tienda')}</option><option value="other">${L('å…¶ä»–', 'Otro')}</option></select></label>
-    <div class="form-row"><label>${L('æ—¥æœŸ', 'Fecha')}<input id="requestDate" type="date" value="${today}" required></label><label>${L('ç›¸å…³æ—¶é—´', 'Hora relacionada')}<input id="requestTime" type="time"></label></div>
-    <label>${L('æƒ…å†µè¯´æ˜', 'ExplicaciÃ³n')}<textarea id="requestReason" minlength="5" maxlength="1000" required></textarea></label><button class="primary-btn" type="submit">${L('æäº¤ç»™VIVI', 'Enviar a VIVI')}</button>
-  </form></article><article class="card"><p class="eyebrow">MY REQUESTS</p><h2>${L('æˆ‘çš„ç”³è¯·è®°å½•', 'Mis solicitudes')}</h2>${requestTable(state.data.requests, false)}</article></div>`;
-}
-
-function requestTable(items, manager = true) {
-  if (!items.length) return `<div class="empty">${L('æš‚æ— ç”³è¯·', 'No hay solicitudes')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${manager ? `<th>${L('å‘˜å·¥', 'Empleado')}</th>` : ''}<th>${L('ç±»å‹', 'Tipo')}</th><th>${L('æ—¥æœŸ', 'Fecha')}</th><th>${L('è¯´æ˜', 'ExplicaciÃ³n')}</th><th>${L('çŠ¶æ€', 'Estado')}</th>${manager ? `<th>${L('æ“ä½œ', 'AcciÃ³n')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${manager ? `<td>${escapeHTML(item.profiles?.full_name || '')}</td>` : ''}<td>${escapeHTML(requestTypeLabel(item.request_type))}</td><td>${dateText(item.request_date)}${item.related_time ? ` Â· ${escapeHTML(item.related_time.slice(0,5))}` : ''}</td><td>${escapeHTML(item.reason)}${item.review_note ? `<br><small>${L('å›å¤', 'Respuesta')}: ${escapeHTML(item.review_note)}</small>` : ''}</td><td><span class="status ${item.status}">${statusLabel(item.status)}</span></td>${manager ? `<td>${item.status === 'pending' ? `<div class="button-row"><button class="secondary-btn" data-review="approved" data-id="${item.id}">${L('æ‰¹å‡†', 'Aprobar')}</button><button class="danger-btn" data-review="rejected" data-id="${item.id}">${L('æ‹’ç»', 'Rechazar')}</button></div>` : 'â€”'}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
-}
-
-function requestTypeLabel(type) { return ({ missed_punch: L('è¡¥å¡', 'CorrecciÃ³n'), leave: L('è¯·å‡', 'Permiso'), gps_issue: L('GPSå¼‚å¸¸', 'GPS'), cross_store: L('è·¨åº—', 'Otra tienda'), other: L('å…¶ä»–', 'Otro') })[type] || type; }
-function statusLabel(status) { return ({ pending: L('å¾…å®¡æ‰¹', 'Pendiente'), approved: L('å·²æ‰¹å‡†', 'Aprobada'), rejected: L('å·²æ‹’ç»', 'Rechazada') })[status] || status; }
-
-function renderProfile() {
-  return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>${escapeHTML(state.profile.employee_no)} Â· ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('åœ¨èŒ', 'En activo') : L('åœç”¨', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article><article class="card summary-card"><p class="eyebrow">PRIVACY</p><h3>${L('æ•°æ®ã€ä½ç½®ä¸ç…§ç‰‡', 'Datos, ubicaciÃ³n y fotos')}</h3><p>${L('GPSåªåœ¨æ‰‹æœºæ‰“å¡æ—¶è¯»å–ä¸€æ¬¡ï¼Œä¸ä¼šæŒç»­è¿½è¸ªã€‚åº—é“ºç”µè„‘çš„ä¸Šç­å’Œä¸‹ç­æ‰“å¡ä¼šæ‹æ‘„ç°åœºç…§ç‰‡ï¼Œç…§ç‰‡ç›´æ¥ä¸Šä¼ è‡³ç§æœ‰äº‘ç«¯ï¼Œä¸ä¿å­˜åœ¨åº—é“ºç”µè„‘ï¼Œå¹¶åœ¨30å¤©åè‡ªåŠ¨åˆ é™¤ã€‚', 'El GPS solo se obtiene al fichar con el mÃ³vil y no realiza seguimiento continuo. En el ordenador de tienda se hace una foto en la entrada y la salida; se sube directamente al almacenamiento privado, no se guarda en el ordenador y se elimina automÃ¡ticamente despuÃ©s de 30 dÃ­as.')}</p></article></div>`;
-}
-
-function renderManagerHome() {
-  const active = state.data.employees.filter((item) => item.active);
-  const punched = new Set(state.data.events.filter((event) => event.event_type === 'clock_in').map((event) => event.employee_id));
-  const pending = state.data.requests.filter((item) => item.status === 'pending');
-  const unconfigured = state.data.stores.filter((store) => store.latitude === null || store.longitude === null);
-  const unhealthy = (state.health || []).filter((item) => !item.ok);
-  return `${unhealthy.length ? `<div class="callout warning"><b>${L('ç³»ç»Ÿç‰ˆæœ¬æœªåŒæ­¥', 'VersiÃ³n sin sincronizar')}</b><span>${L('ä»¥ä¸‹åå°éœ€è¦é‡æ–°éƒ¨ç½²ï¼š', 'Hay que volver a desplegar:')} ${unhealthy.map((item) => escapeHTML(item.name)).join('ã€')}</span></div>` : `<div class="callout"><b>${L('ç³»ç»Ÿæ­£å¸¸', 'Sistema correcto')}</b><span>${L('ç½‘é¡µã€æ•°æ®åº“ä¸ä¸‰å¥—åå°æœåŠ¡è¿æ¥æ­£å¸¸ã€‚', 'La web, la base de datos y los tres servicios estÃ¡n conectados.')}</span></div>`}
-  <div class="stat-grid"><article class="stat-card"><small>${L('åœ¨èŒå‘˜å·¥', 'Empleados activos')}</small><b>${active.length}</b></article><article class="stat-card"><small>${L('ä»Šæ—¥å·²ä¸Šç­æ‰“å¡', 'Entradas hoy')}</small><b>${punched.size}</b></article><article class="stat-card"><small>${L('å¾…å®¡æ‰¹', 'Pendientes')}</small><b>${pending.length}</b></article><article class="stat-card"><small>${L('GPSæœªé…ç½®åº—é“º', 'Tiendas sin GPS')}</small><b>${unconfigured.length}</b></article></div>
-  ${unconfigured.length ? `<div class="callout warning"><b>${L('ä¸Šçº¿å‰å¿…é¡»å®Œæˆ', 'Pendiente antes de publicar')}</b><span>${L('è¯·åœ¨â€œåº—é“ºè®¾ç½®â€ä¸­å¡«å†™å››åº—å‡†ç¡®åœ°å€ã€ç»çº¬åº¦å’Œæœ‰æ•ˆèŒƒå›´ã€‚æœªé…ç½®çš„åº—é“ºä¸èƒ½ä½¿ç”¨GPSæ‰“å¡ã€‚', 'Completa direcciÃ³n, coordenadas y radio de las cuatro tiendas. Sin ello no se permite el fichaje GPS.')}</span></div>` : ''}
-  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('ä»Šæ—¥å‘˜å·¥æ‰“å¡æ±‡æ€»', 'Resumen de fichajes de hoy')}</h2><p>${L('æŒ‰å½“å¤©æ’ç­åº—é“ºåˆ†ç»„ï¼Œæ¯åå‘˜å·¥çš„ä¸Šç­ã€ä¼‘æ¯å’Œä¸‹ç­è®°å½•é›†ä¸­åœ¨åŒä¸€è¡Œã€‚', 'Agrupado por la tienda programada; todos los fichajes de cada empleado aparecen en una sola fila.')}</p></div><span class="status ok">Europe/Madrid</span></div>${todayAttendanceSummary(state.data.events)}</article>`;
-}
-
-function todayAttendanceRows(events = []) {
-  const today = madridDate();
-  const scheduleSource = state.data.todaySchedules || state.data.schedules || [];
-  const schedules = scheduleSource.filter((item) => item.work_date === today && scheduleKind(item) === 'work');
-  const storeById = new Map((state.data.stores || []).map((store, index) => [store.id, { ...store, order: index }]));
-  const scheduleByEmployee = new Map(schedules.map((schedule) => [schedule.employee_id, schedule]));
-  const rows = new Map();
-
-  const ensureRow = ({ employeeId, storeId, profile, schedule }) => {
-    const resolvedStoreId = storeId || schedule?.store_id || profile?.store_id || '';
-    const key = `${employeeId || profile?.user_id || 'unknown'}::${resolvedStoreId || 'unknown'}`;
-    if (!rows.has(key)) {
-      const store = storeById.get(resolvedStoreId);
-      rows.set(key, {
-        key,
-        employeeId: employeeId || profile?.user_id || '',
-        employeeName: profile?.full_name || '',
-        employeeNo: profile?.employee_no || '',
-        storeId: resolvedStoreId,
-        storeName: store?.name || schedule?.stores?.name || '',
-        storeOrder: store?.order ?? Number.MAX_SAFE_INTEGER,
-        schedule: schedule || null,
-        events: {},
-        sources: new Set(),
-      });
-    }
-    const row = rows.get(key);
-    if (!row.schedule && schedule) row.schedule = schedule;
-    if (!row.employeeName && profile?.full_name) row.employeeName = profile.full_name;
-    if (!row.employeeNo && profile?.employee_no) row.employeeNo = profile.employee_no;
-    if (!row.storeName && schedule?.stores?.name) row.storeName = schedule.stores.name;
-    return row;
-  };
-
-  schedules.forEach((schedule) => ensureRow({
-    employeeId: schedule.employee_id,
-    storeId: schedule.store_id,
-    profile: schedule.profiles,
-    schedule,
-  }));
-
-  events.forEach((event) => {
-    const schedule = scheduleByEmployee.get(event.employee_id) || null;
-    const row = ensureRow({
-      employeeId: event.employee_id,
-      storeId: event.store_id || schedule?.store_id,
-      profile: event.profiles || schedule?.profiles,
-      schedule: event.store_id === schedule?.store_id ? schedule : null,
-    });
-    if (!row.storeName && event.stores?.name) row.storeName = event.stores.name;
-    if (event.source) row.sources.add(event.source);
-    const current = row.events[event.event_type];
-    const keepLatest = event.event_type === 'break_end' || event.event_type === 'clock_out';
-    if (!current || (keepLatest ? event.occurred_at > current.occurred_at : event.occurred_at < current.occurred_at)) {
-      row.events[event.event_type] = event;
-    }
-  });
-
-  return [...rows.values()].sort((a, b) => {
-    if (a.storeOrder !== b.storeOrder) return a.storeOrder - b.storeOrder;
-    const aStart = a.schedule?.starts_at || '99:99';
-    const bStart = b.schedule?.starts_at || '99:99';
-    return aStart.localeCompare(bStart)
-      || a.employeeName.localeCompare(b.employeeName, state.lang === 'zh' ? 'zh-CN' : 'es-ES')
-      || a.employeeNo.localeCompare(b.employeeNo);
-  });
-}
-
-function todayAttendanceStatus(row) {
-  if (row.events.clock_out) return { className: 'ok', label: L('å·²ä¸‹ç­', 'Finalizado') };
-  if (row.events.break_start && !row.events.break_end) return { className: 'pending', label: L('ä¼‘æ¯ä¸­', 'En pausa') };
-  if (row.events.clock_in) return { className: 'ok', label: L('å·¥ä½œä¸­', 'Trabajando') };
-  return { className: '', label: L('æœªä¸Šç­', 'Sin entrada') };
-}
-
-function todayAttendanceSummary(events) {
-  const rows = todayAttendanceRows(events);
-  if (!rows.length) return `<div class="empty">${L('ä»Šå¤©æš‚æ— æ’ç­å’Œæ‰“å¡è®°å½•', 'Hoy no hay horarios ni fichajes')}</div>`;
-  const groups = new Map();
-  rows.forEach((row) => {
-    const groupKey = row.storeId || row.storeName || 'unknown';
-    if (!groups.has(groupKey)) groups.set(groupKey, { name: row.storeName || L('æœªè¯†åˆ«åº—é“º', 'Tienda sin identificar'), rows: [] });
-    groups.get(groupKey).rows.push(row);
-  });
-
-  const timeCell = (event) => event ? `<b class="live-punch-time">${timeText(event.occurred_at)}</b>` : '<span class="live-punch-empty">â€”</span>';
-  const photoButtons = (row) => [
-    ['clock_in', L('ä¸Šç­ç…§', 'Entrada')],
-    ['clock_out', L('ä¸‹ç­ç…§', 'Salida')],
-  ].map(([type, label]) => {
-    const event = row.events[type];
-    return event?.metadata?.photo_path
-      ? `<button class="ghost-btn photo-button" data-view-photo="${event.id}" type="button">${label}</button>`
-      : '';
-  }).filter(Boolean).join('');
-
-  return `<div class="live-store-list">${[...groups.values()].map((group) => `<section class="live-store-group">
-    <div class="live-store-head"><h3>${escapeHTML(group.name)}</h3><span>${group.rows.length} ${L('äºº', 'personas')}</span></div>
-    <div class="table-wrap live-summary-table"><table><thead><tr><th>${L('å‘˜å·¥', 'Empleado')}</th><th>${L('æ’ç­', 'Horario')}</th><th>${L('ä¸Šç­', 'Entrada')}</th><th>${L('å¼€å§‹ä¼‘æ¯', 'Inicio pausa')}</th><th>${L('ç»“æŸä¼‘æ¯', 'Fin pausa')}</th><th>${L('ä¸‹ç­', 'Salida')}</th><th>${L('å½“å‰çŠ¶æ€', 'Estado')}</th><th>${L('æ–¹å¼', 'Origen')}</th><th>${L('ç°åœºç…§ç‰‡', 'Fotos')}</th></tr></thead><tbody>${group.rows.map((row) => {
-      const status = todayAttendanceStatus(row);
-      const sources = [...row.sources].map((source) => source === 'kiosk' ? L('ç”µè„‘', 'PC') : source.toUpperCase()).join(' + ');
-      const photos = photoButtons(row);
-      return `<tr><td class="live-employee"><b>${escapeHTML(row.employeeName)}</b><small>${escapeHTML(row.employeeNo)}</small></td><td>${row.schedule ? `${timeText(row.schedule.starts_at)}â€”${timeText(row.schedule.ends_at)}` : `<span class="status alert">${L('æ— æ’ç­', 'Sin horario')}</span>`}</td><td>${timeCell(row.events.clock_in)}</td><td>${timeCell(row.events.break_start)}</td><td>${timeCell(row.events.break_end)}</td><td>${timeCell(row.events.clock_out)}</td><td><span class="status ${status.className}">${status.label}</span></td><td>${sources ? `<span class="status ${row.sources.has('gps') ? 'pending' : 'ok'}">${escapeHTML(sources)}</span>` : 'â€”'}</td><td><div class="live-photo-actions">${photos || 'â€”'}</div></td></tr>`;
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éíçM¹Ñ:-jZ.¶›­–)Ş³V–×÷'B²7&VFT6Æ–VçBÒg&öÒv‡GG3¢òö6Fâæ§6FVÆ—g"ææWBöçÒô7W&6R÷7W&6RÖ§4"ã"ãò¶W6Òs° ¦6öç7BBÒ‡6VÆV7F÷"Â&ö÷BÒFö7VÖVçB’Óâ&ö÷BçVW'•6VÆV7F÷"‡6VÆV7F÷"“°¦6öç7BBBÒ‡6VÆV7F÷"Â&ö÷BÒFö7VÖVçB’Óâ²ââç&ö÷BçVW'•6VÆV7F÷$ÆÂ‡6VÆV7F÷"•Ó°¦6öç7BÒB‚r6r“°¦6öç7B6öæf–rÒv–æF÷rä„ôÄô4ôäd”rÇÂ·Ó°¦6öç7BÔE$”EõE¢Ò6öæf–rçF–ÖW¦öæRÇÂtWW&÷RôÖG&–Bs°¦6öç7B´”õ4µõ5Dõ$tRÒv†öÆ6Wf–ÆÆ¶–÷6µcs°¦6öç7BÄäuõ5Dõ$tRÒv†öÆ6Wf–ÆÆÆæwVvRs°¦6öç7BTä4…ô44„Uõ5Dõ$tRÒv†öÆ6Wf–ÆÆ&V6VçEVæ6†W5cs°¦6öç7BeTä5D”ôåõ$TÄT4U2Ò°¢vFÖ–âÖ’s¢s##bã’ãRã2rÀ¢v¶–÷6²×Væ6‚s¢s##bã’ãRãBrÀ¢vw2×Væ6‚s¢s##bã’ã#"ã"rÀ§Ó°¦6öç7B44„TETÄUõ5D%EôÔôåD‚Òs##bÓ’s°¦6öç7B$UTU5EõD”ÔTõUEôÕ2Ò#ó° ¦gVæ7F–öâv—F…F–ÖV÷WB‡&öÖ—6RÂF–ÖV÷WD×2Ò$UTU5EõD”ÔTõUEôÕ2’°¢ÆWBF–ÖW#°¢6öç7BF–ÖV÷WBÒæWr&öÖ—6R‚…òÂ&V¦V7B’Óâ°¢F–ÖW"Ò6WEF–ÖV÷WB‚‚’Óâ&V¦V7B†æWrW'&÷"‚u$UTU5EõD”ÔTõUBr’’ÂF–ÖV÷WD×2“°¢Ò“°¢&WGW&â&öÖ—6Rç&6R…·&öÖ—6RÂF–ÖV÷WEÒ’æf–æÆÇ’‚‚’Óâ6ÆV%F–ÖV÷WB‡F–ÖW"’“°§Ğ¦6öç7B6öæf–wW&VBÒõæ‡GG3¥ÂõÂõµâõÒµÂç7W&6UÂæ6òBòçFW7B†6öæf–rç7W&6UW&ÂÇÂrr¢bb7G&–ær†6öæf–rç7W&6UV&Æ—6†&ÆT¶W’ÇÂrr’ç7F'G5v—F‚‚w6%÷V&Æ—6†&ÆUòr“° ¦6öç7B6Æ–VçBÒ6öæf–wW&V@¢ò7&VFT6Æ–VçB†6öæf–rç7W&6UW&ÂÂ6öæf–rç7W&6UV&Æ—6†&ÆT¶W’Â°¢WFƒ¢²W'6—7E6W76–öã¢G'VRÂWFõ&Vg&W6…Fö¶Vã¢G'VRÂFWFV7E6W76–öä–åW&Ã¢G'VRÒÀ¢Ò¢¢çVÆÃ° ¦6öç7B7FFRÒ°¢Ææs¢Æö6Å7F÷&vRævWD—FVÒ„Ääuõ5Dõ$tR’ÇÂ†æf–vF÷"æÆæwVvSòçFôÆ÷vW$66R‚’ç7F'G5v—F‚‚w¦‚r’òw¦‚r¢vW2r’À¢VçG'“¢vV×Æ÷–VRrÀ¢6W76–öã¢çVÆÂÀ¢&öf–ÆS¢çVÆÂÀ¢f–Ws¢v†öÖRrÀ¢FF¢·ÒÀ¢¶–÷6³¢&VD¥4ôâ„´”õ4µõ5Dõ$tRÂçVÆÂ’À¢¶–÷6´V×Æ÷–VW3¢µÒÀ¢¶–÷6µ7F÷&S¢çVÆÂÀ¢¶–÷6µ6VÆV7FVC¢çVÆÂÀ¢¶–÷6µ7V66W73¢çVÆÂÀ¢†VÇFƒ¢çVÆÂÀ¢'W7“¢fÇ6RÀ¢66†VGVÆTÖöçFƒ¢çVÆÂÀ¢66†VGVÆTV×Æ÷–VT–C¢çVÆÂÀ§Ó° ¦ÆWB¶–÷6µ&W6WEF–ÖW#° ¦gVæ7F–öâ&VD¥4ôâ†¶W’ÂfÆÆ&6²’°¢G'’²&WGW&â¥4ôâç'6R†Æö6Å7F÷&vRævWD—FVÒ†¶W’’’óòfÆÆ&6³²Ò6F6‚²&WGW&âfÆÆ&6³²Ğ§Ğ ¦gVæ7F–öâ&VÖVÖ&W$6öæf—&ÖVEVæ6‚†WfVçEG—RÂö67W'&VDBÂ7F÷&T–BÒçVÆÂ’°¢–b‚7FFRç&öf–ÆSòçW6W%ö–BÇÂö67W'&VDB’&WGW&ã°¢6öç7Bv÷&´FFRÒÖG&–DFFR†æWrFFR†ö67W'&VDB’“°¢6öç7B7W'&VçBÒ&VD¥4ôâ…Tä4…ô44„Uõ5Dõ$tRÂµÒ“°¢6öç7B&WF–æVBÒ'&’æ—4'&’†7W'&VçB’ò7W'&VçBæf–ÇFW"‚†—FVÒ’Óà¢—FVÓòæV×Æ÷–VUö–Bbb—FVÓòçv÷&µöFFRãÒFDF—2†ÖG&–DFFR‚’ÂÓ"¢bb†—FVÒæV×Æ÷–VUö–BÓÓÒ7FFRç&öf–ÆRçW6W%ö–Bbb—FVÒçv÷&µöFFRÓÓÒv÷&´FFRbb—FVÒæWfVçE÷G—RÓÓÒWfVçEG—R¢’¢µÓ°¢&WF–æVBçW6‚‡°¢V×Æ÷–VUö–C¢7FFRç&öf–ÆRçW6W%ö–BÀ¢7F÷&Uö–C¢7F÷&T–BÇÂçVÆÂÀ¢v÷&µöFFS¢v÷&´FFRÀ¢WfVçE÷G—S¢WfVçEG—RÀ¢ö67W'&VEöC¢ö67W'&VDBÀ¢Ò“°¢Æö6Å7F÷&vRç6WD—FVÒ…Tä4…ô44„Uõ5Dõ$tRÂ¥4ôâç7G&–æv–g’‡&WF–æVBç6Æ–6R‚Ó#B’’“°§Ğ ¦gVæ7F–öâW66T…DÔÂ‡fÇVR’°¢&WGW&â7G&–ær‡fÇVRóòrr’ç&WÆ6R‚õ²cÃâr%ÒörÂ†6†&7FW"’Óâ‡°¢rbs¢rf×²rÂsÂs¢rfÇC²rÂsâs¢rfwC²rÂ"r#¢rb33“²rÂr"s¢rgV÷C²rÀ¢Ò•¶6†&7FW%Ò“°§Ğ ¦gVæ7F–öâÂ‡¦‚ÂW2’²&WGW&â7FFRæÆærÓÓÒw¦‚rò¦‚¢W3²Ğ¦gVæ7F–öâ6WDÆær†Æær’°¢7FFRæÆærÒÆærÓÓÒw¦‚ròw¦‚r¢vW2s°¢Æö6Å7F÷&vRç6WD—FVÒ„Ääuõ5Dõ$tRÂ7FFRæÆær“°¢Fö7VÖVçBæFö7VÖVçDVÆVÖVçBæÆærÒ7FFRæÆærÓÓÒw¦‚ròw¦‚Ô4âr¢vW2s°¢&VæFW$7W'&VçB‚“°§Ğ ¦ÆWBFö7EF–ÖW#°¦gVæ7F–öâFö7B†ÖW76vRÂW'&÷"ÒfÇ6R’°¢6öç7BVÆVÖVçBÒB‚r7Fö7Br“°¢6ÆV%F–ÖV÷WB‡Fö7EF–ÖW"“°¢VÆVÖVçBçFW‡D6öçFVçBÒÖW76vS°¢VÆVÖVçBç7G–ÆRæ&6¶w&÷VæBÒW'&÷"òr3†c33&br¢r3S##Rs°¢VÆVÖVçBæ6Æ74Æ—7BæFB‚w6†÷rr“°¢Fö7EF–ÖW"Ò6WEF–ÖV÷WB‚‚’ÓâVÆVÖVçBæ6Æ74Æ—7Bç&VÖ÷fR‚w6†÷rr’Â3#“°§Ğ ¦gVæ7F–öâW'&÷%FW‡B†W'&÷"’°¢6öç7B6öFRÒ7G&–ær†W'&÷#òæ6öFRÇÂW'&÷#òæÖW76vRÇÂW'&÷#òæW'&÷"ÇÂW'&÷"ÇÂuTä´äõtåôU%$õ"r“°¢6öç7BÖW76vW2Ò°¢”ådÄ”EôÄôt”åô5$TDTåD”Å3¢Â‚~h˜¾iË®Xû~h‰nZønzKˆŞjÚ>zârÂuFVÌ:–föæòò6öçG&6\;–æ6÷'&V7F÷2r’À¢”ådÄ”Eõ„ôäS¢Â‚~h˜¾iË®Xû~jÎ[ÈşKˆŞjÚ>zîûÈÎŠû~Z¾XiZèÎi[NXû~zûÈÎKè¾Zh"³3BcrÂtVÂFVÌ:–föæòæòW2l:Æ–FòâW6VÂf÷&ÖFò6ö×ÆWFòÂ÷"V¦V×Æò³3Bcr’À¢”ådÄ”Eõ”ã¢Â‚~KŠ®K«¥”îKˆŞjÚ>zârÂu”âW'6öæÂ–æ6÷'&V7Fòr’À¢”åôÕU5Eô$UóeôD”t•E3¢Â‚u”î[ø^š¾iŠónKØŞi[ZÙrrÂtVÂ”âFV&RFVæW"b6–g&2r’À¢”åôäõEô4ôäd”uU$TC¢Â‚~Šú^Y[z^[	®iÊ®Šëî{Úå”îûÈÎŠû~yKd•d˜xŞŠëå”ârÂtW7FRV×ÆVFòæòF–VæR”ââd•d’FV&R&W7F&ÆV6W&Æòr’À¢”åõDTÕõ$$”Å•ôÄô4´TC¢Â‚u”î™IŠúşjÊi[‹ø~ZI®ûÈÎŠûs^Xˆn™)şYî˜xŞŠùRrÂtFVÖ6–F÷2–çFVçF÷2â'VV&VâRÖ–çWF÷2r’À¢äõEô54”täTEõDõõD„•5õ5Dõ$S¢Â‚~KÚK¸®ZJiÊ®Š*¾Zèhé.YÊjÚN[©rrÂt†÷’æòW7L:26–væFòW7FF–VæFr’À¢”ådÄ”EôUdTåEõ4UTTä4S¢Â‚~h™>XÚš®[¨şKˆŞjÚ>zîûÈÎŠû~X‹~ikYî˜xŞŠùRrÂu6V7VVæ6–FRf–6†¦R–æ6÷'&V7Fr’À¢”ådÄ”Eô”åUC¢Â‚~Z¾Xiy¨NKúhşKˆŞZèÎi[Nh‰njÎ[ÈşKˆŞjÚ>zârÂtfÇFâFF÷2òVÂf÷&ÖFòæòW2l:Æ–Fòr’À¢”ådÄ”EõD”ÔUõ$ätS¢Â‚~{¹>iÙşi{n™{N[ø^š¾i™®K¨î[ÈZx¾i{n™{BrÂtÆ†÷&f–æÂFV&R6W"÷7FW&–÷"Æ–æ–6–Âr’À¢DôõôT$Å•õDõô4Äô4µô”ã¢Â‚~‹ùiÊ®X‹h™>XÚi{n™{NûÈÎKˆ®xúŞXÚXú®ˆ;ŞYÊhé.xúŞ[ÈZx¾X˜Ó^Xˆn™)şXh^h™2rÂt;¦âW2&öçFòâÆVçG&F6öÆòVVFRf–6†'6RFW6FRRÖ–çWF÷2çFW2FVÂGW&æòâr’À¢”ådÄ”Eõtõ$´DDS¢Â‚~iz^iÉşjÎ[ÈşKˆŞjÚ>zîûÈÎŠû~˜xŞik˜hºiz^iÉòrÂtÆfV6†æòW2l:Æ–Fâ6VÆV66œ;6æÆFRçVWfòr’À¢”ådÄ”Eõ44„TETÄUõD”ÔS¢Â‚~hé.xúŞ{¹>iÙşi{n™{N[ø^š¾i™®K¨î[ÈZx¾i{n™{BrÂtVÂf–âFVÂGW&æòFV&R6W"÷7FW&–÷"Â–æ–6–òr’À¢”ådÄ”EôÔôåDƒ¢Â‚~Šû~˜hºiÈiXy¨Nhé.xúŞiÈK»ÒrÂu6VÆV66–öæVâÖW2l:Æ–Fòr’À¢”ådÄ”EõtTTµõEDU$ã¢Â‚~Šû~j8iú^KˆYjŠiÛşûÈÎjøşKŠ®[z^KÙÎiz^˜;ŞŠhZ¾XijÚ>zîy¨N[©~™;®Y(Îi{n™{BrÂu&Wf—6ÆÆçF–ÆÆ6VÖæÃ¢6FL:ÖÆ&÷&&ÆRæV6W6—FF–VæF’†÷&&–òl:Æ–F÷2r’À¢”ådÄ”Eõ44„TETÄUô´”äC¢Â‚~Šû~˜hº[z^KÙÎ8KÉhşh‰n[›NXrrÂu6VÆV66–öæG&&¦òÂFW66ç6òòf66–öæW2r’À¢äåTÅôÄTdUôÄ”Ô•Eõ$T4„TC¢Â‚~Šú^Y[z^iÊÎ[›N[ªn[{.‹ëîX‹3ZJ[›NX~Kˆ®™™rÂtW7FRV×ÆVFò–†Æ6ç¦FòVÂÌ:ÖÖ—FRçVÂFR3L:Ö2FRf66–öæW2r’À¢äõõ44„TETÄUõDôD“¢Â‚~K¸®ZJk*iÈ[{.Xù[ˆ>y¨Nhé.xúŞûÈÎKˆŞˆ;Şh™>XÚrÂtæò†’†÷&&–òV&Æ–6Fò&†÷’âæòVVFW2f–6†"r’À¢44„TETÄUôD•ôôdc¢Â‚~K¸®ZJiŠşhé.xúŞKÉhşiz^h‰n[›NX~ûÈÎKˆŞˆ;Şh™>XÚrÂt†÷’W2L:ÖÆ–'&RòFRf66–öæW26V|;¦âVÂ†÷&&–òâæòVVFW2f–6†"r’À¢”ådÄ”Eô4õ%$T5D”ôã¢Â‚~Šû~ˆ{>[	Z¾XiKˆKŠ®iÈiXy¨NKúîjÚ>i{n™{BrÂt–æF–6ÂÖVæ÷2Væ†÷&l:Æ–F&6÷'&Vv—"r’À¢”ådÄ”Eô4õ%$T5D”ôåô´”äC¢Â‚~Šû~˜hºiÈiXy¨Nˆ>XºNZHNyn{¾Yè²rÂu6VÆV66–öæVâF—òFR6÷'&V66œ;6âl:Æ–Fòr’À¢”ådÄ”Eô%4Tä4UõD”ÔU3¢Â‚~y›¾Šë{Ë®XºNi{nKˆŞ[©NZ¾Xih™>XÚi{n™{BrÂtæò–çG&öGW¦62†÷&2Â&Vv—7G&"VæW6Væ6–r’À¢äõôu5õU$Ô•54”ôã¢Â‚~[Ù>X˜Şk*iÈiÈiXy¨Nh˜¾iË¤u>h™>XÚhèiØ2rÂtæòF–VæW2WF÷&—¦6œ;6âu2f–vVçFRr’À¢äõôÄÄõtTEôUdTåE3¢Â‚~Šû~ˆ{>[	˜hºKˆzxŞXXŠëy¨Du>h™>XÚXªKÙÂrÂu6VÆV66–öæÂÖVæ÷2VâF—òFRf–6†¦Ru2r’À¢õUE4”DUôUD„õ$•¤TEô$T¢Â‚~[Ù>X˜ŞKØŞ{Úî‹yŞzk¾hé.xúŞ[©~™;®‹h^‹øs#{>ûÈÎKˆŞˆ;Şh™>XÚrÂtW7L:2Ü:2FR#ÖWG&÷2FRÆF–VæF6–væFâæòVVFW2f–6†"r’À¢Äô4D”ôåôäõEô45U$DUôTäõTtƒ¢Â‚~Zé®KØŞ{+î[ªnKˆŞ‹k>ûÈÎŠû~X‹[È™‰NKØŞ{Úî˜xŞŠùRrÂtÆV&–66œ;6âæòW27Vf–6–VçFVÖVçFR&V6—6r’À¢Äô4D”ôåõU$Ô•54”ôåôDTä”TC¢Â‚~kXşŠxYšk*iÈZé®KØŞiØ>™™ûÈÎŠû~YÊYËYØjşXXŠëKØŞ{ÚîiØ>™™rÂtVÂæfVvF÷"æòF–VæRW&Ö—6òFRV&–66œ;6ââ7L:×fÆòVâÆ&'&FRF—&V66–öæW2r’À¢Äô4D”ôåõTäd”Ä$ÄS¢Â‚~i¨.i{nizk9^Xùn[é~XxnzîKØŞ{ÚîûÈÎŠû~h™>[Èh˜¾iË®Zé®KØŞYî˜xŞŠùRrÂtæò6RVFòö'FVæW"ÆV&–66œ;6ââ7F—fVÂu2R–çL:–çFÆòFRçVWfòr’À¢5Dõ$Uôu5ôäõEô4ôäd”uU$TC¢Â‚ud•d[	®iÊ®˜XŞ{ÚîŠú^[©tu>YÙjrrÂtÆF–VæFFöFl:ÖæòF–VæR6ö÷&FVæF2u2r’À¢5Dõ$UôäõEôdõTäC¢Â‚~[©~™;®KˆŞZÙYÊûÈÎŠû~X‹~ikYî˜xŞŠùRrÂtÆF–VæFæòW†—7FRâ7GVÆ—¦R–çL:–çFÆòFRçVWfòr’À¢5Dõ$UôäõEô5D•dS¢Â‚~Šú^[©~™;®[{.XÎyJûÈÎKˆŞˆ;Şhš~ŠÎjÚNi8ŞKÙÂrÂtÆF–VæFW7L:FW67F—fFr’À¢TÕÄõ”TUôD•4$ÄTC¢Â‚~‹JnXû~[{.XÎyJûÈÎŠû~ˆN{;µd•d’rÂt7VVçFFW67F—fFâ6öçF7F6öâd•d’r’À¢TÕÄõ”TUôäõEô5D•dS¢Â‚~Šú^Y[z^KˆŞZÙYÊh‰n[{.XÎyJ‚rÂtVÂV×ÆVFòæòW†—7FRòW7L:FW67F—fFòr’À¢DTÄUDUõ$UT•$U5ôDT5D•dD”ôã¢Â‚~Šû~XXXÎyJŠú^Y[z^ûÈÎXhŞXŠ™šNŠúş[»®‹JnXûrrÂtFW67F—f&–ÖW&òÂV×ÆVFòçFW2FRVÆ–Ö–æ"Æ7VVçFW',;6æVr’À¢TÕÄõ”TUô„5õ$T4õ$E3¢Â‚~Šú^Y[z^[{.iÈhé.xúŞ8h™>XÚ8u>hèiØ>8yK>Šû~h‰nKúîjÚ>Šë[Ù^ûÈÎXú®ˆ;ŞXÎyJûÈÎKˆŞˆ;ŞXŠ™šBrÂtW7FRV×ÆVFò–F–VæR&Vv—7G&÷2â6öÆò6RVVFRFW67F—f"ÂæòVÆ–Ö–æ"r’À¢TÕÄõ”TUôäõEôdõTäC¢Â‚~Y[z^‹JnXû~KˆŞZÙYÊûÈÎXúşˆ;Ş[{.Š*¾XŠ™šBrÂtÆ7VVçFæòW†—7FRò–gVRVÆ–Ö–æFr’À¢TÕÄõ”TUôDTÄUDUôd”ÄTC¢Â‚~‹JnXû~XŠ™šNZK‹J^ûÈÎŠû~zîŠêNŠú^Y[z^k*iÈK»¾KÙ^jÚ>[ÈşŠë[ÙRrÂtæò6RVFòVÆ–Ö–æ"â6ö×'VV&VRæòFVæv&Vv—7G&÷2öf–6–ÆW2r’À¢DUd”4UôD•4$ÄTC¢Â‚~jÚN[©~™;®yK^ˆIiÊ®hèiØ>h‰n[{.XÎyJ‚rÂtW7FR÷&FVæF÷"æòW7L:WF÷&—¦Fòr’À¢DUd”4UôDTä”TC¢Â‚~jÚNyK^ˆIXzŞŠøKˆŞjÚ>zîûÈÎŠû~yKd•d˜xŞik{¹Zé¢rÂtÆ7&VFVæ6–ÂFRW7FR÷&FVæF÷"æòW2l:Æ–Fâd•d’FV&Rf–æ7VÆ&ÆòFRçVWfòr’À¢DUd”4Uõ$UT•$TC¢Â‚~jÚNyK^ˆI[	®iÊ®{¹Zé®[©~™;¢rÂtW7FR÷&FVæF÷"FöFl:ÖæòW7L:f–æ7VÆFòr’À¢4ÔU$õU$Ô•54”ôåôDTä”TC¢Â‚~[ø^š¾XXŠëiNX8şZKNiØ>™™h˜Şˆ;ŞZèÎh‰Kˆ®Kˆ¾xúŞh™>XÚrÂtFV&W2W&Ö—F—"VÂ66W6òÆ<:Ö&&f–6†"ÆVçG&FòÆ6Æ–Fr’À¢4ÔU$õTäd”Ä$ÄS¢Â‚~izk9^KÛşyJyK^ˆIiNX8şZKNûÈÎŠû~j8iú^iNX8şZKNYî˜xŞŠù^ûÈÎh‰nKÛşyJiÊÎK«®h˜¾iË®YÊ[©~™;£#{>Xh^h™>XÚrÂtæò6RVVFRW6"Æ<:Ö&â6ö×'\:–&Æòf–6†6öâGRÜ;7f–ÂFVçG&òFR#Òr’À¢4ÔU$ô4ä4TÄÄTC¢Â‚~[{.Xùnkhh¸ŞxZ~ûÈÎiÊÎjÊh™>XÚk*iÈhùKªBrÂtf÷Fò6æ6VÆFâVÂf–6†¦Ræò6R†Vçf–Fòr’À¢„õDõõ$UT•$TC¢Â‚~Kˆ®Kˆ¾xúŞh™>XÚ[ø^š¾h¸ŞiNxëYË®xZ~x˜rrÂtÆVçG&F’Æ6Æ–F&WV–W&VâVæf÷FòVâVÂÖöÖVçFòr’À¢„õDõô”ådÄ”C¢Â‚~xëYË®xZ~x˜~iziXûÈÎŠû~˜xŞikh¸ŞiBrÂtÆf÷FòæòW2l:Æ–Fâ†¦ÆFRçVWfòr’À¢„õDõõ5DÄS¢Â‚~xZ~x˜~[{.‹h^i{nûÈÎŠû~˜xŞikh¸ŞiBrÂtÆf÷Fò†6GV6Fòâ†¦ÆFRçVWfòr’À¢„õDõõDôõôÄ$tS¢Â‚~xZ~x˜~ih~K»n‹ø~ZJ~ûÈÎŠû~˜xŞikh¸ŞiBrÂtÆf÷FòW2FVÖ6–Fòw&æFRâ†¦ÆFRçVWfòr’À¢„õDõõUÄôEôd”ÄTC¢Â‚~xZ~x˜~Kˆ®KÊZK‹J^ûÈÎiÊÎjÊh™>XÚiÊ®Šë[Ù^ûÈÎŠû~j8iú^{Ù{¹ÎYî˜xŞŠùRrÂtæò6RVFò7V&—"Æf÷Fò’VÂf–6†¦Ræò6R&Vv—7G,;2â6ö×'VV&Æ&VBr’À¢„õDõõ5Dõ$tUõTäd”Ä$ÄS¢Â‚~xZ~x˜~ZÙX*i¨.i{nKˆŞXúşyJûÈÎiÊÎjÊh™>XÚiÊ®Šë[ÙRrÂtVÂÆÖ6VæÖ–VçFòFRf÷F÷2æòW7L:F—7öæ–&ÆR’VÂf–6†¦Ræò6R&Vv—7G,;2r’À¢„õDõôäõEôdõTäC¢Â‚~xZ~x˜~KˆŞZÙYÊh‰n[{.‹h^‹øs3ZJˆz®XªXŠ™šBrÂtÆf÷FòæòW†—7FRò6RVÆ–Ö–ì;2WFöÜ:F–6ÖVçFRFW7\:—2FR3L:Ö2r’À¢$UTU5EôÅ$TE•õ$Ud”UtTC¢Â‚~Šú^yK>Šû~[{.ZHNynûÈÎŠû~X‹~ikiú^yÈ¾iÈikx«nhrÂtÆ6öÆ–6—GVB–gVR&Wf—6Fâ7GVÆ—¦&fW"VÂW7FFòr’À¢$T4õ$EôäõEôdõTäC¢Â‚~Šë[Ù^KˆŞZÙYÊh‰n[{.XùyIşXùXÉnûÈÎŠû~X‹~ikYî˜xŞŠùRrÂtVÂ&Vv—7G&òæòW†—7FRò†6Ö&–Fòâ7GVÆ—¦R–çL:–çFÆòFRçVWfòr’À¢TäUD„TåD”4DTC¢Â‚~y›¾[Ù^[{.‹ø~iÉşûÈÎŠû~˜xŞiky›¾[ÙRrÂtÆ6W6œ;6â†6GV6Fòâ–æ–6–6W6œ;6âFRçVWfòr’À¢4U54”ôåôU…•$TC¢Â‚~y›¾[Ù^[{.‹ø~iÉşûÈÎŠû~˜xŞiky›¾[ÙRrÂtÆ6W6œ;6â†6GV6Fòâ–æ–6–6W6œ;6âFRçVWfòr’À¢dõ$$”DDTã¢Â‚~[Ù>X˜Ş‹JnXû~k*iÈhš~ŠÎjÚNi8ŞKÙÎy¨NiØ>™™rÂtW7F7VVçFæòF–VæRW&Ö—6ò&&VÆ—¦"W7F66œ;6âr’À¢äUEtõ$µôU%$õ#¢Â‚~izk9^‹ùîhê^iÈŞXªYšûÈÎŠû~j8iú^{Ù{¹ÎYî˜xŞŠùRrÂtæò6RVFò6öæV7F"6öâVÂ6W'f–F÷"â6ö×'VV&Æ&VBr’À¢$UTU5EõD”ÔTõUC¢Â‚~iÈŞXªYšY8Ş[©N‹h^i{nûÈÎŠû~zˆŞYî˜xŞŠùRrÂtVÂ6W'f–F÷"F&L;2FVÖ6–Fòâ–çL:–çFÆòFRçVWfòr’À¢”ådÄ”Eõ4U%dU%õ$U5ôå4S¢Â‚~iÈŞXªYš‹ùNY¹î[È.[‹ûÈÎŠû~X‹~ikYî˜xŞŠùRrÂu&W7VW7Fæòl:Æ–FFVÂ6W'f–F÷"â7GVÆ—¦R–çL:–çFÆòFRçVWfòr’À¢DDôÄôEôd”ÄTC¢Â‚~i[hÚîXª‹ÛŞZK‹J^ûÈÎŠû~j8iú^{Ù{¹Î[›nX‹~ikrÂtæò6RVF–W&öâ6&v"Æ÷2FF÷2â6ö×'VV&Æ&VB’7GVÆ—¦r’À¢u%5C##¢Â‚~{Ë®[	ZêŠêKúîZHŞX{Şi[ûÈÎŠû~XXhš~ŠÎ˜XŞZYu5ÂrÂtfÇFÆgVæ6œ;6âFR6÷'&V66œ;6ââV¦V7WF&–ÖW&òVÂ5ÂFR&W&6œ;6âr’À¢ÕTÅD•ÄUô4õ%$T5D”ôå5õ$UT•$Uõ44„TÔõ$Ud”Us¢Â‚~[Ù>ZJiÈZI®iÚKúîjÚ>Šë[Ù^ûÈÎ™ÈŠhj8iú^i[hÚî[©>{¹>ièBrÂt†’f&–26÷'&V66–öæW2&VÂL:Ö²&Wf—6VÂW7VVÖFRÆ&6RFRFF÷2r’À¢4õ%$T5D”ôåô´”äEõ$UT•$U5õ44„TÔõ$Ud”Us¢Â‚~[Ù>X˜ŞŠë[Ù^y¨NKúîjÚ>{¾Yè¾™ÈŠhj8iú^i[hÚî[©>{¹>ièBrÂtVÂF—òFR6÷'&V66œ;6â&WV–W&R&Wf—6"VÂW7VVÖr’À¢”ådÄ”Eô4õ%$T5D”ôåô´”äC¢Â‚~[Ù>X˜ŞYîzºşi¨.KˆŞiJşhÈjÚNKúîjÚ>{¾Yè²rÂtVÂ6W'f–F÷"æòFÖ—FRW7FRF—òFR6÷'&V66œ;6âr’À¢õU$D”ôåôd”ÄTC¢Â‚~i8ŞKÙÎiÊ®ZèÎh‰ûÈÎŠû~X‹~ikYî˜xŞŠùRrÂtÆ÷W&6œ;6âæò6R6ö×ÆWL;2â7GVÆ—¦R–çL:–çFÆòFRçVWfòr’À¢Ó°¢6öç7Bæ÷&ÖÆ—¦VBÒ6öFRçFõWW$66R‚’ç&WÆ6R‚õÇ2²örÂuòr“°¢–b†ÖW76vW5¶æ÷&ÖÆ—¦VEÒ’&WGW&âÖW76vW5¶æ÷&ÖÆ—¦VEÓ°¢6öç7BÖW76vT6öFRÒ7G&–ær†W'&÷#òæÖW76vRÇÂrr’çFõWW$66R‚’ç&WÆ6R‚õÇ2²örÂuòr“°¢–b†ÖW76vW5¶ÖW76vT6öFUÒ’&WGW&âÖW76vW5¶ÖW76vT6öFUÓ°¢–b‚ôd”ÄTBDò…4TäGÄdUD4‚—Äd”ÄTBDòdUD4‡ÄäUEtõ$·ÄÄôBd”ÄTBö’çFW7B†6öFR’’&WGW&âÖW76vW2ääUEtõ$µôU%$õ#°¢–b‚ô¥uGÅDô´Tââ¤U…•$TGÅ4U54”ôââ¤U…•$TBö’çFW7B†6öFR’’&WGW&âÖW76vW2å4U54”ôåôU…•$TC°¢6öç7BFWF–ÂÒ¶6öFRÂW'&÷#òæÖW76vRÂW'&÷#òæW'&÷%Òæf–ÇFW"„&ööÆVâ’æ¦ö–â‚rr“°¢–b†æ÷&ÖÆ—¦VBÓÓÒu„ôäUôU„•5E2rÇÂæ÷&ÖÆ—¦VBÓÓÒu„ôäUôÅ$TE•ôU„•5E2rÇÂæ÷&ÖÆ—¦VBÓÓÒu„ôäUôU„•5E5ô”åôUD‚p¢ÇÂ‚÷†öæRö’çFW7B†FWF–Â’bbôEUÄ”4DWÄÅ$TE’…$Tt•5DU$TGÄU„•5E2—ÅTä•TR4ôå5E$”åBö’çFW7B†FWF–Â’’’°¢&WGW&âÂ‚~h˜¾iË®Xû~[{.ZÙYÊûÈÎŠû~j8iú^iŠşY
+n˜xŞZHŞX‰¾[»¢rÂtVÂFVÌ:–föæò–W†—7FRâ6ö×'VV&6’Æ7VVçFW7L:GWÆ–6Fr“°¢Ğ¢–b†æ÷&ÖÆ—¦VBÓÓÒs#3SRrÇÂôEUÄ”4DWÄÅ$TE’…$Tt•5DU$TGÄU„•5E2—ÅTä•TR4ôå5E$”åBö’çFW7B†FWF–Â’’°¢&WGW&âÂ‚~KùŞZÙZK‹J^ûÉ®Šë[Ù^ZÙYÊYJşKˆh
+~Xk.z¨ûÈÎŠû~j8iú^YîXû{ªniÙşûÈƒ#3S^ûÈ’rÂtæò6RVFòwV&F#¢6öæfÆ–7FòFRVæ–6–FBâ&Wf—6Æ2&W7G&–66–öæW2FVÂ6W'f–F÷"ƒ#3SR’r“°¢Ğ¢–b†æ÷&ÖÆ—¦VBÓÓÒs#3S"rÇÂöçVÆÂfÇVRâ¦æ÷BÖçVÆÂ6öç7G&–çBö’çFW7B†FWF–Â’’°¢&WGW&âÂ‚~KùŞZÙZK‹J^ûÉ®i[hÚî[©>KˆŞXXŠë[ø^Z¾ZÙ~jë^K‹®z›®ûÈÎŠû~j8iú^hé.xúŞZÙ~jë^{ªniÙşûÈƒ#3S.ûÈ’rÂtæò6RVFòwV&F#¢Vâ6×òö&Æ–vF÷&–òW7L:f<:Öòâ&Wf—6Æ2&W7G&–66–öæW2FVÂ†÷&&–òƒ#3S"’r“°¢Ğ¢–b†æ÷&ÖÆ—¦VBÓÓÒs#3SBrÇÂ÷f–öÆFW26†V6²6öç7G&–çBö’çFW7B†FWF–Â’’°¢&WGW&âÂ‚~KùŞZÙZK‹J^ûÉ®i[hÚîKˆŞzÊnYi[hÚî[©>j
+š¨ÎŠxNX‰ûÈƒ#3SNûÈ’rÂtæò6RVFòwV&F#¢Æ÷2FF÷2–æ7V×ÆVâVæ&W7G&–66œ;6âFRfÆ–F6œ;6âƒ#3SB’r“°¢Ğ¢–b†æ÷&ÖÆ—¦VBÓÓÒsC%rÇÂöæòVæ—VR÷"W†6ÇW6–öâ6öç7G&–çBÖF6†–ærö’çFW7B†FWF–Â’’°¢&WGW&âÂ‚~KùŞZÙZK‹J^ûÉ®i[hÚî[©>{Ë®[	KùŞZÙi8ŞKÙÎh˜™Èy¨NYJşKˆ{ªniÙşûÈƒC%ûÈ’rÂtæò6RVFòwV&F#¢fÇFÆ&W7G&–66œ;6â;¦æ–6æV6W6&–&W7F÷W&6œ;6âƒC%’r“°¢Ğ¢–b†æ÷&ÖÆ—¦VBç7F'G5v—F‚‚t”ådÄ”Eòr’’&WGW&âÖW76vW2ä”ådÄ”Eô”åUC°¢6öç6öÆRæW'&÷"‚uVæ†æFÆVBÆ–6F–öâW'&÷#¢rÂW'&÷"“°¢&WGW&âÖW76vW2äõU$D”ôåôd”ÄTC°§Ğ ¦gVæ7F–öâæ÷&ÖÆ—¦VDW'&÷$6öFR†W'&÷"’°¢&WGW&â7G&–ær†W'&÷#òæ6öFRÇÂW'&÷#òæÖW76vRÇÂW'&÷#òæW'&÷"ÇÂW'&÷"ÇÂuTä´äõtåôU%$õ"r’çFõWW$66R‚’ç&WÆ6R‚õÇ2²örÂuòr“°§Ğ ¦gVæ7F–öâf÷&vWD¶–÷6´–d–çfÆ–B†W'&÷"’°¢6öç7B6öFRÒæ÷&ÖÆ—¦VDW'&÷$6öFR†W'&÷"“°¢–b‚²tDUd”4UôD•4$ÄTBrÂtDUd”4UôDTä”TBrÂtDUd”4Uõ$UT•$TBuÒæ–æ6ÇVFW2†6öFR’’&WGW&âfÇ6S°¢Æö6Å7F÷&vRç&VÖ÷fT—FVÒ„´”õ4µõ5Dõ$tR“°¢7FFRæ¶–÷6²ÒçVÆÃ°¢&WGW&âG'VS°§Ğ ¦gVæ7F–öâæ÷&ÖÆ—¦U†öæR‡fÇVR’°¢ÆWBF–v—G2Ò7G&–ær‡fÇVRÇÂrr’ç&WÆ6R‚õÄBörÂrr“°¢–b†F–v—G2ç7F'G5v—F‚‚sr’’F–v—G2ÒF–v—G2ç6Æ–6Rƒ"“°¢–b†F–v—G2æÆVæwF‚ÓÓÒ’’F–v—G2Ò3BG¶F–v—G7Ö°¢&WGW&âF–v—G2ò²G¶F–v—G7Ö¢rs°§Ğ ¦gVæ7F–öâÆöv–äVÖ–Äg&öÕ†öæR‡fÇVR’°¢6öç7BF–v—G2Òæ÷&ÖÆ—¦U†öæR‡fÇVR’ç&WÆ6R‚õÄBörÂrr“°¢&WGW&âG¶F–v—G7ÔGFVæFæ6Ræ–çfÆ–F°§Ğ ¦gVæ7F–öâÖG&–DFFR†FFRÒæWrFFR‚’’°¢&WGW&âæWr–çFÂäFFUF–ÖTf÷&ÖB‚vVâÔ4rÂ²F–ÖU¦öæS¢ÔE$”EõE¢Â–V#¢vçVÖW&–2rÂÖöçFƒ¢s"ÖF–v—BrÂF“¢s"ÖF–v—BrÒ’æf÷&ÖB†FFR“°§Ğ ¦gVæ7F–öâÖG&–DF—7Æ’†FFRÒæWrFFR‚’Âv—F…6V6öæG2ÒfÇ6R’°¢&WGW&âæWr–çFÂäFFUF–ÖTf÷&ÖB‡7FFRæÆærÓÓÒw¦‚ròw¦‚Ô4âr¢vW2ÔU2rÂ°¢F–ÖU¦öæS¢ÔE$”EõE¢À¢vVV¶F“¢w6†÷'BrÂ–V#¢vçVÖW&–2rÂÖöçFƒ¢w6†÷'BrÂF“¢vçVÖW&–2rÀ¢âââ‡v—F…6V6öæG2ò²†÷W#¢s"ÖF–v—BrÂÖ–çWFS¢s"ÖF–v—BrÂ6V6öæC¢s"ÖF–v—BrÒ¢·Ò’À¢Ò’æf÷&ÖB†FFR“°§Ğ ¦gVæ7F–öâF–ÖUFW‡B‡fÇVR’°¢–b‚fÇVR’&WGW&â~(	Bs°¢6öç7BFFRÒæWrFFR‡fÇVR“°¢–b„çVÖ&W"æ—4æâ†FFRævWEF–ÖR‚’’’&WGW&â~(	Bs°¢&WGW&âæWr–çFÂäFFUF–ÖTf÷&ÖB‚vW2ÔU2rÂ²F–ÖU¦öæS¢ÔE$”EõE¢Â†÷W#¢s"ÖF–v—BrÂÖ–çWFS¢s"ÖF–v—BrÒ’æf÷&ÖB†FFR“°§Ğ ¦gVæ7F–öâFFUFW‡B‡fÇVR’°¢–b‚fÇVR’&WGW&â~(	Bs°¢6öç7BFFRÒæWrFFR†Gµ7G&–ær‡fÇVR’ç6Æ–6RƒÂ—ÕC#££¦“°¢&WGW&âæWr–çFÂäFFUF–ÖTf÷&ÖB‡7FFRæÆærÓÓÒw¦‚ròw¦‚Ô4âr¢vW2ÔU2rÂ°¢F–ÖU¦öæS¢uUD2rÂvVV¶F“¢w6†÷'BrÂF“¢s"ÖF–v—BrÂÖöçFƒ¢w6†÷'BrÀ¢Ò’æf÷&ÖB†FFR“°§Ğ ¦gVæ7F–öâGFVæFæ6U66†VGVÆR†—FVÒ’°¢&WGW&â‡7FFRæFFç66†VGVÆW2ÇÂµÒ’æf–æB‚‡66†VGVÆR’Óâ66†VGVÆRæV×Æ÷–VUö–BÓÓÒ—FVÓòæV×Æ÷–VUö–@¢bb66†VGVÆRçv÷&µöFFRÓÓÒ—FVÓòçv÷&µöFFRbb66†VGVÆT¶–æB‡66†VGVÆR’ÓÓÒwv÷&²r’ÇÂçVÆÃ°§Ğ ¦gVæ7F–öâ6÷VçFVE7F'B†—FVÒÂ66†VGVÆRÒGFVæFæ6U66†VGVÆR†—FVÒ’’°¢–b‚—FVÓòæ6Æö6µö–â’&WGW&âçVÆÃ°¢6öç7B6Æö6´–âÒæWrFFR†—FVÒæ6Æö6µö–â“°¢–b„çVÖ&W"æ—4æâ†6Æö6´–âævWEF–ÖR‚’’’&WGW&âçVÆÃ°¢6öç7B66†VGVÆVE7F'BÒæWrFFR‡66†VGVÆSòç7F'G5öB“°¢–b„çVÖ&W"æ—4æâ‡66†VGVÆVE7F'BævWEF–ÖR‚’’’&WGW&â6Æö6´–ã°¢&WGW&â6Æö6´–âÂ66†VGVÆVE7F'Bò66†VGVÆVE7F'B¢6Æö6´–ã°§Ğ ¦gVæ7F–öâ6÷VçFVEv÷&´Ö–çWFW2†—FVÒÂ66†VGVÆRÒGFVæFæ6U66†VGVÆR†—FVÒ’’°¢–b‚—FVÓòæ6Æö6µö–âÇÂ—FVÓòæ6Æö6µö÷WB’&WGW&âçVÆÃ°¢6öç7B†4'&Vµ7F'BÒ&ööÆVâ†—FVÒæ'&Vµ÷7F'B“°¢6öç7B†4'&V´VæBÒ&ööÆVâ†—FVÒæ'&VµöVæB“°¢–b††4'&Vµ7F'BÓÒ†4'&V´VæB’&WGW&âçVÆÃ°¢6öç7B7F'BÒ6÷VçFVE7F'B†—FVÒÂ66†VGVÆR“°¢6öç7B6Æö6´–âÒæWrFFR†—FVÒæ6Æö6µö–â“°¢6öç7BVæBÒæWrFFR†—FVÒæ6Æö6µö÷WB“°¢–b‚7F'BÇÂ¶6Æö6´–âÂVæEÒç6öÖR‚‡fÇVR’ÓâçVÖ&W"æ—4æâ‡fÇVRævWEF–ÖR‚’’’ÇÂVæBÂ7F'B’&WGW&âçVÆÃ°¢6öç7B&W6Væ6TÖ–çWFW2ÒÖF‚ç&÷VæB‚†VæBÒ7F'B’òc“°¢–b‚†4'&Vµ7F'B’&WGW&âÖF‚æÖ‚ƒÂ&W6Væ6TÖ–çWFW2“°¢6öç7B'&Vµ7F'BÒæWrFFR†—FVÒæ'&Vµ÷7F'B“°¢6öç7B'&V´VæBÒæWrFFR†—FVÒæ'&VµöVæB“°¢–b…¶'&Vµ7F'BÂ'&V´VæEÒç6öÖR‚‡fÇVR’ÓâçVÖ&W"æ—4æâ‡fÇVRævWEF–ÖR‚’’’’&WGW&âçVÆÃ°¢–b†6Æö6´–ââ'&Vµ7F'BÇÂ'&Vµ7F'Bâ'&V´VæBÇÂ'&V´VæBâVæBÇÂVæBÂ7F'B’&WGW&âçVÆÃ°¢6öç7B6÷VçFVD'&Vµ7F'BÒ'&Vµ7F'BÂ7F'Bò7F'B¢'&Vµ7F'C°¢6öç7B'&V´Ö–çWFW2Ò'&V´VæBÃÒ6÷VçFVD'&Vµ7F'Bò¢ÖF‚ç&÷VæB‚†'&V´VæBÒ6÷VçFVD'&Vµ7F'B’òc“°¢&WGW&âÖF‚æÖ‚ƒÂ&W6Væ6TÖ–çWFW2Ò'&V´Ö–çWFW2“°§Ğ ¦gVæ7F–öâ6†–gDGW&F–öåFW‡B†—FVÒÂ66†VGVÆRÒGFVæFæ6U66†VGVÆR†—FVÒ’’°¢6öç7BÖ–çWFW2Ò6÷VçFVEv÷&´Ö–çWFW2†—FVÒÂ66†VGVÆR“°¢–b†Ö–çWFW2ÓÓÒçVÆÂ’&WGW&â~(	Bs°¢&WGW&âG´ÖF‚æfÆö÷"†Ö–çWFW2òc—Ö‚Gµ7G&–ær†Ö–çWFW2Rc’çE7F'Bƒ"Âsr—ÖÖ°§Ğ ¦gVæ7F–öâ'&V´GW&F–öåFW‡B†—FVÒ’°¢–b‚—FVÓòæ'&Vµ÷7F'Bbb—FVÓòæ'&VµöVæB’&WGW&âsÒs°¢–b‚—FVÓòæ'&Vµ÷7F'BÇÂ—FVÓòæ'&VµöVæB’&WGW&â~(	Bs°¢6öç7BÖ–çWFW2ÒÖF‚æÖ‚ƒÂÖF‚ç&÷VæB‚†æWrFFR†—FVÒæ'&VµöVæB’ÒæWrFFR†—FVÒæ'&Vµ÷7F'B’’òc’“°¢&WGW&âG¶Ö–çWFW7ÖÖ°§Ğ ¦gVæ7F–öâFDF—2†FFU7G&–ærÂÖ÷VçB’°¢6öç7BFFRÒæWrFFR†G¶FFU7G&–æwÕC#££¦“°¢FFRç6WEUD4FFR†FFRævWEUD4FFR‚’²Ö÷VçB“°¢&WGW&âFFRçFô•4õ7G&–ær‚’ç6Æ–6RƒÂ“°§Ğ ¦gVæ7F–öâÖöçF„Æ7DFFR†ÖöçF…7G&–ær’°¢6öç7B·–V"ÂÖöçF…ÒÒ7G&–ær†ÖöçF…7G&–ær’ç7Æ—B‚rÒr’æÖ„çVÖ&W"“°¢–b‚–V"ÇÂÖöçF‚ÂÇÂÖöçF‚â"’&WGW&ârs°¢&WGW&âæWrFFR„FFRåUD2‡–V"ÂÖöçF‚Â’’çFô•4õ7G&–ær‚’ç6Æ–6RƒÂ“°§Ğ ¦gVæ7F–öâ7W'&VçE66†VGVÆTÖöçF‚‚’°¢6öç7B7W'&VçBÒÖG&–DFFR‚’ç6Æ–6RƒÂr“°¢&WGW&â7FFRç66†VGVÆTÖöçF‚ÇÂ†7W'&VçBÂ44„TETÄUõ5D%EôÔôåD‚ò44„TETÄUõ5D%EôÔôåD‚¢7W'&VçB“°§Ğ ¦gVæ7F–öâÖG&–EF–ÖUfÇVR‡fÇVRÂfÆÆ&6²’°¢–b‚fÇVR’&WGW&âfÆÆ&6³°¢6öç7BFFRÒæWrFFR‡fÇVR“°¢–b„çVÖ&W"æ—4æâ†FFRævWEF–ÖR‚’’’&WGW&âfÆÆ&6³°¢&WGW&âæWr–çFÂäFFUF–ÖTf÷&ÖB‚vVâÔt"rÂ°¢F–ÖU¦öæS¢ÔE$”EõE¢Â†÷W#¢s"ÖF–v—BrÂÖ–çWFS¢s"ÖF–v—BrÂ†÷W$7–6ÆS¢vƒ#2rÀ¢Ò’æf÷&ÖB†FFR“°§Ğ ¦gVæ7F–öâÖG&–DÆö6ÅFô—6ò†FFU7G&–ærÂF–ÖU7G&–ær’°¢6öç7B·–V"ÂÖöçF‚ÂF•ÒÒFFU7G&–ærç7Æ—B‚rÒr’æÖ„çVÖ&W"“°¢6öç7B¶†÷W"ÂÖ–çWFUÒÒF–ÖU7G&–ærç7Æ—B‚s¢r’æÖ„çVÖ&W"“°¢ÆWBwVW72ÒFFRåUD2‡–V"ÂÖöçF‚ÒÂF’Â†÷W"ÂÖ–çWFR“°¢f÷"†ÆWB6÷VçBÒ²6÷VçBÂ3²6÷VçB³Ò’°¢6öç7B'G2ÒæWr–çFÂäFFUF–ÖTf÷&ÖB‚vVâÔt"rÂ°¢F–ÖU¦öæS¢ÔE$”EõE¢Â–V#¢vçVÖW&–2rÂÖöçFƒ¢s"ÖF–v—BrÂF“¢s"ÖF–v—BrÀ¢†÷W#¢s"ÖF–v—BrÂÖ–çWFS¢s"ÖF–v—BrÂ†÷W$7–6ÆS¢vƒ#2rÀ¢Ò’æf÷&ÖEFõ'G2†æWrFFR†wVW72’“°¢6öç7BvWBÒ‡G—R’ÓâçVÖ&W"‡'G2æf–æB‚‡'B’Óâ'BçG—RÓÓÒG—R“òçfÇVR“°¢6öç7B&W&W6VçFVBÒFFRåUD2†vWB‚w–V"r’ÂvWB‚vÖöçF‚r’ÒÂvWB‚vF’r’ÂvWB‚v†÷W"r’ÂvWB‚vÖ–çWFRr’“°¢wVW72³ÒFFRåUD2‡–V"ÂÖöçF‚ÒÂF’Â†÷W"ÂÖ–çWFR’Ò&W&W6VçFVC°¢Ğ¢&WGW&âæWrFFR†wVW72’çFô•4õ7G&–ær‚“°§Ğ ¦gVæ7F–öâÆæwVvT'WGFöâ‚’°¢&WGW&âÆ'WGFöâ6Æ73Ò&ÆæwVvRÖ'Fâ"–CÒ&ÆæwVvUFövvÆR"G—SÒ&'WGFöâ#âG·7FFRæÆærÓÓÒw¦‚ròtU2r¢~KŠŞihrwÓÂö'WGFöãæ°§Ğ ¦gVæ7F–öâ&VæFW$6öæf–wW&F–öäW'&÷"‚’°¢æ–ææW$…DÔÂÒÆÖ–â6Æ73Ò'6WGW×vR#ãÇ6V7F–öâ6Æ73Ò'6WGWÖ6&B#à¢Ç7â6Æ73Ò&'&æBÖÖ&²#äƒÂ÷7ããÇ6Æ73Ò&W–V'&÷r#ä4ôäd”uU$D”ôâ$UT•$TCÂ÷à¢ÆƒâG´Â‚~zØ[è^‹ùîhê^ikšyºârÂtfÇF6öæV7F"VÂçVWfò&÷–V7Fòr—ÓÂöƒà¢ÇâG´Â‚~Šû~XXYÊ‚6öæf–ræ§2KŠŞZ¾Xiiky¨B7W&6R&ö¦V7BU$ÂY(Â6%÷V&Æ—6†&ÆRXZÎ™*^8.KˆŞŠhZ¾XiK»¾KÙ^zêynYZøn™*^8"rÂt;FRVâ6öæf–ræ§2ÆU$ÂFVÂçVWfò&÷–V7Fò’7R6ÆfR6%÷V&Æ—6†&ÆRâçVæ6;F2Væ6ÆfRFRFÖ–æ—7G&F÷"âr—ÓÂ÷à¢ÆF—b6Æ73Ò&6ÆÆ÷WBv&æ–ær#ãÆ#âG´Â‚~ZèXZ‚rÂu6VwW&–FBr—ÓÂö#ãÇ7ãâG´Â‚w6W'f–6U÷&öÆ^86%÷6V7&WBY(Îi[hÚî[©>ZønzXú®ˆ;ŞKùŞZÙYÊiÈŞXªYšzºş8"rÂw6W'f–6U÷&öÆRÂ6%÷6V7&WB’Æ6öçG&6\;FR&6RFRFF÷26öâ6öÆò&VÂ6W'f–F÷"âr—ÓÂ÷7ããÂöF—cà¢Â÷6V7F–öããÂöÖ–ãæ°§Ğ ¦gVæ7F–öâ&VæFW$WF‚‚’°¢6öç7B¶–÷6µ&VG’Ò&ööÆVâ‡7FFRæ¶–÷6³òæFWf–6T–Bbb7FFRæ¶–÷6³òæFWf–6U6V7&WB“°¢æ–ææW$…DÔÂÒÆÖ–â6Æ73Ò&WF‚×6†VÆÂ#à¢Ç6V7F–öâ6Æ73Ò&WF‚×7F÷'’#à¢ÆF—b6Æ73Ò&'&æBÖÆö6·W#ãÇ7â6Æ73Ò&'&æBÖÖ&²#äƒÂ÷7ããÇ7ããÆ#ä„ôÄ4Ud”ÄÄÂö#ãÇ6ÖÆÃä4ôåE$ôÂ„õ$$”òôd”4”ÃÂ÷6ÖÆÃãÂ÷7ããÂöF—cà¢ÆF—cãÇ6Æ73Ò&W–V'&÷r#ääõd´TU22äÂãÂ÷ãÆƒâG´Â‚~jøşKˆjÊX‹[)~ûÈÎkˆ^jY®Šë[Ù^8"rÂt6F¦÷&æFÂ6Æ&ÖVçFR&Vv—7G&Fâr—ÓÂöƒãÇâG´Â‚~Y¹¾[©~{¹şKˆhé.xúŞ8ˆ>XºN8yK>Šû~KˆîZêŠê8.Y[z^h˜¾iË®XúşYÊ[Ù>ZJhé.xúŞ[©~™;£#{>Xh^Zé®KØŞh™>XÚûÈÎ‹z[©~zØx›jè®h8^Xk^yKd•dK‹Ni{nhèiØ>8"rÂt†÷&&–÷2Âf–6†¦W2Â6öÆ–6—GVFW2’VF—F÷,:Ö&Æ27VG&òF–VæF2âVÂÜ;7f–ÂW&Ö—FRf–6†"ÖVæ÷2FR#ÒFRÆF–VæF6–væF²Æ2W†6W6–öæW2&WV–W&VâWF÷&—¦6œ;6âFRd•d’âr—ÓÂ÷ãÂöF—cà¢ÆF—b6Æ73Ò&WF‚Öf7G2#ãÆF—cãÆ#ãCÂö#ãÇ7ãâG´Â‚~Zën[©~™;¢rÂwF–VæF2r—ÓÂ÷7ããÂöF—cãÆF—cãÆ#ã#sÂö#ãÇ7ãâG´Â‚~KÉhòrÂvFW66ç6òr—ÓÂ÷7ããÂöF—cãÆF—cãÆ#ãvƒÂö#ãÇ7ãâG´Â‚~jøşiz^xúŞjÊrÂv¦÷&æFr—ÓÂ÷7ããÂöF—cãÂöF—cà¢Â÷6V7F–öãà¢Ç6V7F–öâ6Æ73Ò&WF‚×æVÂ#à¢ÆF—b6Æ73Ò'F÷Ö7F–öç2"7G–ÆSÒ&§W7F–g’Ö6öçFVçC¦fÆW‚ÖVæC¶Ö&v–âÖ&÷GFöÓ£#G‚#âG¶ÆæwVvT'WGFöâ‚—ÓÂöF—cà¢Ç6Æ73Ò&W–V'&÷r#ä44U52ò44U4óÂ÷ãÆƒ#âG´Â‚~˜hºKÛşyJik[ÈòrÂtVÆ–vR<;6Öò66VFW"r—ÓÂöƒ#à¢ÇâG´Â‚~Y[z^h˜¾iË®8[©~™;®Y»®Zé®yK^ˆIY(Åd•dzêynYîXûKÛşyJKˆŞYÎiØ>™™8"rÂtVÂÜ;7f–ÂFVÂV×ÆVFòÂVÂ÷&FVæF÷"FRF–VæF’VÂæVÂFRd•d’F–VæVâW&Ö—6÷2F—7F–çF÷2âr—ÓÂ÷à¢ÆF—b6Æ73Ò&VçG'’×F'2#à¢Æ'WGFöâG—SÒ&'WGFöâ"FFÖVçG'“Ò&V×Æ÷–VR"6Æ73Ò"G·7FFRæVçG'’ÓÓÒvV×Æ÷–VRròv7F—fRr¢rwÒ#âG´Â‚~Y[z^h˜¾iË¢rÂtV×ÆVFòr—ÓÂö'WGFöãà¢Æ'WGFöâG—SÒ&'WGFöâ"FFÖVçG'“Ò&¶–÷6²"6Æ73Ò"G·7FFRæVçG'’ÓÓÒv¶–÷6²ròv7F—fRr¢rwÒ#âG´Â‚~[©~™;®yK^ˆIrÂt÷&FVæF÷"r—ÓÂö'WGFöãà¢Æ'WGFöâG—SÒ&'WGFöâ"FFÖVçG'“Ò&ÖævW""6Æ73Ò"G·7FFRæVçG'’ÓÓÒvÖævW"ròv7F—fRr¢rwÒ#åd•d“Âö'WGFöãà¢ÂöF—cà¢ÆF—b–CÒ&VçG'”6öçFVçB#à¢G·7FFRæVçG'’ÓÓÒv¶–÷6²rò&VæFW$¶–÷6´VçG'’†¶–÷6µ&VG’’¢&VæFW$Æöv–äf÷&Ò‡7FFRæVçG'’—Ğ¢ÂöF—cà¢Ç6Æ73Ò&f÷&Ò×7FGW2"–CÒ&WF…7FGW2#ãÂ÷à¢Â÷6V7F–öãà¢ÂöÖ–ãæ°¢&–æDWF‚‚“°§Ğ ¦gVæ7F–öâ&VæFW$Æöv–äf÷&Ò‡&öÆR’°¢&WGW&âÆf÷&Ò–CÒ&Æöv–äf÷&Ò"6Æ73Ò'7F6²Öf÷&Ò"FF×&öÆSÒ"G·&öÆWÒ#à¢ÆÆ&VÃâG´Â‚~h˜¾iË®XûrrÂuFVÌ:–föæòr—ÓÆ–çWB–CÒ&Æöv–å†öæR"G—SÒ'FVÂ"Æ6V†öÆFW#Ò"³3Bc"&WV—&VBWFö6ö×ÆWFSÒ'W6W&æÖR#ãÂöÆ&VÃà¢ÆÆ&VÃâG´Â‚~y›¾[Ù^ZønzrÂt6öçG&6\;r—ÓÆ–çWB–CÒ&Æöv–å77v÷&B"G—SÒ'77v÷&B"Ö–æÆVæwFƒÒ#‚"&WV—&VBWFö6ö×ÆWFSÒ&7W'&VçB×77v÷&B#ãÂöÆ&VÃà¢Æ'WGFöâ6Æ73Ò'&–Ö'’Ö'Fâ"G—SÒ'7V&Ö—B#âG·&öÆRÓÓÒvÖævW"ròÂ‚~‹ù¾XZ^Y¹¾[©~zêynYîXûrÂtVçG&"ÂæVÂFRd•d’r’¢Â‚~y›¾[Ù^iú^yÈ¾h‰y¨NKúhòrÂtVçG&"Ö’7VVçFr—ÓÂö'WGFöãà¢ÆF—b6Æ73Ò&6ÆÆ÷WB#ãÆ#âG´Â‚~ŠûNiˆârÂtæ÷Fr—ÓÂö#ãÇ7ãâG·&öÆRÓÓÒvÖævW"ròÂ‚~Xú®iÈ•d•dzêynY‹JnXû~XúşKº^‹ù¾XZ^8"rÂu6öÆòVVFR66VFW"Æ7VVçFFÖ–æ—7G&F÷&FRd•d’âr’¢Â‚~h˜¾iË®Xúşiú^yÈ¾hé.xúŞY(ÎyK>Šû~ûÈÎK™şXúşYÊ[Ù>ZJhé.xúŞ[©~™;£#{>Xh^Zé®KØŞh™>XÚ8"rÂuVVFW26öç7VÇF"†÷&&–÷2’6öÆ–6—GVFW2’f–6†"6öâV&–66œ;6âÖVæ÷2FR#ÒFRÆF–VæF6–væFâr—ÓÂ÷7ããÂöF—cà¢Âöf÷&Óæ°§Ğ ¦gVæ7F–öâ&VæFW$¶–÷6´VçG'’‡&VG’’°¢–b‡&VG’’°¢&WGW&âÆF—b6Æ73Ò'7F6²Öf÷&Ò#ãÆF—b6Æ73Ò&6ÆÆ÷WB#ãÆ#âG´Â‚~[{.˜XŞ{ÚârÂt6öæf–wW&Fòr—ÓÂö#ãÇ7ãâG¶W66T…DÔÂ‡7FFRæ¶–÷6²ç7F÷&TæÖRÇÂÂ‚~[©~™;®yK^ˆIrÂt÷&FVæF÷"FRF–VæFr’—ÓÂ÷7ããÂöF—cà¢Æ'WGFöâ6Æ73Ò'&–Ö'’Ö'Fâ"–CÒ&÷Vä¶–÷6²"G—SÒ&'WGFöâ#âG´Â‚~h™>[ÈY»®Zé®h™>XÚyXÎ™Ú"rÂt'&—"çFÆÆFRf–6†¦Rr—ÓÂö'WGFöãà¢Æ'WGFöâ6Æ73Ò&v†÷7BÖ'Fâ"–CÒ&6ÆV$¶–÷6²"G—SÒ&'WGFöâ#âG´Â‚~Šz>™šNjÚNyK^ˆI˜XŞ{ÚârÂuV—F"6öæf–wW&6œ;6âr—ÓÂö'WGFöããÂöF—cæ°¢Ğ¢&WGW&âÆf÷&Ò–CÒ&¶–÷6´ÖævW$Æöv–â"6Æ73Ò'7F6²Öf÷&Ò#à¢Ç6Æ73Ò&×WFVB#âG´Â‚~zÊÎKˆjÊ™ÈŠhd•dYÊ‹ùXû[©~™;®yK^ˆIKˆ®y›¾[Ù^[›n{¹Zé®[©~™;®8.{¹Zé®YîY[z^Xú®™È˜hºZy>YŞ[›n‹é>XZSnKØÕ”î8"rÂtÆ&–ÖW&fW¢d•d’FV&R–æ–6–"6W6œ;6â’f–æ7VÆ"W7FR÷&FVæF÷"VæF–VæFâFW7\:—2VÂV×ÆVFò6öÆòVÆ–vR7RæöÖ'&RR–çG&öGV6R7R”âFRb6–g&2âr—ÓÂ÷à¢ÆÆ&VÃâG´Â‚ud•dh˜¾iË®XûrrÂuFVÌ:–föæòFRd•d’r—ÓÆ–çWB–CÒ&¶–÷6´ÖævW%†öæR"G—SÒ'FVÂ"&WV—&VCãÂöÆ&VÃà¢ÆÆ&VÃâG´Â‚ud•dy›¾[Ù^ZønzrÂt6öçG&6\;FRd•d’r—ÓÆ–çWB–CÒ&¶–÷6´ÖævW%77v÷&B"G—SÒ'77v÷&B"Ö–æÆVæwFƒÒ#‚"&WV—&VCãÂöÆ&VÃà¢Æ'WGFöâ6Æ73Ò'&–Ö'’Ö'Fâ"G—SÒ'7V&Ö—B#âG´Â‚~š¨ÎŠø[›n˜XŞ{ÚîjÚNyK^ˆIrÂufW&–f–6"’6öæf–wW&"r—ÓÂö'WGFöãà¢Âöf÷&Óæ°§Ğ ¦gVæ7F–öâ&–æDWF‚‚’°¢B‚r6ÆæwVvUFövvÆRr“òæFDWfVçDÆ—7FVæW"‚v6Æ–6²rÂ‚’Óâ6WDÆær‡7FFRæÆærÓÓÒw¦‚ròvW2r¢w¦‚r’“°¢BB‚u¶FFÖVçG'•Òr’æf÷$V6‚‚†'WGFöâ’Óâ'WGFöâæFDWfVçDÆ—7FVæW"‚v6Æ–6²rÂ‚’Óâ°¢7FFRæVçG'’Ò'WGFöâæFF6WBæVçG'“°¢&VæFW$WF‚‚“°¢Ò’“°¢B‚r6Æöv–äf÷&Òr“òæFDWfVçDÆ—7FVæW"‚w7V&Ö—BrÂÆöv–â“°¢B‚r6÷Vä¶–÷6²r“òæFDWfVçDÆ—7FVæW"‚v6Æ–6²rÂ‚’Óâ÷Vä¶–÷6²‚’“°¢B‚r66ÆV$¶–÷6²r“òæFDWfVçDÆ—7FVæW"‚v6Æ–6²rÂ‚’Óâ°¢–b‚6öæf—&Ò„Â‚~zîZé®Šz>™šN‹ùXûyK^ˆIy¨N[©~™;®{¹Zé®ûÉòrÂ|+õV—F"Æf–æ7VÆ6œ;6âFRW7FR÷&FVæF÷#òr’’’&WGW&ã°¢Æö6Å7F÷&vRç&VÖ÷fT—FVÒ„´”õ4µõ5Dõ$tR“²7FFRæ¶–÷6²ÒçVÆÃ²&VæFW$WF‚‚“°¢Ò“°¢B‚r6¶–÷6´ÖævW$Æöv–âr“òæFDWfVçDÆ—7FVæW"‚w7V&Ö—BrÂ7F'D¶–÷6´6öæf–wW&F–öâ“°§Ğ ¦7–æ2gVæ7F–öâÆöv–â†WfVçB’°¢WfVçBç&WfVçDFVfVÇB‚“°¢6öç7Bf÷&ÒÒWfVçBæ7W'&VçEF&vWC°¢6öç7B'WGFöâÒf÷&ÒçVW'•6VÆV7F÷"‚v'WGFöå·G—SÒ'7V&Ö—B%Òr“°¢–b†'WGFöâæF—6&ÆVB’&WGW&ã°¢'WGFöâæF—6&ÆVBÒG'VS°¢6öç7BFW6—&VE&öÆRÒf÷&ÒæFF6WBç&öÆS°¢6öç7B7FGW2ÒB‚r6WF…7FGW2r“°¢7FGW2çFW‡D6öçFVçBÒÂ‚~jÚ>YÊy›¾[Ù^(
+brÂt–æ–6–æFò6W6œ;6î(
+br“°¢G'’°¢6öç7B²FFÂW'&÷"ÒÒv—Bv—F…F–ÖV÷WB†6Æ–VçBæWF‚ç6–vä–åv—F…77v÷&B‡°¢VÖ–Ã¢Æöv–äVÖ–Äg&öÕ†öæR‚B‚r6Æöv–å†öæRr’çfÇVR’À¢77v÷&C¢B‚r6Æöv–å77v÷&Br’çfÇVRÀ¢Ò’“°¢–b†W'&÷"’F‡&÷rW'&÷#°¢6öç7B&öf–ÆRÒv—BÆöE&öf–ÆR†FFçW6W"æ–B“°¢–b‚&öf–ÆRÇÂ&öf–ÆRæ7F—fRÇÂ†FW6—&VE&öÆRÓÓÒvÖævW"rbb&öf–ÆRç&öÆRÓÒvÖævW"r’ÇÂ†FW6—&VE&öÆRÓÓÒvV×Æ÷–VRrbb&öf–ÆRç&öÆRÓÒvV×Æ÷–VRr’’°¢v—B6Æ–VçBæWF‚ç6–vä÷WB‚“°¢7FGW2çFW‡D6öçFVçBÒFW6—&VE&öÆRÓÓÒvÖævW"ròÂ‚~jÚN‹JnXû~KˆŞiŠõd•dzêynY‚rÂtW7F7VVçFæòW2FÖ–æ—7G&F÷&r’¢Â‚~jÚN‹JnXû~KˆŞiŠşY[z^‹JnXûrrÂtW7F7VVçFæòW2FRV×ÆVFòr“°¢&WGW&ã°¢Ğ¢7FFRç6W76–öâÒFFç6W76–öã²7FFRç&öf–ÆRÒ&öf–ÆS²7FFRçf–WrÒv†öÖRs°¢v—Bv—F…F–ÖV÷WB†ÆöE÷'FÄFF‚’“²&VæFW%÷'FÂ‚“°¢Ò6F6‚†W'&÷"’°¢–b‡7FFRç&öf–ÆR’°¢7FFRç6W76–öâÒçVÆÃ²7FFRç&öf–ÆRÒçVÆÃ²7FFRæFFÒ·Ó°¢v—B6Æ–VçBæWF‚ç6–vä÷WB‚’æ6F6‚‚‚’Óâ·Ò“°¢Ğ¢7FGW2çFW‡D6öçFVçBÒW'&÷%FW‡B†W'&÷"“°¢Òf–æÆÇ’°¢'WGFöâæF—6&ÆVBÒfÇ6S°¢Ğ§Ğ ¦7–æ2gVæ7F–öâÆöE&öf–ÆR‡W6W$–B’°¢6öç7B²FFÂW'&÷"ÒÒv—Bv—F…F–ÖV÷WB†6Æ–VçBæg&öÒ‚w&öf–ÆW2r’ç6VÆV7B‚r¢Â7F÷&W2†–BÆæÖRÆFG&W72’r’æW‚wW6W%ö–BrÂW6W$–B’ç6–ævÆR‚’“°¢–b†W'&÷"’°¢6öç6öÆRæW'&÷"‚u&öf–ÆRÆöBf–ÆVC¢rÂW'&÷"“°¢F‡&÷ræWrW'&÷"‚tDDôÄôEôd”ÄTBr“°¢Ğ¢&WGW&âFF°§Ğ ¦7–æ2gVæ7F–öâ7F'D¶–÷6´6öæf–wW&F–öâ†WfVçB’°¢WfVçBç&WfVçDFVfVÇB‚“°¢6öç7Bf÷&ÒÒWfVçBæ7W'&VçEF&vWC°¢6öç7B'WGFöâÒf÷&ÒçVW'•6VÆV7F÷"‚v'WGFöå·G—SÒ'7V&Ö—B%Òr“°¢–b†'WGFöâæF—6&ÆVB’&WGW&ã°¢'WGFöâæF—6&ÆVBÒG'VS°¢6öç7B7FGW2ÒB‚r6WF…7FGW2r“°¢7FGW2çFW‡D6öçFVçBÒÂ‚~jÚ>YÊš¨ÎŠød•d‹ª¾K»Ş(
+brÂufW&–f–6æFòd•d(
+br“°¢G'’°¢6öç7B²FFÂW'&÷"ÒÒv—Bv—F…F–ÖV÷WB†6Æ–VçBæWF‚ç6–vä–åv—F…77v÷&B‡°¢VÖ–Ã¢Æöv–äVÖ–Äg&öÕ†öæR‚B‚r6¶–÷6´ÖævW%†öæRr’çfÇVR’À¢77v÷&C¢B‚r6¶–÷6´ÖævW%77v÷&Br’çfÇVRÀ¢Ò’“°¢–b†W'&÷"’F‡&÷rW'&÷#°¢6öç7B&öf–ÆRÒv—BÆöE&öf–ÆR†FFçW6W"æ–B“°¢–b‡&öf–ÆSòç&öÆRÓÒvÖævW"rÇÂ&öf–ÆRæ7F—fR’°¢v—B6Æ–VçBæWF‚ç6–vä÷WB‚“²7FGW2çFW‡D6öçFVçBÒÂ‚~Xú®iÈ•d•dXúşKº^˜XŞ{Úî[©~™;®yK^ˆIrÂu6öÆòd•d’VVFR6öæf–wW&"VÂ÷&FVæF÷"r“²&WGW&ã°¢Ğ¢6öç7B²FF¢7F÷&W2ÂW'&÷#¢7F÷&TW'&÷"ÒÒv—B6Æ–VçBæg&öÒ‚w7F÷&W2r’ç6VÆV7B‚r¢r’æW‚v7F—fRrÂG'VR’æ÷&FW"‚væÖRr“°¢–b‡7F÷&TW'&÷"’F‡&÷ræWrW'&÷"‚tDDôÄôEôd”ÄTBr“°¢–b‚7F÷&W3òæÆVæwF‚’F‡&÷ræWrW'&÷"‚u5Dõ$UôäõEôdõTäBr“°¢B‚r6VçG'”6öçFVçBr’æ–ææW$…DÔÂÒÆf÷&Ò–CÒ&f–æ—6„¶–÷6µ6WGW"6Æ73Ò'7F6²Öf÷&Ò#à¢ÆÆ&VÃâG´Â‚~{¹Zé®[©~™;¢rÂuF–VæFf–æ7VÆFr—ÓÇ6VÆV7B–CÒ&¶–÷6µ7F÷&R#âG·7F÷&W2æÖ‚‡7F÷&R’ÓâÆ÷F–öâfÇVSÒ"G·7F÷&Ræ–GÒ#âG¶W66T…DÔÂ‡7F÷&RææÖR—ÓÂö÷F–öãæ’æ¦ö–â‚rr—ÓÂ÷6VÆV7CãÂöÆ&VÃà¢ÆÆ&VÃâG´Â‚~yK^ˆIYŞz{rÂtæöÖ'&RFVÂ÷&FVæF÷"r—ÓÆ–çWB–CÒ&¶–÷6´æÖR"fÇVSÒ"G´Â‚~[©~™;®iKn™;nyK^ˆIrÂt÷&FVæF÷"FR6¦r—Ò"&WV—&VBÖ–æÆVæwFƒÒ#"#ãÂöÆ&VÃà¢Æ'WGFöâ6Æ73Ò'&–Ö'’Ö'Fâ"G—SÒ'7V&Ö—B#âG´Â‚~ZèÎh‰{¹Zé¢rÂt6ö×ÆWF"f–æ7VÆ6œ;6âr—ÓÂö'WGFöãà¢Âöf÷&Óæ°¢B‚r6f–æ—6„¶–÷6µ6WGWr’æFDWfVçDÆ—7FVæW"‚w7V&Ö—BrÂf–æ—6„¶–÷6´6öæf–wW&F–öâ“°¢7FGW2çFW‡D6öçFVçBÒrs°¢Ò6F6‚†W'&÷"’°¢v—B6Æ–VçBæWF‚ç6–vä÷WB‚’æ6F6‚‚‚’Óâ·Ò“°¢7FFRç6W76–öâÒçVÆÃ°¢7FFRç&öf–ÆRÒçVÆÃ°¢7FGW2çFW‡D6öçFVçBÒW'&÷%FW‡B†W'&÷"“°¢Òf–æÆÇ’°¢'WGFöâæF—6&ÆVBÒfÇ6S°¢Ğ§Ğ ¦7–æ2gVæ7F–öâf–æ—6„¶–÷6´6öæf–wW&F–öâ†WfVçB’°¢WfVçBç&WfVçDFVfVÇB‚“°¢6öç7Bf÷&ÒÒWfVçBæ7W'&VçEF&vWC°¢6öç7B'WGFöâÒf÷&ÒçVW'•6VÆV7F÷"‚v'WGFöå·G—SÒ'7V&Ö—B%Òr“°¢–b†'WGFöâæF—6&ÆVB’&WGW&ã°¢'WGFöâæF—6&ÆVBÒG'VS°¢6öç7B7FGW2ÒB‚r6WF…7FGW2r“°¢7FGW2çFW‡D6öçFVçBÒÂ‚~jÚ>YÊyIşh‰jÚNyK^ˆIy¨NxºÎz¸¾XzŞŠø(
+brÂt7&VæFò7&VFVæ6–ÂFVÂ÷&FVæF÷.(
+br“°¢G'’°¢6öç7B7F÷&T–BÒB‚r6¶–÷6µ7F÷&Rr’çfÇVS°¢6öç7B&W7VÇBÒv—BFÖ–ä7F–öâ‡²7F–öã¢v7&VFUö¶–÷6²rÂ7F÷&T–BÂæÖS¢B‚r6¶–÷6´æÖRr’çfÇVRÒ“°¢6öç7B²FF¢7F÷&RÒÒv—B6Æ–VçBæg&öÒ‚w7F÷&W2r’ç6VÆV7B‚væÖRr’æW‚v–BrÂ7F÷&T–B’æÖ–&U6–ævÆR‚“°¢7FFRæ¶–÷6²Ò²FWf–6T–C¢&W7VÇBæFWf–6T–BÂFWf–6U6V7&WC¢&W7VÇBæFWf–6U6V7&WBÂ7F÷&TæÖS¢7F÷&SòææÖRÇÂrrÓ°¢Æö6Å7F÷&vRç6WD—FVÒ„´”õ4µõ5Dõ$tRÂ¥4ôâç7G&–æv–g’‡7FFRæ¶–÷6²’“°¢v—B6Æ–VçBæWF‚ç6–vä÷WB‚“²7FFRç6W76–öâÒçVÆÃ²7FFRç&öf–ÆRÒçVÆÃ°¢v—B÷Vä¶–÷6²‚“°¢Ò6F6‚†W'&÷"’°¢7FGW2çFW‡D6öçFVçBÒW'&÷%FW‡B†W'&÷"“°¢Òf–æÆÇ’°¢'WGFöâæF—6&ÆVBÒfÇ6S°¢Ğ§Ğ ¦7–æ2gVæ7F–öâgVæ7F–öå&WVW7B†æÖRÂ&öG’Â²WF†VçF–6FVBÒfÇ6RÂF–ÖV÷WD×2Ò$UTU5EõD”ÔTõUEôÕ2ÒÒ·Ò’°¢6öç7B7F'FVBÒFFRææ÷r‚“°¢ÆWB7FvRÒw6W76–öâs°¢6öç7B†VFW'2Ò²t6öçFVçBÕG—Rs¢vÆ–6F–öâö§6öârÂ–¶W“¢6öæf–rç7W&6UV&Æ—6†&ÆT¶W’Ó°¢6öç7B6öçG&öÆÆW"ÒæWr&÷'D6öçG&öÆÆW"‚“°¢6öç7BF–ÖV÷WBÒ6WEF–ÖV÷WB‚‚’Óâ6öçG&öÆÆW"æ&÷'B‚’ÂF–ÖV÷WD×2“°¢ÆWB&÷'D†æFÆW#°¢6öç7B&÷'FVBÒæWr&öÖ—6R‚…òÂ&V¦V7B’Óâ°¢&÷'D†æFÆW"Ò‚’Óâ&V¦V7B†æWrW'&÷"‚u$UTU5EõD”ÔTõUBr’“°¢6öçG&öÆÆW"ç6–væÂæFDWfVçDÆ—7FVæW"‚v&÷'BrÂ&÷'D†æFÆW"Â¶öæ6S§G'VWÒ“°¢Ò“°¢G'’°¢–b†WF†VçF–6FVB’°¢6öç7B²FFÂW'&÷"ÒÒv—B&öÖ—6Rç&6R…¶6Æ–VçBæWF‚ævWE6W76–öâ‚’Æ&÷'FVEÒ“°¢–b†W'&÷"ÇÂFFòç6W76–öãòæ66W75÷Fö¶Vâ’F‡&÷ræWrW'&÷"‚u4U54”ôåôU…•$TBr“°¢†VFW'2äWF†÷&—¦F–öâÒ&V&W"G¶FFç6W76–öâæ66W75÷Fö¶VçÖ°¢Ğ¢7FvRÒw&WVW7Bs°¢6öç7B&W7öç6RÒv—B&öÖ—6Rç&6R…¶fWF6‚†G¶6öæf–rç7W&6UW&ÇÒögVæ7F–öç2÷còG¶æÖWÖÂ°¢ÖWF†öC¢uõ5BrÆ†VFW'2Æ&öG“¤¥4ôâç7G&–æv–g’†&öG’’Ç6–væÃ¦6öçG&öÆÆW"ç6–væÂÆ66†S¢væò×7F÷&RrÀ¢Ò’Æ&÷'FVEÒ“°¢7FvRÒw&W7öç6Rs°¢6öç7B&W7öç6UFW‡BÒv—B&öÖ—6Rç&6R…·&W7öç6RçFW‡B‚’Æ&÷'FVEÒ“°¢ÆWB&W7VÇC°¢G'’²&W7VÇBÒ¥4ôâç'6R‡&W7öç6UFW‡B“²Ğ¢6F6‚²F‡&÷ræWrW'&÷"‚t”ådÄ”Eõ4U%dU%õ$U5ôå4Rr“²Ğ¢–b‚&W7öç6Ræö²ÇÂ&W7VÇCòæW'&÷"’°¢6öç7BW'&÷"ÒæWrW'&÷"‡&W7VÇCòæW'&÷"ÇÂ…EEòG·&W7öç6Rç7FGW7Ö“°¢ö&¦V7Bæ76–vâ†W'&÷"Ç·7FGW3§&W7öç6Rç7FGW2Æ6öFS§&W7VÇCòæ6öFRÆFWF–Ã§&W7VÇCòæFWF–ÂÇ&V6÷&D6÷VçG3§&W7VÇCòç&V6÷&D6÷VçG7Ò“·F‡&÷rW'&÷#°¢Ğ¢&WGW&â&W7VÇC°¢Ò6F6‚†÷&–v–æÂ’°¢6öç7BW'&÷"Ò6öçG&öÆÆW"ç6–væÂæ&÷'FVBÇÂ÷&–v–æÃòææÖRÓÓÒt&÷'DW'&÷"ròæWrW'&÷"‚u$UTU5EõD”ÔTõUBr¢¢÷&–v–æÂ–ç7Fæ6VöbG—TW'&÷"òæWrW'&÷"‚täUEtõ$µôU%$õ"r’¢÷&–v–æÃ°¢W'&÷"æF–væ÷7F–2Ò·6W'f–6S¦æÖRÆ7F–öã¦&öG’æ7F–öâÇÂwVæ6‚rÇ7FvRÆVÆ6VD×3¤FFRææ÷r‚’×7F'FVBÇ7FGW3¦W'&÷"ç7FGW2ÇÂçVÆÂÆ6öFS¦æ÷&ÖÆ—¦VDW'&÷$6öFR†W'&÷"—Ó°¢F‡&÷rW'&÷#°¢Òf–æÆÇ’²6ÆV%F–ÖV÷WB‡F–ÖV÷WB“¶6öçG&öÆÆW"ç6–væÂç&VÖ÷fTWfVçDÆ—7FVæW"‚v&÷'BrÆ&÷'D†æFÆW"“²Ğ§Ğ ¦7–æ2gVæ7F–öâ&tgVæ7F–öâ†æÖRÂ&öG’’°¢&WGW&âgVæ7F–öå&WVW7B†æÖRÂ&öG’“°§Ğ ¦7–æ2gVæ7F–öâ÷Vä¶–÷6²‚’°¢6ÆV%F–ÖV÷WB†¶–÷6µ&W6WEF–ÖW"“°¢–b‚7FFRæ¶–÷6²’²7FFRæVçG'’Òv¶–÷6²s²&VæFW$WF‚‚“²&WGW&ã²Ğ¢7FFRæ¶–÷6µ7V66W72ÒçVÆÃ²7FFRæ¶–÷6µ6VÆV7FVBÒçVÆÃ°¢æ–ææW$…DÔÂÒÆF—b6Æ73Ò&&ö÷B#ãÇ7â6Æ73Ò&'&æBÖÖ&²#äƒÂ÷7ããÇâG´Â‚~jÚ>YÊXª‹ÛŞK¸®iz^Y[z^(
+brÂt6&væFòV×ÆVF÷2FR†÷(
+br—ÓÂ÷ãÂöF—cæ°¢G'’°¢6öç7B&W7VÇBÒv—B&tgVæ7F–öâ‚v¶–÷6²×Væ6‚rÂ²7F–öã¢vÆ—7BrÂââç7FFRæ¶–÷6²Ò“°¢7FFRæ¶–÷6´V×Æ÷–VW2Ò&W7VÇBæV×Æ÷–VW2ÇÂµÓ²7FFRæ¶–÷6µ7F÷&RÒ&W7VÇBç7F÷&S°¢&VæFW$¶–÷6²‚“°¢Ò6F6‚†W'&÷"’°¢f÷&vWD¶–÷6´–d–çfÆ–B†W'&÷"“°¢Fö7B†W'&÷%FW‡B†W'&÷"’ÂG'VR“²&VæFW$WF‚‚“°¢Ğ§Ğ ¦gVæ7F–öâWfVçDÆ&VÂ‡G—R’°¢&WGW&â‡²6Æö6µö–ã¢Â‚~Kˆ®xúÒrÂtVçG&Fr’Â'&Vµ÷7F'C¢Â‚~[ÈZx¾KÉhòrÂt–æ–6–òW6r’Â'&VµöVæC¢Â‚~{¹>iÙşKÉhòrÂtf–âW6r’Â6Æö6µö÷WC¢Â‚~Kˆ¾xúÒrÂu6Æ–Fr’Ò•·G—UÒÇÂG—S°§Ğ ¦gVæ7F–öâæW‡D7F–öç4g&öÕ&V6÷&B‡&V6÷&B’°¢–b‚&V6÷&Còæ6Æö6µö–â’&WGW&â²v6Æö6µö–âuÓ°¢–b‡&V6÷&Bæ6Æö6µö÷WB’&WGW&âµÓ°¢–b‡&V6÷&Bæ'&Vµ÷7F'Bbb&V6÷&Bæ'&VµöVæB’&WGW&â²v'&VµöVæBuÓ°¢–b‚&V6÷&Bæ'&Vµ÷7F'B’&WGW&â²v'&Vµ÷7F'BrÂv6Æö6µö÷WBuÓ°¢&WGW&â²v6Æö6µö÷WBuÓ°§Ğ ¦gVæ7F–öâ&VæFW$¶–÷6²‚’°¢6öç7B6VÆV7FVBÒ7FFRæ¶–÷6´V×Æ÷–VW2æf–æB‚†—FVÒ’Óâ—FVÒçW6W%ö–BÓÓÒ7FFRæ¶–÷6µ6VÆV7FVB“°¢æ–ææW$…DÔÂÒÆÖ–â6Æ73Ò&¶–÷6²×6†VÆÂ#à¢Æ†VFW"6Æ73Ò&¶–÷6²×F÷#ãÆF—b6Æ73Ò&'&æBÖÆö6·W#ãÇ7â6Æ73Ò&'&æBÖÖ&²#äƒÂ÷7ããÇ7ããÆ#ä„ôÄ4Ud”ÄÄÂö#ãÇ6ÖÆÃâG¶W66T…DÔÂ‡7FFRæ¶–÷6µ7F÷&SòææÖRÇÂ7FFRæ¶–÷6³òç7F÷&TæÖRÇÂrr—ÓÂ÷6ÖÆÃãÂ÷7ããÂöF—cãÆF—b6Æ73Ò&¶–÷6²Ö6Æö6²#ãÆ"–CÒ&¶–÷6µF–ÖR#âG·F–ÖUFW‡B†æWrFFR‚’—ÓÂö#ãÇ6ÖÆÃâG¶ÖG&–DF—7Æ’‚—ÓÂ÷6ÖÆÃãÂöF—cãÂö†VFW#à¢Ç6V7F–öâ6Æ73Ò&¶–÷6²Ö6&B#à¢G·7FFRæ¶–÷6µ7V66W72òÆF—b6Æ73Ò'7V66W72×æVÂ#ãÆ#î)É2G¶W66T…DÔÂ‡7FFRæ¶–÷6µ7V66W72ææÖR—ÓÂö#ãÇ7ãâG¶W66T…DÔÂ†WfVçDÆ&VÂ‡7FFRæ¶–÷6µ7V66W72æWfVçEG—R’—Ò+rG¶W66T…DÔÂ‡F–ÖUFW‡B‡7FFRæ¶–÷6µ7V66W72æö67W'&VDB’—ÓÂ÷7ããÇâG·7FFRæ¶–÷6µ7V66W72ç†÷Fô6GW&VBòÂ‚~h™>XÚ[{.Šë[Ù^ûÈÎxëYË®xZ~x˜~[{.ZèXZKˆ®KÊK‰NKˆŞKÉ®KùŞZÙYÊyK^ˆIKŠŞ8"rÂtf–6†¦R&Vv—7G&FòâÆf÷Fò6R7V&œ;2FRf÷&Ö6VwW&’æò6RwV&L;2VâVÂ÷&FVæF÷"âr’¢Â‚~h™>XÚ[{.Šë[Ù^ûÈÎ{;¾{¹ş[nˆz®Xª˜X{®8"rÂtf–6†¦R&Vv—7G&FòâÆçFÆÆ6R6W'&,:WFöÜ:F–6ÖVçFRâr—ÓÂ÷ãÂöF—cæ¢ ¢Ç6Æ73Ò&W–V'&÷r#äd”4„¤RTâD”TäDÂ÷ãÆƒâG´Â‚~˜hºKÚy¨NZy>YÒrÂtVÆ–vRGRæöÖ'&Rr—ÓÂöƒãÇâG´Â‚~zîŠêNZy>YŞYî‹é>XZ^KŠ®K«£nKØÕ”î8.Kˆ®xúŞY(ÎKˆ¾xúŞKÉ®ˆz®Xªh¸ŞiNxëYË®xZ~x˜~ûÉ¾xZ~x˜~KˆŞKÉ®KùŞZÙYÊ‹ùXûyK^ˆIKŠŞ8"rÂtFW7\:—2–çG&öGV6RGR”âW'6öæÂFRb6–g&2âVâÆVçG&F’Æ6Æ–F6R†,:Væf÷FòWFöÜ:F–6VRæò6RwV&F,:VâW7FR÷&FVæF÷"âr—ÓÂ÷à¢Æ–çWB–CÒ&V×Æ÷–VU6V&6‚"G—SÒ'6V&6‚"Æ6V†öÆFW#Ò"G´Â‚~i	Î{J.Zy>YŞ(
+brÂt'W66"æöÖ'&^(
+br—Ò"WFö6ö×ÆWFSÒ&öfb#à¢ÆF—b6Æ73Ò&V×Æ÷–VR×–6¶W""–CÒ&V×Æ÷–VU–6¶W"#âG·&VæFW$V×Æ÷–VT6†ö–6W2‡7FFRæ¶–÷6´V×Æ÷–VW2Â6VÆV7FVB—ÓÂöF—cà¢G·6VÆV7FVBòÆF—b6Æ73Ò'–âÖ&÷‚#ãÆÆ&VÃâG´Â‚~KŠ®K«£nKØÕ”ârÂu”âW'6öæÂFRb6–g&2r—ÓÆ–çWB–CÒ&¶–÷6µ–â"G—SÒ'77v÷&B"–çWFÖöFSÒ&çVÖW&–2"GFW&ãÒ%³Ó•×³gÒ"Ö†ÆVæwFƒÒ#b"WFö6ö×ÆWFSÒ&öfb"WFöfö7W3ãÂöÆ&VÃãÂöF—cà¢ÆF—b6Æ73Ò'Væ6‚Ö7F–öç2#âG·6VÆV7FVBææW‡D7F–öç2æÖ‚†7F–öâ’ÓâÆ'WGFöâ6Æ73Ò"G¶7F–öâÓÓÒv6Æö6µö÷WBròw6V6öæF'’Ö'Fâr¢w&–Ö'’Ö'FâwÒ"G—SÒ&'WGFöâ"FF×Væ6ƒÒ"G¶7F–öçÒ#âG¶WfVçDÆ&VÂ†7F–öâ—ÓÂö'WGFöãæ’æ¦ö–â‚rr’ÇÂÇâG´Â‚~K¸®ZJ[{.{¸şZèÎh‰h™>XÚrÂtÆ¦÷&æFFR†÷’–W7L:6ö×ÆWFr—ÓÂ÷æÓÂöF—cæ¢rwĞ¢Ğ¢Â÷6V7F–öãà¢Æfö÷FW"6Æ73Ò&¶–÷6²Öfö÷FW"#ãÆ'WGFöâ6Æ73Ò&Æ–æ²Ö'Fâ"–CÒ&¶–÷6µ&Vg&W6‚"G—SÒ&'WGFöâ#î(k²G´Â‚~X‹~ikrÂt7GVÆ—¦"r—ÓÂö'WGFöããÆ'WGFöâ6Æ73Ò&Æ–æ²Ö'Fâ"–CÒ&W†—D¶–÷6²"G—SÒ&'WGFöâ#âG´Â‚~‹ùNY¹îy›¾[ÙRrÂuföÇfW"Â66W6òr—ÓÂö'WGFöããÂöfö÷FW#à¢ÂöÖ–ãæ°¢&–æD¶–÷6²‚“°§Ğ ¦gVæ7F–öâ&VæFW$V×Æ÷–VT6†ö–6W2†V×Æ÷–VW2Â6VÆV7FVB’°¢–b‚V×Æ÷–VW2æÆVæwF‚’&WGW&âÆF—b6Æ73Ò&V×G’#âG´Â‚~K¸®ZJk*iÈhé.YÊjÚN[©~y¨NY[z^ûÈÎŠû~j8iú^[{.Xù[ˆ>hé.xúÒrÂtæò†’V×ÆVF÷26–væF÷2†÷’W7FF–VæFâ&Wf—6VÂ†÷&&–òV&Æ–6Fòr—ÓÂöF—cæ°¢&WGW&âV×Æ÷–VW2æÖ‚†V×Æ÷–VR’ÓâÆ'WGFöâ6Æ73Ò&V×Æ÷–VRÖ6†ö–6RG·6VÆV7FVCòçW6W%ö–BÓÓÒV×Æ÷–VRçW6W%ö–Bòv7F—fRr¢rwÒ"G—SÒ&'WGFöâ"FFÖV×Æ÷–VSÒ"G¶V×Æ÷–VRçW6W%ö–GÒ#ãÆ#âG¶W66T…DÔÂ†V×Æ÷–VRægVÆÅöæÖR—ÓÂö#ãÇ6ÖÆÃâG¶W66T…DÔÂ†V×Æ÷–VRæV×Æ÷–VUöæò—Ò+rG¶V×Æ÷–VRæWfVçG2æÆVæwF‚òWfVçDÆ&VÂ†V×Æ÷–VRæWfVçG2æB‚Ó’æWfVçE÷G—R’²rr²F–ÖUFW‡B†V×Æ÷–VRæWfVçG2æB‚Ó’æö67W'&VEöB’¢Â‚~[	®iÊ®h™>XÚrÂu6–âf–6†"r—ÓÂ÷6ÖÆÃãÂö'WGFöãæ’æ¦ö–â‚rr“°§Ğ ¦gVæ7F–öâ&–æD¶–÷6²‚’°¢B‚r6W†—D¶–÷6²r“òæFDWfVçDÆ—7FVæW"‚v6Æ–6²rÂ‚’Óâ²6ÆV%F–ÖV÷WB†¶–÷6µ&W6WEF–ÖW"“²&VæFW$WF‚‚“²Ò“°¢B‚r6¶–÷6µ&Vg&W6‚r“òæFDWfVçDÆ—7FVæW"‚v6Æ–6²rÂ÷Vä¶–÷6²“°¢B‚r6V×Æ÷–VU6V&6‚r“òæFDWfVçDÆ—7FVæW"‚v–çWBrÂ†WfVçB’Óâ°¢6öç7BFW&ÒÒWfVçBçF&vWBçfÇVRçG&–Ò‚’çFôÆ÷vW$66R‚“°¢6öç7BÆ—7BÒ7FFRæ¶–÷6´V×Æ÷–VW2æf–ÇFW"‚†V×Æ÷–VR’ÓâG¶V×Æ÷–VRægVÆÅöæÖWÒG¶V×Æ÷–VRæV×Æ÷–VUöæ÷ÖçFôÆ÷vW$66R‚’æ–æ6ÇVFW2‡FW&Ò’“°¢B‚r6V×Æ÷–VU–6¶W"r’æ–ææW$…DÔÂÒ&VæFW$V×Æ÷–VT6†ö–6W2†Æ—7BÂ7FFRæ¶–÷6´V×Æ÷–VW2æf–æB‚†—FVÒ’Óâ—FVÒçW6W%ö–BÓÓÒ7FFRæ¶–÷6µ6VÆV7FVB’“°¢&–æDV×Æ÷–VT6†ö–6W2‚“°¢Ò“°¢&–æDV×Æ÷–VT6†ö–6W2‚“°¢BB‚u¶FF×Væ6…Òr’æf÷$V6‚‚†'WGFöâ’Óâ'WGFöâæFDWfVçDÆ—7FVæW"‚v6Æ–6²rÂ‚’Óâ¶–÷6µVæ6‚†'WGFöâæFF6WBçVæ6‚’’“°§Ğ ¦gVæ7F–öâ&–æDV×Æ÷–VT6†ö–6W2‚’°¢BB‚u¶FFÖV×Æ÷–VUÒr’æf÷$V6‚‚†'WGFöâ’Óâ'WGFöâæFDWfVçDÆ—7FVæW"‚v6Æ–6²rÂ‚’Óâ°¢7FFRæ¶–÷6µ6VÆV7FVBÒ'WGFöâæFF6WBæV×Æ÷–VS²&VæFW$¶–÷6²‚“°¢Ò’“°§Ğ ¦gVæ7F–öâ¶–÷6µ†÷Fõ&WV—&VB†WfVçEG—R’°¢&WGW&âWfVçEG—RÓÓÒv6Æö6µö–ârÇÂWfVçEG—RÓÓÒv6Æö6µö÷WBs°§Ğ ¦gVæ7F–öâv—D×2†Ö–ÆÆ—6V6öæG2’°¢&WGW&âæWr&öÖ—6R‚‡&W6öÇfR’Óâ6WEF–ÖV÷WB‡&W6öÇfRÂÖ–ÆÆ—6V6öæG2’“°§Ğ ¦7–æ2gVæ7F–öâ6GW&T¶–÷6µ†÷Fò†WfVçEG—R’°¢–b‚æf–vF÷"æÖVF–FWf–6W3òævWEW6W$ÖVF–’F‡&÷ræWrW'&÷"‚t4ÔU$õTäd”Ä$ÄRr“°¢6öç7BÖöFÅ&ö÷BÒB‚r6ÖöFÅ&ö÷Br“°¢ÆWB7G&VÒÒçVÆÃ°¢ÆWBf–FVòÒçVÆÃ°¢G'’°¢ÖöFÅ&ö÷Bæ–ææW$…DÔÂÒÇ6V7F–öâ6Æ73Ò&ÖöFÂ6ÖW&ÖÖöFÂ"&öÆSÒ&F–Æör"&–ÖÖöFÃÒ'G'VR"&–ÖÆ&VÆÆVF'“Ò&6ÖW&F—FÆR#à¢ÆF—b6Æ73Ò&ÖöFÂÖ†VB#ãÆF—cãÇ6Æ73Ò&W–V'&÷r#äÄ•dR„õDóÂ÷ãÆƒ"–CÒ&6ÖW&F—FÆR#âG¶WfVçDÆ&VÂ†WfVçEG—R—Ò+rG´Â‚~xëYË®h¸ŞxZrrÂtf÷FòVâF—&V7Fòr—ÓÂöƒ#ãÂöF—cãÆ'WGFöâ6Æ73Ò&6Æ÷6RÖ'Fâ"–CÒ&6ÖW&6æ6VÂ"G—SÒ&'WGFöâ"&–ÖÆ&VÃÒ"G´Â‚~Xùnkh‚rÂt6æ6VÆ"r—Ò#ì9sÂö'WGFöããÂöF—cà¢ÇâG´Â‚~Šû~iÊÎK«®jÚ>ZûiNX8şZKN8.yK¾™Ú.[nYÊƒ.zy.Yîˆz®Xªh¸ŞiNûÈÎxZ~x˜~KˆŞKÉ®KùŞZÙYÊyK^ˆI˜xÎ8"rÂtÖ—&FRg&VçFRÆ<:Ö&âÆf÷Fò6R†,:WFöÜ:F–6ÖVçFRVâ"6VwVæF÷2’æò6RwV&F,:VâVÂ÷&FVæF÷"âr—ÓÂ÷à¢ÆF—b6Æ73Ò&6ÖW&Ög&ÖR#ãÇf–FVò–CÒ&¶–÷6´6ÖW&"WF÷Æ’×WFVBÆ—6–æÆ–æSãÂ÷f–FVóãÇ7G&öær–CÒ&6ÖW&6÷VçFF÷vâ#î(
+cÂ÷7G&öæsãÂöF—cà¢Ç6Æ73Ò&6ÖW&×7FGW2"–CÒ&6ÖW&7FGW2#âG´Â‚~jÚ>YÊY
+şXªiNX8şZKN(
+brÂt–æ–6–æFòÆ<:Ö&(
+br—ÓÂ÷à¢Â÷6V7F–öãæ°¢B‚r66ÖW&6æ6VÂr“òæFDWfVçDÆ—7FVæW"‚v6Æ–6²rÂ‚’Óâ²ÖöFÅ&ö÷Bæ–ææW$…DÔÂÒrs²Ò“° ¢G'’°¢7G&VÒÒv—Bæf–vF÷"æÖVF–FWf–6W2ævWEW6W$ÖVF–‡°¢f–FVó¢²f6–ætÖöFS¢wW6W"rÂv–GFƒ¢²–FVÃ¢cCÒÂ†V–v‡C¢²–FVÃ¢CƒÒÒÀ¢VF–ó¢fÇ6RÀ¢Ò“°¢Ò6F6‚†W'&÷"’°¢–b†W'&÷#òææÖRÓÓÒtæ÷DÆÆ÷vVDW'&÷"rÇÂW'&÷#òææÖRÓÓÒu6V7W&—G”W'&÷"r’F‡&÷ræWrW'&÷"‚t4ÔU$õU$Ô•54”ôåôDTä”TBr“°¢F‡&÷ræWrW'&÷"‚t4ÔU$õTäd”Ä$ÄRr“°¢Ğ¢f–FVòÒB‚r6¶–÷6´6ÖW&r“°¢–b‚f–FVò’F‡&÷ræWrW'&÷"‚t4ÔU$ô4ä4TÄÄTBr“°¢f–FVòç7&4ö&¦V7BÒ7G&VÓ°¢–b‡f–FVòç&VG•7FFRÂ"’°¢v—B&öÖ—6Rç&6R…°¢æWr&öÖ—6R‚‡&W6öÇfRÂ&V¦V7B’Óâ°¢f–FVòæFDWfVçDÆ—7FVæW"‚vÆöFVFFFrÂ&W6öÇfRÂ²öæ6S¢G'VRÒ“°¢f–FVòæFDWfVçDÆ—7FVæW"‚vW'&÷"rÂ‚’Óâ&V¦V7B†æWrW'&÷"‚t4ÔU$õTäd”Ä$ÄRr’’Â²öæ6S¢G'VRÒ“°¢Ò’À¢v—D×2ƒó’çF†Vâ‚‚’Óâ²F‡&÷ræWrW'&÷"‚t4ÔU$õTäd”Ä$ÄRr“²Ò’À¢Ò“°¢Ğ¢v—Bf–FVòçÆ’‚“°¢f÷"†6öç7BçVÖ&W"öb³"ÂÒ’°¢–b‚f–FVòæ—46öææV7FVB’F‡&÷ræWrW'&÷"‚t4ÔU$ô4ä4TÄÄTBr“°¢B‚r66ÖW&6÷VçFF÷vâr’çFW‡D6öçFVçBÒ7G&–ær†çVÖ&W"“°¢B‚r66ÖW&7FGW2r’çFW‡D6öçFVçBÒÂ‚~Šû~KùŞhÈjÚ>ZûiNX8şZKBrÂtÖçL:–âÆÖ—&F†6–Æ<:Ö&r“°¢v—Bv—D×2ƒ“°¢Ğ¢–b‚f–FVòæ—46öææV7FVBÇÂf–FVòçf–FVõv–GF‚ÇÂf–FVòçf–FVô†V–v‡B’F‡&÷ræWrW'&÷"‚t4ÔU$õTäd”Ä$ÄRr“° ¢6öç7B66ÆRÒÖF‚æÖ–âƒÂcCòf–FVòçf–FVõv–GF‚ÂCƒòf–FVòçf–FVô†V–v‡B“°¢6öç7B6çf2ÒFö7VÖVçBæ7&VFTVÆVÖVçB‚v6çf2r“°¢6çf2çv–GF‚ÒÖF‚æÖ‚ƒÂÖF‚ç&÷VæB‡f–FVòçf–FVõv–GF‚¢66ÆR’“°¢6çf2æ†V–v‡BÒÖF‚æÖ‚ƒÂÖF‚ç&÷VæB‡f–FVòçf–FVô†V–v‡B¢66ÆR’“°¢6öç7B6öçFW‡BÒ6çf2ævWD6öçFW‡B‚s&BrÂ²Ç†¢fÇ6RÒ“°¢–b‚6öçFW‡B’F‡&÷ræWrW'&÷"‚t4ÔU$õTäd”Ä$ÄRr“°¢6öçFW‡BçG&ç6ÆFR†6çf2çv–GF‚Â“°¢6öçFW‡Bç66ÆR‚ÓÂ“°¢6öçFW‡BæG&t–ÖvR‡f–FVòÂÂÂ6çf2çv–GF‚Â6çf2æ†V–v‡B“°¢6öç7B†÷FôFFW&ÂÒ6çf2çFôFFU$Â‚v–ÖvRö§VrrÂãs"“°¢6çf2çv–GF‚Ò°¢6çf2æ†V–v‡BÒ°¢–b‚†÷FôFFW&Âç7F'G5v—F‚‚vFF¦–ÖvRö§Vs¶&6ScBÂr’ÇÂ†÷FôFFW&ÂæÆVæwF‚âcó’F‡&÷ræWrW'&÷"‚u„õDõõDôõôÄ$tRr“°¢B‚r66ÖW&6÷VçFF÷vâr’çFW‡D6öçFVçBÒ~)É2s°¢B‚r66ÖW&7FGW2r’çFW‡D6öçFVçBÒÂ‚~xZ~x˜~[{.h¸ŞiNûÈÎjÚ>YÊZèXZKˆ®KÊ(
+brÂtf÷Fò&VÆ—¦Fâ7V&–VæFòFRf÷&Ö6VwW&(
+br“°¢&WGW&â²†÷FôFFW&ÂÂ†÷Fô6GW&VDC¢æWrFFR‚’çFô•4õ7G&–ær‚’Ó°¢Òf–æÆÇ’°¢7G&VÓòævWEG&6·2‚’æf÷$V6‚‚‡G&6²’ÓâG&6²ç7F÷‚’“°¢–b‡f–FVò’f–FVòç7&4ö&¦V7BÒçVÆÃ°¢–b†ÖöFÅ&ö÷B’ÖöFÅ&ö÷Bæ–ææW$…DÔÂÒrs°¢Ğ§Ğ ¦7–æ2gVæ7F–öâ¶–÷6µVæ6‚†WfVçEG—R’°¢6öç7B–âÒB‚r6¶–÷6µ–âr“òçfÇVRÇÂrs°¢–b‚õåÆG³gÒBòçFW7B‡–â’’²Fö7B„Â‚~Šû~‹é>XZSnKØÕ”ârÂt–çG&öGV6RVÂ”âFRb6–g&2r’ÂG'VR“²&WGW&ã²Ğ¢–b‡7FFRæ'W7’’&WGW&ã°¢7FFRæ'W7’ÒG'VS°¢BB‚u¶FF×Væ6…Òr’æf÷$V6‚‚†'WGFöâ’Óâ²'WGFöâæF—6&ÆVBÒG'VS²Ò“°¢G'’°¢6öç7B†÷FòÒ¶–÷6µ†÷Fõ&WV—&VB†WfVçEG—R’òv—B6GW&T¶–÷6µ†÷Fò†WfVçEG—R’¢çVÆÃ°¢6öç7B&W7VÇBÒv—B&tgVæ7F–öâ‚v¶–÷6²×Væ6‚rÂ°¢7F–öã¢wVæ6‚rÂââç7FFRæ¶–÷6²ÂV×Æ÷–VT–C¢7FFRæ¶–÷6µ6VÆV7FVBÂ–âÂWfVçEG—RÀ¢âââ‡†÷FòÇÂ·Ò’À¢Ò“°¢7FFRæ¶–÷6µ7V66W72Ò²æÖS¢&W7VÇBæV×Æ÷–VRææÖRÂWfVçEG—RÂö67W'&VDC¢&W7VÇBæWfVçBæö67W'&VDBÂ†÷Fô6GW&VC¢&W7VÇBç†÷Fô6GW&VBÓ°¢&VæFW$¶–÷6²‚“°¢¶–÷6µ&W6WEF–ÖW"Ò6WEF–ÖV÷WB‚‚’Óâ÷Vä¶–÷6²‚’ÂS“°¢Ò6F6‚†W'&÷"’°¢–b†f÷&vWD¶–÷6´–d–çfÆ–B†W'&÷"’’²Fö7B†W'&÷%FW‡B†W'&÷"’ÂG'VR“²&VæFW$WF‚‚“²&WGW&ã²Ğ¢Fö7B†W'&÷%FW‡B†W'&÷"’ÂG'VR“°¢6öç7B–ä–çWBÒB‚r6¶–÷6µ–âr“°¢–b‡–ä–çWB’²–ä–çWBçfÇVRÒrs²–ä–çWBæfö7W2‚“²Ğ¢Ğ¢f–æÆÇ’°¢7FFRæ'W7’ÒfÇ6S°¢BB‚u¶FF×Væ6…Òr’æf÷$V6‚‚†'WGFöâ’Óâ²'WGFöâæF—6&ÆVBÒfÇ6S²Ò“°¢Ğ§Ğ ¦7–æ2gVæ7F–öâÆöE÷'FÄFF‚’°¢–b‚7FFRç&öf–ÆR’&WGW&ã°¢–b‡7FFRç&öf–ÆRç&öÆRÓÓÒvÖævW"r’v—BÆöDÖævW$FF‚“²VÇ6Rv—BÆöDV×Æ÷–VTFF‚“°§Ğ ¦gVæ7F–öâ76W'EVW'•&W7VÇG2‡&W7VÇG2’°¢6öç7Bf–ÆVBÒ&W7VÇG2æf–æB‚‡&W7VÇB’Óâ&W7VÇCòæW'&÷"“°¢–b‚f–ÆVB’&WGW&ã°¢6öç6öÆRæW'&÷"‚u7W&6RFFVW'’f–ÆVC¢rÂf–ÆVBæW'&÷"“°¢F‡&÷ræWrW'&÷"‚tDDôÄôEôd”ÄTBr“°§Ğ ¦7–æ2gVæ7F–öâ6†V6µ7—7FVÔ†VÇF‚‚’°¢6öç7BgVæ7F–öäæÖW2Ò²vFÖ–âÖ’rÂv¶–÷6²×Væ6‚rÂvw2×Væ6‚uÓ°¢6öç7B6†V6·2Òv—B&öÖ—6RæÆÂ†gVæ7F–öäæÖW2æÖ†7–æ2†æÖR’Óâ°¢G'’°¢6öç7B&W7VÇBÒv—BgVæ7F–öå&WVW7B†æÖRÂ²7F–öã¢v†VÇF‚rÒÂ²F–ÖV÷WD×3¢…óÒ“°¢&WGW&â²æÖRÂö³¢&W7VÇCòç&VÆV6RÓÓÒeTä5D”ôåõ$TÄT4U5¶æÖUÒÂ&VÆV6S¢&W7VÇCòç&VÆV6RÇÂrrÓ°¢Ò6F6‚†W'&÷"’°¢&WGW&â²æÖRÂö³¢fÇ6RÂW'&÷#¢W'&÷%FW‡B†W'&÷"’Ó°¢Ğ¢Ò’“°¢7FFRæ†VÇF‚Ò6†V6·3°§Ğ ¦7–æ2gVæ7F–öâÆöDV×Æ÷–VTFF‚’°¢6öç7BFöF’ÒÖG&–DFFR‚“°¢6öç7BÖöçF…7F'BÒG·FöF’ç6Æ–6RƒÂr—ÒÓ°¢6öç7B66†VGVÆU7F'BÒÖöçF…7F'BÂFDF—2‡FöF’ÂÓr’òÖöçF…7F'B¢FDF—2‡FöF’ÂÓr“°¢6öç7Bæ÷rÒæWrFFR‚’çFô•4õ7G&–ær‚“°¢6öç7BF•7F'BÒÖG&–DÆö6ÅFô—6ò‡FöF’Âs£r“°¢6öç7BF”VæBÒÖG&–DÆö6ÅFô—6ò†FDF—2‡FöF’Â’Âs£r“°¢6öç7B·7F÷&W2Â66†VGVÆW2ÂGFVæFæ6RÂ&WVW7G2ÂW&Ö—76–öç2ÂFöF”WfVçG5ÒÒv—B&öÖ—6RæÆÂ…°¢6Æ–VçBæg&öÒ‚w7F÷&W2r’ç6VÆV7B‚r¢r’æW‚v7F—fRrÂG'VR’æ÷&FW"‚væÖRr’À¢6Æ–VçBæg&öÒ‚w66†VGVÆW2r’ç6VÆV7B‚r¢Â7F÷&W2†æÖRÆFG&W72’r’æwFR‚wv÷&µöFFRrÂ66†VGVÆU7F'B’æÇFR‚wv÷&µöFFRrÂFDF—2‡FöF’ÂB’’æ÷&FW"‚wv÷&µöFFRr’À¢6Æ–VçBæg&öÒ‚vGFVæFæ6UöF–Ç’r’ç6VÆV7B‚r¢r’æwFR‚wv÷&µöFFRrÂÖöçF…7F'B’æÇFR‚wv÷&µöFFRrÂFöF’’æ÷&FW"‚wv÷&µöFFRrÂ²66VæF–æs¢fÇ6RÒ’À¢6Æ–VçBæg&öÒ‚w&WVW7G2r’ç6VÆV7B‚r¢r’æ÷&FW"‚v7&VFVEöBrÂ²66VæF–æs¢fÇ6RÒ’æÆ–Ö—BƒS’À¢6Æ–VçBæg&öÒ‚vw5÷W&Ö—76–öç2r’ç6VÆV7B‚r¢Â7F÷&W2†æÖRÆFG&W72ÆÆF—GVFRÆÆöæv—GVFRÇ&F—W5öÒ’r’æW‚v7F—fRrÂG'VR’æÇFR‚wfÆ–Eög&öÒrÂæ÷r’æwFR‚wfÆ–E÷VçF–ÂrÂæ÷r’æ÷&FW"‚wfÆ–E÷VçF–Âr’À¢6Æ–VçBæg&öÒ‚vGFVæFæ6UöWfVçG2r’ç6VÆV7B‚vV×Æ÷–VUö–BÇ7F÷&Uö–BÆWfVçE÷G—RÆö67W'&VEöBr¢æW‚vV×Æ÷–VUö–BrÂ7FFRç&öf–ÆRçW6W%ö–B’æwFR‚vö67W'&VEöBrÂF•7F'B’æÇB‚vö67W'&VEöBrÂF”VæB¢æ÷&FW"‚vö67W'&VEöBr’À¢Ò“°¢76W'EVW'•&W7VÇG2…·7F÷&W2Â66†VGVÆW2ÂGFVæFæ6RÂ&WVW7G2ÂW&Ö—76–öç5Ò“°¢6öç7BGFVæFæ6U&÷w2ÒGFVæFæ6RæFFÇÂµÓ°¢6öç7B66†VDWfVçG2Ò&VD¥4ôâ…Tä4…ô44„Uõ5Dõ$tRÂµÒ’æf–ÇFW"‚†—FVÒ’Óà¢—FVÓòæV×Æ÷–VUö–BÓÓÒ7FFRç&öf–ÆRçW6W%ö–Bbb—FVÓòçv÷&µöFFRÓÓÒFöF¢“°¢6öç7B6W'fW$WfVçG2ÒFöF”WfVçG2æW'&÷"ò‡FöF”WfVçG2æFFÇÂµÒ’¢µÓ°¢6öç7BVffV7F—fTWfVçG2Ò²ââç6W'fW$WfVçG2Âââæ66†VDWfVçG5Òç6÷'B‚†Â"’Óà¢7G&–ær†æö67W'&VEöB’æÆö6ÆT6ö×&R…7G&–ær†"æö67W'&VEöB’¢“°¢–b†VffV7F—fTWfVçG2æÆVæwF‚’°¢6öç7BW†—7F–æt–æFW‚ÒGFVæFæ6U&÷w2æf–æD–æFW‚‚†—FVÒ’Óâ—FVÒçv÷&µöFFRÓÓÒFöF’“°¢6öç7BW†—7F–ærÒW†—7F–æt–æFW‚ãÒòGFVæFæ6U&÷w5¶W†—7F–æt–æFW…Ò¢°¢V×Æ÷–VUö–C¢7FFRç&öf–ÆRçW6W%ö–BÀ¢7F÷&Uö–C¢VffV7F—fTWfVçG5³Óòç7F÷&Uö–BÇÂçVÆÂÀ¢v÷&µöFFS¢FöF’À¢Ó°¢6öç7BÖW&vVBÒ²ââæW†—7F–ærÓ°¢f÷"†6öç7BWfVçBöbVffV7F—fTWfVçG2’°¢6öç7Bf–VÆBÒ‡²6Æö6µö–ã¢v6Æö6µö–ârÂ'&Vµ÷7F'C¢v'&Vµ÷7F'BrÂ'&VµöVæC¢v'&VµöVæBrÂ6Æö6µö÷WC¢v6Æö6µö÷WBrÒ•¶WfVçBæWfVçE÷G—UÓ°¢–b†f–VÆBbbÖW&vVE¶f–VÆEÒ’ÖW&vVE¶f–VÆEÒÒWfVçBæö67W'&VEöC°¢Ğ¢–b†W†—7F–æt–æFW‚ãÒ’GFVæFæ6U&÷w5¶W†—7F–æt–æFW…ÒÒÖW&vVC°¢VÇ6RGFVæFæ6U&÷w2çVç6†–gB†ÖW&vVB“°¢Ğ¢–b‡FöF”WfVçG2æW'&÷"’6öç6öÆRçv&â‚tGFVæFæ6RWfVçBfÆÆ&6²Væf–Æ&ÆS¢rÂFöF”WfVçG2æW'&÷"“°¢7FFRæFFÒ°¢7F÷&W3¢7F÷&W2æFFÇÂµÒÀ¢66†VGVÆW3¢66†VGVÆW2æFFÇÂµÒÀ¢GFVæFæ6S¢GFVæFæ6U&÷w2À¢&WVW7G3¢&WVW7G2æFFÇÂµÒÀ¢W&Ö—76–öç3¢W&Ö—76–öç2æFFÇÂµÒÀ¢Ó°§Ğ¦7–æ2gVæ7F–öâÆöDÖævW$FF‚’°¢6öç7BFöF’ÒÖG&–DFFR‚“°¢6öç7BGFVæFæ6TÖöçF‚Ò7FFRæGFVæFæ6TÖöçF‚ÇÂFöF’ç6Æ–6RƒÃr“°¢6öç7BÖöçF…7F'BÒG¶GFVæFæ6TÖöçF‡ÒÓ°¢6öç7BGFVæFæ6TVæBÒGFVæFæ6TÖöçF‚ÓÓÒFöF’ç6Æ–6RƒÃr’òFöF’¢ÖöçF„Æ7DFFR†GFVæFæ6TÖöçF‚“°¢6öç7B66†VGVÆTÖöçF‚Ò7W'&VçE66†VGVÆTÖöçF‚‚“°¢6öç7B66†VGVÆU7F'BÒFDF—2†G·66†VGVÆTÖöçF‡ÒÓÂÓr“°¢6öç7B66†VGVÆTVæBÒÖöçF„Æ7DFFR‡66†VGVÆTÖöçF‚“°¢6öç7B66†VGVÆUVW'•7F'BÒ66†VGVÆU7F'BÂÖöçF…7F'Bò66†VGVÆU7F'B¢ÖöçF…7F'C°¢6öç7B66†VGVÆUVW'”VæBÒ66†VGVÆTVæBâFöF’ò66†VGVÆTVæB¢FöF“°¢6öç7BÆVfU–V"Ò66†VGVÆTÖöçF‚ç6Æ–6RƒÂB“°¢6öç7BF•7F'BÒÖG&–DÆö6ÅFô—6ò‡FöF’Âs£r“°¢6öç7BF”VæBÒÖG&–DÆö6ÅFô—6ò†FDF—2‡FöF’Â’Âs£r“°¢6öç7B†÷Fõ7F'BÒæWrFFR„FFRææ÷r‚’Ò3¢ƒeóCó’çFô•4õ7G&–ær‚“°¢6öç7B·7F÷&W2ÂV×Æ÷–VW2Â66†VGVÆW2ÂFöF•66†VGVÆW2ÂWfVçG2Â&WVW7G2ÂW&Ö—76–öç2ÂFWf–6W2ÂGFVæFæ6RÂVF—G2Â†÷FôWfVçG2ÂæçVÄÆVfUÒÒv—B&öÖ—6RæÆÂ…°¢6Æ–VçBæg&öÒ‚w7F÷&W2r’ç6VÆV7B‚r¢r’æ÷&FW"‚væÖRr’À¢6Æ–VçBæg&öÒ‚w&öf–ÆW2r’ç6VÆV7B‚r¢Â7F÷&W2†æÖR’r’æW‚w&öÆRrÂvV×Æ÷–VRr’æ÷&FW"‚vgVÆÅöæÖRr’À¢6Æ–VçBæg&öÒ‚w66†VGVÆW2r’ç6VÆV7B‚r¢Â7F÷&W2†æÖR’r’æwFR‚wv÷&µöFFRrÂ66†VGVÆUVW'•7F'B’æÇFR‚wv÷&µöFFRrÂ66†VGVÆUVW'”VæB’æ÷&FW"‚wv÷&µöFFRr’À¢6Æ–VçBæg&öÒ‚w66†VGVÆW2r’ç6VÆV7B‚r¢Â7F÷&W2†æÖR’r’æW‚wv÷&µöFFRrÂFöF’’æ÷&FW"‚w7F'G5öBr’À¢6Æ–VçBæg&öÒ‚vGFVæFæ6UöWfVçG2r’ç6VÆV7B‚r¢Â7F÷&W2†æÖR’r’æwFR‚vö67W'&VEöBrÂF•7F'B’æÇB‚vö67W'&VEöBrÂF”VæB’æ÷&FW"‚vö67W'&VEöBr’À¢6Æ–VçBæg&öÒ‚w&WVW7G2r’ç6VÆV7B‚r¢r’æ÷&FW"‚v7&VFVEöBrÂ²66VæF–æs¢fÇ6RÒ’æÆ–Ö—Bƒ’À¢6Æ–VçBæg&öÒ‚vw5÷W&Ö—76–öç2r’ç6VÆV7B‚r¢Â7F÷&W2†æÖR’r’æW‚v7F—fRrÂG'VR’æwFR‚wfÆ–E÷VçF–ÂrÂæWrFFR‚’çFô•4õ7G&–ær‚’’æ÷&FW"‚wfÆ–E÷VçF–Âr’À¢6Æ–VçBæg&öÒ‚v¶–÷6µöFWf–6W2r’ç6VÆV7B‚r¢Â7F÷&W2†æÖR’r’æ÷&FW"‚v7&VFVEöBrÂ²66VæF–æs¢fÇ6RÒ’À¢6Æ–VçBæg&öÒ‚vGFVæFæ6UöF–Ç’r’ç6VÆV7B‚r¢r’æwFR‚wv÷&µöFFRrÂÖöçF…7F'B’æÇFR‚wv÷&µöFFRrÂGFVæFæ6TVæB’æ÷&FW"‚wv÷&µöFFRrÂ²66VæF–æs¢fÇ6RÒ’À¢6Æ–VçBæg&öÒ‚vVF—EöÆöw2r’ç6VÆV7B‚r¢r’æ÷&FW"‚v7&VFVEöBrÂ²66VæF–æs¢fÇ6RÒ’æÆ–Ö—Bƒ’À¢6Æ–VçBæg&öÒ‚vGFVæFæ6UöWfVçG2r’ç6VÆV7B‚v–BÂV×Æ÷–VUö–BÂ7F÷&Uö–BÂWfVçE÷G—RÂ6÷W&6RÂö67W'&VEöBÂÖWFFFÂ7F÷&W2†æÖR’r¢æW‚w6÷W&6RrÂv¶–÷6²r’æ–â‚vWfVçE÷G—RrÂ²v6Æö6µö–ârÂv6Æö6µö÷WBuÒ’æwFR‚vö67W'&VEöBrÂ†÷Fõ7F'B¢æ÷&FW"‚vö67W'&VEöBrÂ²66VæF–æs¢fÇ6RÒ’æÆ–Ö—BƒS’À¢6Æ–VçBæg&öÒ‚w66†VGVÆW2r’ç6VÆV7B‚vV×Æ÷–VUö–BÂv÷&µöFFRr’æW‚w66†VGVÆUö¶–æBrÂvæçVÅöÆVfRr’æW‚wV&Æ—6†VBrÂG'VR¢æwFR‚wv÷&µöFFRrÂG¶ÆVfU–V'ÒÓÓ’æÇFR‚wv÷&µöFFRrÂG¶ÆVfU–V'ÒÓ"Ó3’æ÷&FW"‚wv÷&µöFFRr’À¢Ò“°¢6öç7B&W7VÇG2Ò·7F÷&W2ÂV×Æ÷–VW2Â66†VGVÆW2ÂFöF•66†VGVÆW2ÂWfVçG2Â&WVW7G2ÂW&Ö—76–öç2ÂFWf–6W2ÂGFVæFæ6RÂVF—G2Â†÷FôWfVçG5Ó°¢76W'EVW'•&W7VÇG2‡&W7VÇG2“°¢6öç7BV×Æ÷–VT'”–BÒæWrÖ‚†V×Æ÷–VW2æFFÇÂµÒ’æÖ‚†V×Æ÷–VR’Óâ¶V×Æ÷–VRçW6W%ö–BÂV×Æ÷–VUÒ’“°¢6öç7BGF6„V×Æ÷–VRÒ†—FV×2’Óâ†—FV×2ÇÂµÒ’æÖ‚†—FVÒ’Óâ‡²ââæ—FVÒÂ&öf–ÆW3¢V×Æ÷–VT'”–BævWB†—FVÒæV×Æ÷–VUö–B’ÇÂçVÆÂÒ’“°¢7FFRæFFÒ°¢7F÷&W3¢7F÷&W2æFFÇÂµÒÀ¢V×Æ÷–VW3¢V×Æ÷–VW2æFFÇÂµÒÀ¢66†VGVÆW3¢GF6„V×Æ÷–VR‡66†VGVÆW2æFF’À¢FöF•66†VGVÆW3¢GF6„V×Æ÷–VR‡FöF•66†VGVÆW2æFF’À¢WfVçG3¢GF6„V×Æ÷–VR†WfVçG2æFF’À¢&WVW7G3¢GF6„V×Æ÷–VR‡&WVW7G2æFF’À¢W&Ö—76–öç3¢GF6„V×Æ÷–VR‡W&Ö—76–öç2æFF’À¢FWf–6W3¢FWf–6W2æFFÇÂµÒÀ¢GFVæFæ6S¢GFVæFæ6RæFFÇÂµÒÀ¢VF—G3¢VF—G2æFFÇÂµÒÀ¢†÷FôWfVçG3¢GF6„V×Æ÷–VR‡†÷FôWfVçG2æFF’À¢æçVÄÆVfS¢æçVÄÆVfRæFFÇÂµÒÀ¢æçVÄÆVfU&VG“¢æçVÄÆVfRæW'&÷"À¢Ó°¢–b‚7FFRæ†VÇF‚’v—B6†V6µ7—7FVÔ†VÇF‚‚“°§Ğ ¦gVæ7F–öâæd—FV×2‚’°¢&WGW&â7FFRç&öf–ÆRç&öÆRÓÓÒvÖævW"p¢òµ²v†öÖRrÂÂ‚~Y¹¾[©~h¾Šx‚rÂu&W7VÖVâr•ÒÂ²vV×Æ÷–VW2rÂÂ‚~Y[z^‹JnXûrrÂtV×ÆVF÷2r•ÒÂ²w66†VGVÆRrÂÂ‚~hé.xúÒrÂt†÷&&–÷2r•ÒÂ²w&WVW7G2rÂÂ‚~yK>Šû~Zêh›’rÂu6öÆ–6—GVFW2r•ÒÂ²vw2rÂÂ‚tu>hèiØ2rÂuW&Ö—6÷2u2r•ÒÂ²w7F÷&W2rÂÂ‚~[©~™;®Šëî{ÚârÂuF–VæF2r•ÒÂ²vW‡÷'BrÂÂ‚~ˆ>XºNKˆîhª^Š‚rÂt¦÷&æFR–æf÷&ÖW2r•ÕĞ¢¢µ²v†öÖRrÂÂ‚~h‰y¨NšinšRrÂtÖ’–æ–6–òr•ÒÂ²w&V6÷&G2rÂÂ‚~ˆ>XºNŠë[ÙRrÂtÖ—2f–6†¦W2r•ÒÂ²w&WVW7G2rÂÂ‚~hùKªNyK>ŠûrrÂu6öÆ–6—GVFW2r•ÒÂ²w&öf–ÆRrÂÂ‚~KŠ®K«®‹XNii’rÂtÖ’W&f–Âr•ÕÓ°§Ğ ¦gVæ7F–öâ&VæFW$æf–vF–öâ†—FV×2’°¢6öç7B'WGFöâÒ…·f–WrÆÆ&VÅÒ’ÓâÆ'WGFöâ6Æ73Ò&æbÖ'FâG·7FFRçf–WrÓÓÒf–Wròv7F—fRr¢rwÒ"FF×f–WsÒ"G·f–WwÒ#âG¶Æ&VÇÓÂö'WGFöãæ°¢–b‡7FFRç&öf–ÆRç&öÆRÓÒvÖævW"r’&WGW&â—FV×2æÖ†'WGFöâ’æ¦ö–â‚rr“°¢6öç7BF–Ç’Ò²v†öÖRrÂw66†VGVÆRrÂvW‡÷'BrÂw&WVW7G2rÂvV×Æ÷–VW2uÒæÖ‡f–WsÓæ—FV×2æf–æB†—FVÓÓæ—FVÕ³ÓÓÓ×f–Wr’’æf–ÇFW"„&ööÆVâ“°¢6öç7BW‡G&Ò—FV×2æf–ÇFW"†—FVÓÓâF–Ç’æ–æ6ÇVFW2†—FVÒ’“°¢&WGW&âF–Ç’æÖ†'WGFöâ’æ¦ö–â‚rr’²ÆFWF–Ç26Æ73Ò&æbÖW‡G&"G¶W‡G&ç6öÖR†—FVÓÓæ—FVÕ³ÓÓÓ×7FFRçf–Wr’òv÷Vâr¢rwÓãÇ7VÖÖ'“âG´Â‚~i»NZI®Šëî{ÚârÂtÜ:2§W7FW2r—ÓÂ÷7VÖÖ'“âG¶W‡G&æÖ†'WGFöâ’æ¦ö–â‚rr—ÓÂöFWF–Ç3æ°§Ğ ¦gVæ7F–öâ&VæFW%÷'FÂ‚’°¢6öç7B—FV×2Òæd—FV×2‚“°¢–b‚—FV×2ç6öÖR‚…·f–WuÒ’Óâf–WrÓÓÒ7FFRçf–Wr’’7FFRçf–WrÒv†öÖRs°¢6öç7B7W'&VçEF—FÆRÒ—FV×2æf–æB‚…·f–WuÒ’Óâf–WrÓÓÒ7FFRçf–Wr“òå³ÒÇÂrs°¢æ–ææW$…DÔÂÒÆF—b6Æ73Ò&ÖÆ–÷WB#à¢Æ6–FR6Æ73Ò'6–FV&"#ãÆF—b6Æ73Ò&'&æBÖÆö6·W#ãÇ7â6Æ73Ò&'&æBÖÖ&²#äƒÂ÷7ããÇ7ããÆ#ä„ôÄ4Ud”ÄÄÂö#ãÇ6ÖÆÃä4ôåE$ôÂ„õ$$”óÂ÷6ÖÆÃãÂ÷7ããÂöF—cà¢ÆæcâG·&VæFW$æf–vF–öâ†—FV×2—ÓÂöæcà¢ÆF—b6Æ73Ò'6–FV&"Ö&÷GFöÒ#ãÆF—b6Æ73Ò&66÷VçBÖ6†—#ãÆ#âG¶W66T…DÔÂ‡7FFRç&öf–ÆRægVÆÅöæÖR—ÓÂö#ãÇ6ÖÆÃâG·7FFRç&öf–ÆRç&öÆRÓÓÒvÖævW"ròud•d’+rÔätU"r¢G¶W66T…DÔÂ‡7FFRç&öf–ÆRæV×Æ÷–VUöæò—Ò+rG¶W66T…DÔÂ‡7FFRç&öf–ÆRç7F÷&W3òææÖRÇÂrr—ÖÓÂ÷6ÖÆÃãÂöF—cãÆ'WGFöâ6Æ73Ò&v†÷7BÖ'Fâ"–CÒ&Æöv÷WB"G—SÒ&'WGFöâ#âG´Â‚~˜X{®y›¾[ÙRrÂt6W'&"6W6œ;6âr—ÓÂö'WGFöããÂöF—cà¢Âö6–FSà¢ÆÖ–â6Æ73Ò&Ö–âÖ&V#ãÆ†VFW"6Æ73Ò'F÷&"#ãÆF—cãÇ6Æ73Ò&W–V'&÷r#âG·7FFRç&öf–ÆRç&öÆRÓÓÒvÖævW"ròud•d’+rB5Dõ$U2r¢W66T…DÔÂ‡7FFRç&öf–ÆRç7F÷&W3òææÖRÇÂt„ôÄ4Ud”ÄÄr—ÓÂ÷ãÆƒâG¶7W'&VçEF—FÆWÓÂöƒãÂöF—cãÆF—b6Æ73Ò'F÷Ö7F–öç2#âG¶ÆæwVvT'WGFöâ‚—ÓÆ'WGFöâ6Æ73Ò&v†÷7BÖ'Fâ"–CÒ'&Vg&W6„FF"G—SÒ&'WGFöâ#î(k³Âö'WGFöããÆF—b6Æ73Ò&FFRÖ6†—#ãÆ"–CÒ'÷'FÄ6Æö6²#âG·F–ÖUFW‡B†æWrFFR‚’—ÓÂö#ãÇ6ÖÆÃâG¶ÖG&–DF—7Æ’‚—ÓÂ÷6ÖÆÃãÂöF—cãÂöF—cãÂö†VFW#à¢Ç6V7F–öâ6Æ73Ò'f–Wr#âG·&VæFW%÷'FÅf–Wr‚—ÓÂ÷6V7F–öããÂöÖ–ãà¢Ææb6Æ73Ò&Öö&–ÆRÖæb#âG¶—FV×2æÖ‚…·f–WrÂÆ&VÅÒ’ÓâÆ'WGFöâ6Æ73Ò"G·7FFRçf–WrÓÓÒf–Wròv7F—fRr¢rwÒ"FF×f–WsÒ"G·f–WwÒ"G—SÒ&'WGFöâ#âG¶Æ&VÇÓÂö'WGFöãæ’æ¦ö–â‚rr—ÓÂöæcà¢ÂöF—cæ°¢&–æE÷'FÂ‚“°§Ğ ¦gVæ7F–öâ&VæFW%÷'FÅf–Wr‚’°¢–b‡7FFRç&öf–ÆRç&öÆRÓÓÒvÖævW"r’°¢&WGW&â‡²†öÖS¢&VæFW$ÖævW$†öÖRÂV×Æ÷–VW3¢&VæFW$V×Æ÷–VW2Â66†VGVÆS¢&VæFW%66†VGVÆRÂ&WVW7G3¢&VæFW$ÖævW%&WVW7G2Âw3¢&VæFW$w4FÖ–âÂ7F÷&W3¢&VæFW%7F÷&W2ÂW‡÷'C¢&VæFW$W‡÷'BÒ•·7FFRçf–WuÓòâ‚’ÇÂrs°¢Ğ¢&WGW&â‡²†öÖS¢&VæFW$V×Æ÷–VT†öÖRÂ&V6÷&G3¢&VæFW%&V6÷&G2Â&WVW7G3¢&VæFW$V×Æ÷–VU&WVW7G2Â&öf–ÆS¢&VæFW%&öf–ÆRÒ•·7FFRçf–WuÓòâ‚’ÇÂrs°§Ğ ¦gVæ7F–öâ&VæFW$V×Æ÷–VT†öÖR‚’°¢6öç7BFöF’ÒÖG&–DFFR‚“°¢6öç7B66†VGVÆRÒ7FFRæFFç66†VGVÆW2æf–æB‚†—FVÒ’Óâ—FVÒçv÷&µöFFRÓÓÒFöF’“°¢6öç7B&V6÷&BÒ7FFRæFFæGFVæFæ6Ræf–æB‚†—FVÒ’Óâ—FVÒçv÷&µöFFRÓÓÒFöF’“°¢6öç7BW&Ö—76–öç2Ò7FFRæFFçW&Ö—76–öç2ÇÂµÓ°¢6öç7BæçVÄÆVfRÒ66†VGVÆT¶–æB‡66†VGVÆR’ÓÓÒvæçVÅöÆVfRs°¢6öç7B7FGW2Ò&V6÷&Còæ6Æö6µö÷WBòÂ‚~K¸®iz^[{.ZèÎh‰rÂt¦÷&æF6ö×ÆWFFr’¢&V6÷&Còæ6Æö6µö–âòÂ‚~[z^KÙÎ‹ù¾ŠÎKŠÒrÂt¦÷&æFVâ7W'6òr’¢æçVÄÆVfRòÂ‚~K¸®ZJ[›NXrrÂuf66–öæW2r’¢66†VGVÆSòæ—5öF•ööfbòÂ‚~K¸®ZJKÉhòrÂtL:ÖÆ–'&Rr’¢Â‚~zØ[è^X‹[©rrÂuVæF–VçFRFRVçG&Fr“°¢&WGW&âÆF—b6Æ73Ò'vRÖw&–B#à¢Æ'F–6ÆR6Æ73Ò&6&B†W&òÖ6&B#ãÆF—cãÇ6Æ73Ò&W–V'&÷r#âG¶FFUFW‡B‡FöF’—ÓÂ÷ãÆƒ#âG¶W66T…DÔÂ‡7FFRç&öf–ÆRægVÆÅöæÖR—ŞûÈÂG·7FGW7ÓÂöƒ#ãÇâG·66†VGVÆRò†æçVÄÆVfRòÂ‚~hé.xúŞûÉ®[›NXrrÂt†÷&&–ó¢f66–öæW2r’¢66†VGVÆRæ—5öF•ööfbòÂ‚~hé.xúŞûÉ®KÉhòrÂt†÷&&–ó¢FW66ç6òr’¢G¶W66T…DÔÂ‡66†VGVÆRç7F÷&W3òææÖRÇÂrr—Ò+rG·F–ÖUFW‡B‡66†VGVÆRç7F'G5öB—Ş(	BG·F–ÖUFW‡B‡66†VGVÆRæVæG5öB—Ö’¢Â‚ud•d[	®iÊ®Xù[ˆ>K¸®ZJy¨Nhé.xúÒrÂud•d’FöFl:Öæò†V&Æ–6FòVÂ†÷&&–òFR†÷’r—ÓÂ÷ãÂöF—cãÆF—b6Æ73Ò&†W&òÖÖWF#ãÇ7ãâG´Â‚~h˜¾iË®Zé®KØŞûÉ®[©~™;£#{>Xh^h™>XÚrÂtÜ;7f–Ã¢f–6†¦RFVçG&òFR#Òr—ÓÂ÷7ããÇ7ãâG´Â‚~[©~™;®yK^ˆIûÉ¥”îh™>XÚrÂt÷&FVæF÷#¢f–6†¦R6öâ”âr—ÓÂ÷7ããÂöF—cãÂö'F–6ÆSà¢Æ'F–6ÆR6Æ73Ò&6&B7VÖÖ'’Ö6&B#ãÆF—b6Æ73Ò&ÖWG&–2#ãÇ7ãâG´Â‚~Kˆ®xúÒrÂtVçG&Fr—ÓÂ÷7ããÆ#âG·F–ÖUFW‡B‡&V6÷&Còæ6Æö6µö–â—ÓÂö#ãÂöF—cãÆF—b6Æ73Ò&ÖWG&–2#ãÇ7ãâG´Â‚~KÉhòrÂuW6r—ÓÂ÷7ããÆ#âG·F–ÖUFW‡B‡&V6÷&Còæ'&Vµ÷7F'B—Ş(	2G·F–ÖUFW‡B‡&V6÷&Còæ'&VµöVæB—ÓÂö#ãÂöF—cãÆF—b6Æ73Ò&ÖWG&–2#ãÇ7ãâG´Â‚~Kˆ¾xúÒrÂu6Æ–Fr—ÓÂ÷7ããÆ#âG·F–ÖUFW‡B‡&V6÷&Còæ6Æö6µö÷WB—ÓÂö#ãÂöF—cãÂö'F–6ÆSà¢ÂöF—cà¢G·&VæFW%66†VGVÆVDÖö&–ÆUVæ6‚‡66†VGVÆRÂ&V6÷&B—Ğ¢G·W&Ö—76–öç2æÖ‚‡W&Ö—76–öâ’Óâ&VæFW$w46&B‡W&Ö—76–öâÂ&V6÷&B’’æ¦ö–â‚rr—Ğ¢Æ'F–6ÆR6Æ73Ò&6&B#ãÆF—b6Æ73Ò'6V7F–öâÖ†VB#ãÆF—cãÇ6Æ73Ò&W–V'&÷r#ääU…BrD•3Â÷ãÆƒ#âG´Â‚~‹ùiÉşhé.xúÒrÂu,;7†–Ö÷2GW&æ÷2r—ÓÂöƒ#ãÂöF—cãÂöF—câG·66†VGVÆUF&ÆR‡7FFRæFFç66†VGVÆW2æf–ÇFW"‚†—FVÒ’Óâ—FVÒçv÷&µöFFRãÒFöF’’ç6Æ–6RƒÂr’ÂfÇ6R—ÓÂö'F–6ÆSæ°§Ğ ¦gVæ7F–öâ&VæFW%66†VGVÆVDÖö&–ÆUVæ6‚‡66†VGVÆRÂ&V6÷&B’°¢6öç7BæW‡D7F–öç2ÒæW‡D7F–öç4g&öÕ&V6÷&B‡&V6÷&B“°¢ÆWB6öçFVçC°¢–b‚66†VGVÆR’°¢6öçFVçBÒÆF—b6Æ73Ò&6ÆÆ÷WBv&æ–ær#ãÆ#âG´Â‚~KˆŞˆ;Şh™>XÚrÂtæòF—7öæ–&ÆRr—ÓÂö#ãÇ7ãâG´Â‚~K¸®ZJk*iÈ[{.Xù[ˆ>y¨Nhé.xúŞûÈÎŠû~ˆN{;µd•d8"rÂtæò†’†÷&&–òV&Æ–6Fò&†÷’â6öçF7F6öâd•d’âr—ÓÂ÷7ããÂöF—cæ°¢ÒVÇ6R–b‡66†VGVÆRæ—5öF•ööfb’°¢6öçFVçBÒ66†VGVÆT¶–æB‡66†VGVÆR’ÓÓÒvæçVÅöÆVfRp¢òÆF—b6Æ73Ò&6ÆÆ÷WB#ãÆ#âG´Â‚~K¸®iz^[›NXrrÂuf66–öæW2r—ÓÂö#ãÇ7ãâG´Â‚~[›NX~iÉş™{NKˆŞi‹îzK®h™>XÚhÈ™*î8"rÂtæò6R×VW7G&â&÷FöæW2FRf–6†¦RGW&çFRÆ2f66–öæW2âr—ÓÂ÷7ããÂöF—cæ ¢¢ÆF—b6Æ73Ò&6ÆÆ÷WB#ãÆ#âG´Â‚~K¸®iz^KÉhòrÂtL:ÖÆ–'&Rr—ÓÂö#ãÇ7ãâG´Â‚~KÉhşiz^KˆŞi‹îzK®h™>XÚhÈ™*î8"rÂtæò6R×VW7G&â&÷FöæW2FRf–6†¦RVâVâL:ÖÆ–'&Râr—ÓÂ÷7ããÂöF—cæ°¢ÒVÇ6R–b‚æW‡D7F–öç2æÆVæwF‚’°¢6öçFVçBÒÇ7â6Æ73Ò'7FGW2ö²#âG´Â‚~K¸®ZJ[{.{¸şZèÎh‰h™>XÚrÂtÆ¦÷&æFFR†÷’–W7L:6ö×ÆWFr—ÓÂ÷7ãæ°¢ÒVÇ6R°¢6öçFVçBÒÆF—b6Æ73Ò&'WGFöâ×&÷r#âG¶æW‡D7F–öç2æÖ‚†WfVçB’ÓâÆ'WGFöâ6Æ73Ò"G¶WfVçBÓÓÒv6Æö6µö÷WBròw6V6öæF'’Ö'Fâr¢w&–Ö'’Ö'FâwÒ"FFÖw2×Væ6ƒÒ"G¶WfVçGÒ"G—SÒ&'WGFöâ#âG¶WfVçDÆ&VÂ†WfVçB—ÓÂö'WGFöãæ’æ¦ö–â‚rr—ÓÂöF—cæ°¢Ğ¢&WGW&âÆ'F–6ÆR6Æ73Ò&6&B#ãÇ6Æ73Ò&W–V'&÷r#äÔô$”ÄRu2Tä4ƒÂ÷ãÆƒ#âG´Â‚~[©~™;£#{>Xh^h˜¾iË®h™>XÚrÂtf–6†¦RÜ;7f–ÂFVçG&òFR#Òr—ÓÂöƒ#ãÇâG·66†VGVÆRbb66†VGVÆRæ—5öF•ööfbòG¶W66T…DÔÂ‡66†VGVÆRç7F÷&W3òææÖRÇÂrr—ÓÆ'#âG¶W66T…DÔÂ‡66†VGVÆRç7F÷&W3òæFG&W72ÇÂrr—Ö¢Â‚~h˜¾iË®h™>XÚ[ø^š¾Zû[©N[Ù>ZJ[{.Xù[ˆ>y¨Nhé.xúŞ8"rÂtVÂf–6†¦RÜ;7f–ÂFV&R6÷'&W7öæFW"Â†÷&&–òV&Æ–6FòFR†÷’âr—ÓÂ÷âG¶6öçFVçGÓÆF—b6Æ73Ò&6ÆÆ÷WB#ãÆ#äu2+r#ÓÂö#ãÇ7ãâG´Â‚~x+X{¾h™>XÚi{nXú®Šû¾XùnKˆjÊKØŞ{Úî8.[ø^š¾XXŠë{+îzîZé®KØŞûÉ¾{;¾{¹şKˆŞKÉ®hÈ{ºŞ‹ûŞ‹Š®8"rÂtÆV&–66œ;6â6Rö'F–VæRVæ6öÆfW¢Âf–6†"âFV&W2W&Ö—F—"V&–66œ;6â&V6—6²æò†’6VwV–Ö–VçFò6öçF–çVòâr—ÓÂ÷7ããÂöF—cãÂö'F–6ÆSæ°§Ğ ¦gVæ7F–öâ&VæFW$w46&B‡W&Ö—76–öâÂ&V6÷&B’°¢6öç7BW6VBÒW&Ö—76–öâçW6VEöWfVçG2ÇÂµÓ°¢6öç7BæW‡D7F–öç2ÒæW‡D7F–öç4g&öÕ&V6÷&B‡&V6÷&B“°¢6öç7BÆÆ÷vVBÒ‡W&Ö—76–öâæÆÆ÷vVEöWfVçG2ÇÂµÒ’æf–ÇFW"‚†WfVçB’ÓâW6VBæ–æ6ÇVFW2†WfVçB’bbæW‡D7F–öç2æ–æ6ÇVFW2†WfVçB’“°¢&WGW&âÆ'F–6ÆR6Æ73Ò&6&B#ãÇ6Æ73Ò&W–V'&÷r#åDTÕõ$%’u2UD„õ$•¤D”ôãÂ÷ãÆƒ#âG´Â‚~x›jè®h8^Xk^h˜¾iË¤u>h™>XÚ[{.hèiØ2rÂtf–6†¦Ru2WF÷&—¦FòFV×÷&ÆÖVçFRr—ÓÂöƒ#ãÇâG¶W66T…DÔÂ‡W&Ö—76–öâç7F÷&W3òææÖRÇÂrr—ÓÆ'#âG¶ÖG&–DF—7Æ’†æWrFFR‡W&Ö—76–öâçfÆ–Eög&öÒ’ÂG'VR—Ò(i"G¶ÖG&–DF—7Æ’†æWrFFR‡W&Ö—76–öâçfÆ–E÷VçF–Â’ÂG'VR—ÓÆ'#âG¶W66T…DÔÂ‡W&Ö—76–öâç&V6öâ—ÓÂ÷ãÆF—b6Æ73Ò&'WGFöâ×&÷r#âG¶ÆÆ÷vVBæÖ‚†WfVçB’ÓâÆ'WGFöâ6Æ73Ò'&–Ö'’Ö'Fâ"FFÖw2×Væ6ƒÒ"G¶WfVçGÒ"FFÖw2×W&Ö—76–öãÒ"G·W&Ö—76–öâæ–GÒ"G—SÒ&'WGFöâ#âG¶WfVçDÆ&VÂ†WfVçB—ÓÂö'WGFöãæ’æ¦ö–â‚rr’ÇÂÇ7â6Æ73Ò'7FGW2ö²#âG¶æW‡D7F–öç2æÆVæwF‚òÂ‚~[Ù>X˜Şk*iÈzÊnYš®[¨şy¨NXúşyJXªKÙÂrÂtæò†’Væ66œ;6âF—7öæ–&ÆRVâW7FRÖöÖVçFòr’¢Â‚~K¸®ZJ[{.{¸şZèÎh‰h™>XÚrÂtÆ¦÷&æFFR†÷’–W7L:6ö×ÆWFr—ÓÂ÷7ãæÓÂöF—cãÆF—b6Æ73Ò&6ÆÆ÷WB#ãÆ#äu2+r#ÓÂö#ãÇ7ãâG´Â‚~K‹Ni{n‹z[©~h™>XÚK™ş[ø^š¾YÊhèiØ>[©~™;£#{>Xh^8"rÂtVÂf–6†¦RW†6W6–öæÂFÖ&œ:–âFV&R&VÆ—¦'6RÖVæ÷2FR#ÒFRÆF–VæFWF÷&—¦Fâr—ÓÂ÷7ããÂöF—cãÂö'F–6ÆSæ°§Ğ ¦gVæ7F–öâ66†VGVÆT¶–æB†—FVÒ’°¢–b†—FVÓòç66†VGVÆUö¶–æBÓÓÒvæçVÅöÆVfRr’&WGW&âvæçVÅöÆVfRs°¢&WGW&â—FVÓòæ—5öF•ööfbòvF•ööfbr¢wv÷&²s°§Ğ ¦gVæ7F–öâ66†VGVÆUF&ÆR†—FV×2Â6†÷tV×Æ÷–VRÒG'VRÂVF—F&ÆRÒfÇ6R’°¢–b‚—FV×2æÆVæwF‚’&WGW&âÆF—b6Æ73Ò&V×G’#âG´Â‚~i¨.izhé.xúÒrÂtæò†’†÷&&–÷2r—ÓÂöF—cæ°¢&WGW&âÆF—b6Æ73Ò'F&ÆR×w&#ãÇF&ÆSãÇF†VCãÇG#âG·6†÷tV×Æ÷–VRòÇFƒâG´Â‚~Y[zRrÂtV×ÆVFòr—ÓÂ÷Fƒæ¢rwÓÇFƒâG´Â‚~iz^iÉòrÂtfV6†r—ÓÂ÷FƒãÇFƒâG´Â‚~[©~™;¢rÂuF–VæFr—ÓÂ÷FƒãÇFƒâG´Â‚~i{n™{BrÂt†÷&&–òr—ÓÂ÷FƒâG¶VF—F&ÆRòÇFƒâG´Â‚~i8ŞKÙÂrÂt66œ;6âr—ÓÂ÷Fƒæ¢rwÓÂ÷G#ãÂ÷F†VCãÇF&öG“âG¶—FV×2æÖ‚†—FVÒ’ÓâÇG#âG·6†÷tV×Æ÷–VRòÇFCãÆ#âG¶W66T…DÔÂ†—FVÒç&öf–ÆW3òægVÆÅöæÖRÇÂrr—ÓÂö#ãÆ'#ãÇ6ÖÆÃâG¶W66T…DÔÂ†—FVÒç&öf–ÆW3òæV×Æ÷–VUöæòÇÂrr—ÓÂ÷6ÖÆÃãÂ÷FCæ¢rwÓÇFCâG¶FFUFW‡B†—FVÒçv÷&µöFFR—ÓÂ÷FCãÇFCâG·66†VGVÆT¶–æB†—FVÒ’ÓÓÒvæçVÅöÆVfRrò~(	Br¢W66T…DÔÂ†—FVÒç7F÷&W3òææÖRÇÂrr—ÓÂ÷FCãÇFCâG·66†VGVÆT¶–æB†—FVÒ’ÓÓÒvæçVÅöÆVfRròÇ7â6Æ73Ò'7FGW2æçVÂÖÆVfR#âG´Â‚~[›NXrrÂuf66–öæW2r—ÓÂ÷7ãæ¢—FVÒæ—5öF•ööfbòÇ7â6Æ73Ò'7FGW2#âG´Â‚~KÉhòrÂtÆ–'&Rr—ÓÂ÷7ãæ¢G·F–ÖUFW‡B†—FVÒç7F'G5öB—Ş(	BG·F–ÖUFW‡B†—FVÒæVæG5öB—ÖÓÂ÷FCâG¶VF—F&ÆRòÇFCâG¶—FVÒç&öf–ÆW3òæ7F—fRÓÓÒfÇ6Rò~(	Br¢Æ'WGFöâ6Æ73Ò&v†÷7BÖ'Fâ"FFÖVF—B×66†VGVÆSÒ"G¶—FVÒæ–GÒ"G—SÒ&'WGFöâ#âG´Â‚~KúîiK’rÂtÖöF–f–6"r—ÓÂö'WGFöãæÓÂ÷FCæ¢rwÓÂ÷G#æ’æ¦ö–â‚rr—ÓÂ÷F&öG“ãÂ÷F&ÆSãÂöF—cæ°§Ğ ¦gVæ7F–öâ&VæFW%&V6÷&G2‚’°¢&WGW&âÆ'F–6ÆR6Æ73Ò&6&B#ãÆF—b6Æ73Ò'6V7F–öâÖ†VB#ãÆF—cãÇ6Æ73Ò&W–V'&÷r#äôdd”4”Â$T4õ$E3Â÷ãÆƒ#âG´Â‚~iÊÎiÈˆ>XºNŠë[ÙRrÂu&Vv—7G&÷2FRW7FRÖW2r—ÓÂöƒ#ãÂöF—cãÂöF—câG¶GFVæFæ6UF&ÆR‡7FFRæFFæGFVæFæ6RÂfÇ6R—ÓÂö'F–6ÆSæ°§Ğ ¦gVæ7F–öâGFVæFæ6UF&ÆR†—FV×2Â6†÷tV×Æ÷–VRÒG'VRÂVF—F&ÆRÒfÇ6R’°¢–b‚—FV×2æÆVæwF‚’&WGW&âÆF—b6Æ73Ò&V×G’#âG´Â‚~i¨.izˆ>XºNŠë[ÙRrÂtæò†’&Vv—7G&÷2r—ÓÂöF—cæ°¢&WGW&âÆF—b6Æ73Ò'F&ÆR×w&#ãÇF&ÆSãÇF†VCãÇG#âG·6†÷tV×Æ÷–VRòÇFƒâG´Â‚~Y[zRrÂtV×ÆVFòr—ÓÂ÷Fƒæ¢rwÓÇFƒâG´Â‚~iz^iÉòrÂtfV6†r—ÓÂ÷FƒãÇFƒâG´Â‚~[©~™;¢rÂuF–VæFr—ÓÂ÷FƒãÇFƒâG´Â‚~Kˆ®xúÒrÂtVçG&Fr—ÓÂ÷FƒãÇFƒâG´Â‚~KÉhòrÂuW6r—ÓÂ÷FƒãÇFƒâG´Â‚~Kˆ¾xúÒrÂu6Æ–Fr—ÓÂ÷FƒãÇFƒâG´Â‚~iÈiX[z^i{brÂt†÷&2VfV7F—f2r—ÓÂ÷FƒãÇFƒâG´Â‚~x«nhrÂtW7FFòr—ÓÂ÷FƒâG¶VF—F&ÆRòÇFƒâG´Â‚~i8ŞKÙÂrÂt66œ;6âr—ÓÂ÷Fƒæ¢rwÓÂ÷G#ãÂ÷F†VCãÇF&öG“âG¶—FV×2æÖ‚†—FVÒ’ÓâÇG#âG·6†÷tV×Æ÷–VRòÇFCâG¶W66T…DÔÂ†—FVÒæV×Æ÷–VUöæÖRÇÂrr—ÓÂ÷FCæ¢rwÓÇFCâG¶FFUFW‡B†—FVÒçv÷&µöFFR—ÓÂ÷FCãÇFCâG¶W66T…DÔÂ†—FVÒç7F÷&UöæÖRÇÂrr—ÓÂ÷FCãÇFCâG·F–ÖUFW‡B†—FVÒæ6Æö6µö–â—ÓÂ÷FCãÇFCâG·F–ÖUFW‡B†—FVÒæ'&Vµ÷7F'B—Ş(	2G·F–ÖUFW‡B†—FVÒæ'&VµöVæB—ÓÂ÷FCãÇFCâG·F–ÖUFW‡B†—FVÒæ6Æö6µö÷WB—ÓÂ÷FCãÇFCâG¶—FVÒæ6÷'&V7F–öåö¶–æBÓÓÒv'6Væ6Rròs‚Òr¢6†–gDGW&F–öåFW‡B†—FVÒ—ÓÂ÷FCãÇFCãÇ7â6Æ73Ò'7FGW2G¶—FVÒæ6÷'&V7F–öåö¶–æBÓÓÒv'6Væ6RròvÆW'Br¢—FVÒæ6÷'&V7FVBòwVæF–ærr¢vö²wÒ#âG¶—FVÒæ6÷'&V7F–öåö¶–æBÓÓÒv'6Væ6RròÂ‚~{Ë®XºBrÂtW6Væ6–r’¢—FVÒæ6÷'&V7FVBòÂ‚~[{.ZêŠêKúîjÚ2rÂt6÷'&Vv–Fòr’¢Â‚~XéşZx¾Šë[ÙRrÂt÷&–v–æÂr—ÓÂ÷7ããÂ÷FCâG¶VF—F&ÆRòÇFCãÆF—b6Æ73Ò&'WGFöâ×&÷r#ãÆ'WGFöâG—SÒ&'WGFöâ"6Æ73Ò&v†÷7BÖ'Fâ"FFÖVF—BÖGFVæFæ6SÒ"G¶W66T…DÔÂ†—FVÒæV×Æ÷–VUö–B—Ò"FF×v÷&²ÖFFSÒ"G¶W66T…DÔÂ†—FVÒçv÷&µöFFR—Ò#âG¶—FVÒæ6÷'&V7FVBòÂ‚~XhŞjÊKúîiK’rÂuföÇfW"6÷'&Vv—"r’¢Â‚~KúîiK’rÂt6÷'&Vv—"r—ÓÂö'WGFöãâG¶—FVÒæ6÷'&V7FVBòÆ'WGFöâG—SÒ&'WGFöâ"6Æ73Ò&v†÷7BÖ'FâFævW""FF×fö–BÖGFVæFæ6SÒ"G¶W66T…DÔÂ†—FVÒæV×Æ÷–VUö–B—Ò"FF×v÷&²ÖFFSÒ"G¶W66T…DÔÂ†—FVÒçv÷&µöFFR—Ò#âG´Â‚~i*N™HKúîjÚ2rÂtçVÆ"6÷'&V66œ;6âr—ÓÂö'WGFöãæ¢rwÓÂöF—cãÂ÷FCæ¢rwÓÂ÷G#æ’æ¦ö–â‚rr—ÓÂ÷F&öG“ãÂ÷F&ÆSãÂöF—cæ°§Ğ ¦gVæ7F–öâ&VæFW$V×Æ÷–VU&WVW7G2‚’°¢6öç7BFöF’ÒÖG&–DFFR‚“°¢&WGW&âÆF—b6Æ73Ò'7Æ—B#ãÆ'F–6ÆR6Æ73Ò&6&B7F–6·’Ö6&B#ãÇ6Æ73Ò&W–V'&÷r#ääUr$UTU5CÂ÷ãÆƒ#âG´Â‚~hùKªNyK>ŠûrrÂtçVWf6öÆ–6—GVBr—ÓÂöƒ#ãÇâG´Â‚~Š^XÚ8Šû~X~8u>[È.[‹h‰n‹z[©~iJşhûNYØ~YÊjÚNhùKªN8"rÂu6öÆ–6—F6÷'&V66œ;6âFRf–6†¦RÂW&Ö—6òÂ–æ6–FVæ6–u2ò÷–òVâ÷G&F–VæFâr—ÓÂ÷ãÆf÷&Ò–CÒ'&WVW7Df÷&Ò"6Æ73Ò'7F6²Öf÷&Ò#à¢ÆÆ&VÃâG´Â‚~{¾Yè²rÂuF—òr—ÓÇ6VÆV7B–CÒ'&WVW7EG—R#ãÆ÷F–öâfÇVSÒ&Ö—76VE÷Væ6‚#âG´Â‚~Š^XÚyK>ŠûrrÂt6÷'&V66œ;6âFRf–6†¦Rr—ÓÂö÷F–öããÆ÷F–öâfÇVSÒ&ÆVfR#âG´Â‚~Šû~X~yK>ŠûrrÂuW&Ö—6òòW6Væ6–r—ÓÂö÷F–öããÆ÷F–öâfÇVSÒ&w5ö—77VR#âG´Â‚tu>[È.[‹‚rÂt–æ6–FVæ6–u2r—ÓÂö÷F–öããÆ÷F–öâfÇVSÒ&7&÷75÷7F÷&R#âG´Â‚~‹z[©~iJşhûBrÂt÷–òVâ÷G&F–VæFr—ÓÂö÷F–öããÆ÷F–öâfÇVSÒ&÷F†W"#âG´Â‚~X[nK¹brÂt÷G&òr—ÓÂö÷F–öããÂ÷6VÆV7CãÂöÆ&VÃà¢ÆF—b6Æ73Ò&f÷&Ò×&÷r#ãÆÆ&VÃâG´Â‚~iz^iÉòrÂtfV6†r—ÓÆ–çWB–CÒ'&WVW7DFFR"G—SÒ&FFR"fÇVSÒ"G·FöF—Ò"&WV—&VCãÂöÆ&VÃãÆÆ&VÃâG´Â‚~y»X[>i{n™{BrÂt†÷&&VÆ6–öæFr—ÓÆ–çWB–CÒ'&WVW7EF–ÖR"G—SÒ'F–ÖR#ãÂöÆ&VÃãÂöF—cà¢ÆÆ&VÃâG´Â‚~h8^Xk^ŠûNiˆârÂtW‡Æ–66œ;6âr—ÓÇFW‡F&V–CÒ'&WVW7E&V6öâ"Ö–æÆVæwFƒÒ#R"Ö†ÆVæwFƒÒ#"&WV—&VCãÂ÷FW‡F&VãÂöÆ&VÃãÆ'WGFöâ6Æ73Ò'&–Ö'’Ö'Fâ"G—SÒ'7V&Ö—B#âG´Â‚~hùKªN{¹•d•d’rÂtVçf–"d•d’r—ÓÂö'WGFöãà¢Âöf÷&ÓãÂö'F–6ÆSãÆ'F–6ÆR6Æ73Ò&6&B#ãÇ6Æ73Ò&W–V'&÷r#äÕ’$UTU5E3Â÷ãÆƒ#âG´Â‚~h‰y¨NyK>Šû~Šë[ÙRrÂtÖ—26öÆ–6—GVFW2r—ÓÂöƒ#âG·&WVW7EF&ÆR‡7FFRæFFç&WVW7G2ÂfÇ6R—ÓÂö'F–6ÆSãÂöF—cæ°§Ğ ¦gVæ7F–öâ&WVW7EF&ÆR†—FV×2ÂÖævW"ÒG'VR’°¢–b‚—FV×2æÆVæwF‚’&WGW&âÆF—b6Æ73Ò&V×G’#âG´Â‚~i¨.izyK>ŠûrrÂtæò†’6öÆ–6—GVFW2r—ÓÂöF—cæ°¢&WGW&âÆF—b6Æ73Ò'F&ÆR×w&#ãÇF&ÆSãÇF†VCãÇG#âG¶ÖævW"òÇFƒâG´Â‚~Y[zRrÂtV×ÆVFòr—ÓÂ÷Fƒæ¢rwÓÇFƒâG´Â‚~{¾Yè²rÂuF—òr—ÓÂ÷FƒãÇFƒâG´Â‚~iz^iÉòrÂtfV6†r—ÓÂ÷FƒãÇFƒâG´Â‚~ŠûNiˆârÂtW‡Æ–66œ;6âr—ÓÂ÷FƒãÇFƒâG´Â‚~x«nhrÂtW7FFòr—ÓÂ÷FƒâG¶ÖævW"òÇFƒâG´Â‚~i8ŞKÙÂrÂt66œ;6âr—ÓÂ÷Fƒæ¢rwÓÂ÷G#ãÂ÷F†VCãÇF&öG“âG¶—FV×2æÖ‚†—FVÒ’ÓâÇG#âG¶ÖævW"òÇFCâG¶W66T…DÔÂ†—FVÒç&öf–ÆW3òægVÆÅöæÖRÇÂrr—ÓÂ÷FCæ¢rwÓÇFCâG¶W66T…DÔÂ‡&WVW7EG—TÆ&VÂ†—FVÒç&WVW7E÷G—R’—ÓÂ÷FCãÇFCâG¶FFUFW‡B†—FVÒç&WVW7EöFFR—ÒG¶—FVÒç&VÆFVE÷F–ÖRò+rG¶W66T…DÔÂ†—FVÒç&VÆFVE÷F–ÖRç6Æ–6RƒÃR’—Ö¢rwÓÂ÷FCãÇFCâG¶W66T…DÔÂ†—FVÒç&V6öâ—ÒG¶—FVÒç&Wf–Wuöæ÷FRòÆ'#ãÇ6ÖÆÃâG´Â‚~Y¹îZHÒrÂu&W7VW7Fr—Ó¢G¶W66T…DÔÂ†—FVÒç&Wf–Wuöæ÷FR—ÓÂ÷6ÖÆÃæ¢rwÓÂ÷FCãÇFCãÇ7â6Æ73Ò'7FGW2G¶—FVÒç7FGW7Ò#âG·7FGW4Æ&VÂ†—FVÒç7FGW2—ÓÂ÷7ããÂ÷FCâG¶ÖævW"òÇFCâG¶—FVÒç7FGW2ÓÓÒwVæF–ærròÆF—b6Æ73Ò&'WGFöâ×&÷r#ãÆ'WGFöâ6Æ73Ò'6V6öæF'’Ö'Fâ"FF×&Wf–WsÒ&&÷fVB"FFÖ–CÒ"G¶—FVÒæ–GÒ#âG´Â‚~h›XxbrÂt&ö&"r—ÓÂö'WGFöããÆ'WGFöâ6Æ73Ò&FævW"Ö'Fâ"FF×&Wf–WsÒ'&V¦V7FVB"FFÖ–CÒ"G¶—FVÒæ–GÒ#âG´Â‚~h¹.{¹ÒrÂu&V6†¦"r—ÓÂö'WGFöããÂöF—cæ¢~(	BwÓÂ÷FCæ¢rwÓÂ÷G#æ’æ¦ö–â‚rr—ÓÂ÷F&öG“ãÂ÷F&ÆSãÂöF—cæ°§Ğ ¦gVæ7F–öâ&WVW7EG—TÆ&VÂ‡G—R’²&WGW&â‡²Ö—76VE÷Væ6ƒ¢Â‚~Š^XÚrÂt6÷'&V66œ;6âr’ÂÆVfS¢Â‚~Šû~XrrÂuW&Ö—6òr’Âw5ö—77VS¢Â‚tu>[È.[‹‚rÂtu2r’Â7&÷75÷7F÷&S¢Â‚~‹z[©rrÂt÷G&F–VæFr’Â÷F†W#¢Â‚~X[nK¹brÂt÷G&òr’Ò•·G—UÒÇÂG—S²Ğ¦gVæ7F–öâ7FGW4Æ&VÂ‡7FGW2’²&WGW&â‡²VæF–æs¢Â‚~[è^Zêh›’rÂuVæF–VçFRr’Â&÷fVC¢Â‚~[{.h›XxbrÂt&ö&Fr’Â&V¦V7FVC¢Â‚~[{.h¹.{¹ÒrÂu&V6†¦Fr’Ò•·7FGW5ÒÇÂ7FGW3²Ğ ¦gVæ7F–öâ&VæFW%&öf–ÆR‚’°¢&WGW&âÆF—b6Æ73Ò'vRÖw&–B#ãÆ'F–6ÆR6Æ73Ò&6&B†W&òÖ6&B#ãÆF—cãÇ6Æ73Ò&W–V'&÷r#äTÕÄõ”TR$ôd”ÄSÂ÷ãÆƒ#âG¶W66T…DÔÂ‡7FFRç&öf–ÆRægVÆÅöæÖR—ÓÂöƒ#ãÇâG¶W66T…DÔÂ‡7FFRç&öf–ÆRæV×Æ÷–VUöæò—Ò+rG¶W66T…DÔÂ‡7FFRç&öf–ÆRç7F÷&W3òææÖRÇÂrr—ÓÂ÷ãÂöF—cãÆF—b6Æ73Ò&†W&òÖÖWF#ãÇ7ãâG·7FFRç&öf–ÆRæ7F—fRòÂ‚~YÊˆÂrÂtVâ7F—fòr’¢Â‚~XÎyJ‚rÂtFW67F—fFòr—ÓÂ÷7ããÇ7ãâG¶W66T…DÔÂ‡7FFRç&öf–ÆRç†öæR—ÓÂ÷7ããÂöF—cãÂö'F–6ÆSãÆ'F–6ÆR6Æ73Ò&6&B7VÖÖ'’Ö6&B#ãÇ6Æ73Ò&W–V'&÷r#å$•d5“Â÷ãÆƒ3âG´Â‚~i[hÚî8KØŞ{ÚîKˆîxZ~x˜rrÂtFF÷2ÂV&–66œ;6â’f÷F÷2r—ÓÂöƒ3ãÇâG´Â‚tu>Xú®YÊh˜¾iË®h™>XÚi{nŠû¾XùnKˆjÊûÈÎKˆŞKÉ®hÈ{ºŞ‹ûŞ‹Š®8.[©~™;®yK^ˆIy¨NKˆ®xúŞY(ÎKˆ¾xúŞh™>XÚKÉ®h¸ŞiNxëYË®xZ~x˜~ûÈÎxZ~x˜~y»Nhê^Kˆ®KÊˆ{>zxiÈK©zºşûÈÎKˆŞKùŞZÙYÊ[©~™;®yK^ˆIûÈÎ[›nYÊƒ3ZJYîˆz®XªXŠ™šN8"rÂtVÂu26öÆò6Rö'F–VæRÂf–6†"6öâVÂÜ;7f–Â’æò&VÆ—¦6VwV–Ö–VçFò6öçF–çVòâVâVÂ÷&FVæF÷"FRF–VæF6R†6RVæf÷FòVâÆVçG&F’Æ6Æ–F²6R7V&RF—&V7FÖVçFRÂÆÖ6VæÖ–VçFò&—fFòÂæò6RwV&FVâVÂ÷&FVæF÷"’6RVÆ–Ö–æWFöÜ:F–6ÖVçFRFW7\:—2FR3L:Ö2âr—ÓÂ÷ãÂö'F–6ÆSãÂöF—cæ°§Ğ ¦gVæ7F–öâ&VæFW$ÖævW$†öÖR‚’°¢6öç7B7F—fRÒ7FFRæFFæV×Æ÷–VW2æf–ÇFW"‚†—FVÒ’Óâ—FVÒæ7F—fR“°¢6öç7BVæ6†VBÒæWr6WB‡7FFRæFFæWfVçG2æf–ÇFW"‚†WfVçB’ÓâWfVçBæWfVçE÷G—RÓÓÒv6Æö6µö–âr’æÖ‚†WfVçB’ÓâWfVçBæV×Æ÷–VUö–B’“°¢6öç7BVæF–ærÒ7FFRæFFç&WVW7G2æf–ÇFW"‚†—FVÒ’Óâ—FVÒç7FGW2ÓÓÒwVæF–ærr“°¢6öç7BVæ6öæf–wW&VBÒ7FFRæFFç7F÷&W2æf–ÇFW"‚‡7F÷&R’Óâ7F÷&RæÆF—GVFRÓÓÒçVÆÂÇÂ7F÷&RæÆöæv—GVFRÓÓÒçVÆÂ“°¢6öç7BVæ†VÇF‡’Ò‡7FFRæ†VÇF‚ÇÂµÒ’æf–ÇFW"‚†—FVÒ’Óâ—FVÒæö²“°¢&WGW&âG·Væ†VÇF‡’æÆVæwF‚òÆF—b6Æ73Ò&6ÆÆ÷WBv&æ–ær#ãÆ#âG´Â‚~{;¾{¹şx˜iÊÎiÊ®YÎjÚRrÂufW'6œ;6â6–â6–æ7&öæ—¦"r—ÓÂö#ãÇ7ãâG´Â‚~Kº^Kˆ¾YîXû™ÈŠh˜xŞik˜:{Û.ûÉ¢rÂt†’VRföÇfW"FW7ÆVv#¢r—ÒG·Væ†VÇF‡’æÖ‚†—FVÒ’ÓâW66T…DÔÂ†—FVÒææÖR’’æ¦ö–â‚~8r—ÓÂ÷7ããÂöF—cæ¢ÆF—b6Æ73Ò&6ÆÆ÷WB#ãÆ#âG´Â‚~{;¾{¹şjÚ>[‹‚rÂu6—7FVÖ6÷'&V7Fòr—ÓÂö#ãÇ7ãâG´Â‚~{Ùš^8i[hÚî[©>KˆîKˆZY~YîXûiÈŞXª‹ùîhê^jÚ>[‹8"rÂtÆvV"ÂÆ&6RFRFF÷2’Æ÷2G&W26W'f–6–÷2W7L:â6öæV7FF÷2âr—ÓÂ÷7ããÂöF—cæĞ¢ÆF—b6Æ73Ò'7FBÖw&–B#ãÆ'F–6ÆR6Æ73Ò'7FBÖ6&B#ãÇ6ÖÆÃâG´Â‚~YÊˆÎY[zRrÂtV×ÆVF÷27F—f÷2r—ÓÂ÷6ÖÆÃãÆ#âG¶7F—fRæÆVæwF‡ÓÂö#ãÂö'F–6ÆSãÆ'F–6ÆR6Æ73Ò'7FBÖ6&B#ãÇ6ÖÆÃâG´Â‚~K¸®iz^[{.Kˆ®xúŞh™>XÚrÂtVçG&F2†÷’r—ÓÂ÷6ÖÆÃãÆ#âG·Væ6†VBç6—¦WÓÂö#ãÂö'F–6ÆSãÆ'F–6ÆR6Æ73Ò'7FBÖ6&B#ãÇ6ÖÆÃâG´Â‚~[è^Zêh›’rÂuVæF–VçFW2r—ÓÂ÷6ÖÆÃãÆ#âG·VæF–æræÆVæwF‡ÓÂö#ãÂö'F–6ÆSãÆ'F–6ÆR6Æ73Ò'7FBÖ6&B#ãÇ6ÖÆÃâG´Â‚tu>iÊ®˜XŞ{Úî[©~™;¢rÂuF–VæF26–âu2r—ÓÂ÷6ÖÆÃãÆ#âG·Væ6öæf–wW&VBæÆVæwF‡ÓÂö#ãÂö'F–6ÆSãÂöF—cà¢G·Væ6öæf–wW&VBæÆVæwF‚òÆF—b6Æ73Ò&6ÆÆ÷WBv&æ–ær#ãÆ#âG´Â‚~Kˆ®{«şX˜Ş[ø^š¾ZèÎh‰rÂuVæF–VçFRçFW2FRV&Æ–6"r—ÓÂö#ãÇ7ãâG´Â‚~Šû~YÊ(	Î[©~™;®Šëî{Úî(	ŞKŠŞZ¾XiY¹¾[©~XxnzîYËYØ8{¸ş{ªÎ[ªnY(ÎiÈiXˆÈ>Y»N8.iÊ®˜XŞ{Úîy¨N[©~™;®KˆŞˆ;ŞKÛşyJ„u>h™>XÚ8"rÂt6ö×ÆWFF—&V66œ;6âÂ6ö÷&FVæF2’&F–òFRÆ27VG&òF–VæF2â6–âVÆÆòæò6RW&Ö—FRVÂf–6†¦Ru2âr—ÓÂ÷7ããÂöF—cæ¢rwĞ¢Æ'F–6ÆR6Æ73Ò&6&B#ãÆF—b6Æ73Ò'6V7F–öâÖ†VB#ãÆF—cãÇ6Æ73Ò&W–V'&÷r#äÄ•dRDôD“Â÷ãÆƒ#âG´Â‚~K¸®iz^Y[z^h™>XÚk~h²rÂu&W7VÖVâFRf–6†¦W2FR†÷’r—ÓÂöƒ#ãÇâG´Â‚~hÈ[Ù>ZJhé.xúŞ[©~™;®Xˆn{¸NûÈÎjøşYŞY[z^y¨NKˆ®xúŞ8KÉhşY(ÎKˆ¾xúŞŠë[Ù^™¸nKŠŞYÊYÎKˆŠÎ8"rÂtw'WFò÷"ÆF–VæF&öw&ÖF²FöF÷2Æ÷2f–6†¦W2FR6FV×ÆVFò&V6VâVâVæ6öÆf–Æâr—ÓÂ÷ãÂöF—cãÇ7â6Æ73Ò'7FGW2ö²#äWW&÷RôÖG&–CÂ÷7ããÂöF—câG·FöF”GFVæFæ6U7VÖÖ'’‡7FFRæFFæWfVçG2—ÓÂö'F–6ÆSæ°§Ğ ¦gVæ7F–öâFöF”GFVæFæ6U&÷w2†WfVçG2ÒµÒ’°¢6öç7BFöF’ÒÖG&–DFFR‚“°¢6öç7B66†VGVÆU6÷W&6RÒ7FFRæFFçFöF•66†VGVÆW2ÇÂ7FFRæFFç66†VGVÆW2ÇÂµÓ°¢6öç7B66†VGVÆW2Ò66†VGVÆU6÷W&6Ræf–ÇFW"‚†—FVÒ’Óâ—FVÒçv÷&µöFFRÓÓÒFöF’bb66†VGVÆT¶–æB†—FVÒ’ÓÓÒwv÷&²r“°¢6öç7B7F÷&T'”–BÒæWrÖ‚‡7FFRæFFç7F÷&W2ÇÂµÒ’æÖ‚‡7F÷&RÂ–æFW‚’Óâ·7F÷&Ræ–BÂ²ââç7F÷&RÂ÷&FW#¢–æFW‚ÕÒ’“°¢6öç7B66†VGVÆT'”V×Æ÷–VRÒæWrÖ‡66†VGVÆW2æÖ‚‡66†VGVÆR’Óâ·66†VGVÆRæV×Æ÷–VUö–BÂ66†VGVÆUÒ’“°¢6öç7B&÷w2ÒæWrÖ‚“° ¢6öç7BVç7W&U&÷rÒ‡²V×Æ÷–VT–BÂ7F÷&T–BÂ&öf–ÆRÂ66†VGVÆRÒ’Óâ°¢6öç7B&W6öÇfVE7F÷&T–BÒ7F÷&T–BÇÂ66†VGVÆSòç7F÷&Uö–BÇÂ&öf–ÆSòç7F÷&Uö–BÇÂrs°¢6öç7B¶W’ÒG¶V×Æ÷–VT–BÇÂ&öf–ÆSòçW6W%ö–BÇÂwVæ¶æ÷vâwÓ£¢G·&W6öÇfVE7F÷&T–BÇÂwVæ¶æ÷vâwÖ°¢–b‚&÷w2æ†2†¶W’’’°¢6öç7B7F÷&RÒ7F÷&T'”–BævWB‡&W6öÇfVE7F÷&T–B“°¢&÷w2ç6WB†¶W’Â°¢¶W’À¢V×Æ÷–VT–C¢V×Æ÷–VT–BÇÂ&öf–ÆSòçW6W%ö–BÇÂrrÀ¢V×Æ÷–VTæÖS¢&öf–ÆSòægVÆÅöæÖRÇÂrrÀ¢V×Æ÷–VTæó¢&öf–ÆSòæV×Æ÷–VUöæòÇÂrrÀ¢7F÷&T–C¢&W6öÇfVE7F÷&T–BÀ¢7F÷&TæÖS¢7F÷&SòææÖRÇÂ66†VGVÆSòç7F÷&W3òææÖRÇÂrrÀ¢7F÷&T÷&FW#¢7F÷&Sòæ÷&FW"óòçVÖ&W"äÔ…õ4dUô”åDTtU"À¢66†VGVÆS¢66†VGVÆRÇÂçVÆÂÀ¢WfVçG3¢·ÒÀ¢6÷W&6W3¢æWr6WB‚’À¢Ò“°¢Ğ¢6öç7B&÷rÒ&÷w2ævWB†¶W’“°¢–b‚&÷rç66†VGVÆRbb66†VGVÆR’&÷rç66†VGVÆRÒ66†VGVÆS°¢–b‚&÷ræV×Æ÷–VTæÖRbb&öf–ÆSòægVÆÅöæÖR’&÷ræV×Æ÷–VTæÖRÒ&öf–ÆRægVÆÅöæÖS°¢–b‚&÷ræV×Æ÷–VTæòbb&öf–ÆSòæV×Æ÷–VUöæò’&÷ræV×Æ÷–VTæòÒ&öf–ÆRæV×Æ÷–VUöæó°¢–b‚&÷rç7F÷&TæÖRbb66†VGVÆSòç7F÷&W3òææÖR’&÷rç7F÷&TæÖRÒ66†VGVÆRç7F÷&W2ææÖS°¢&WGW&â&÷s°¢Ó° ¢66†VGVÆW2æf÷$V6‚‚‡66†VGVÆR’ÓâVç7W&U&÷r‡°¢V×Æ÷–VT–C¢66†VGVÆRæV×Æ÷–VUö–BÀ¢7F÷&T–C¢66†VGVÆRç7F÷&Uö–BÀ¢&öf–ÆS¢66†VGVÆRç&öf–ÆW2À¢66†VGVÆRÀ¢Ò’“° ¢WfVçG2æf÷$V6‚‚†WfVçB’Óâ°¢6öç7B66†VGVÆRÒ66†VGVÆT'”V×Æ÷–VRævWB†WfVçBæV×Æ÷–VUö–B’ÇÂçVÆÃ°¢6öç7B&÷rÒVç7W&U&÷r‡°¢V×Æ÷–VT–C¢WfVçBæV×Æ÷–VUö–BÀ¢7F÷&T–C¢WfVçBç7F÷&Uö–BÇÂ66†VGVÆSòç7F÷&Uö–BÀ¢&öf–ÆS¢WfVçBç&öf–ÆW2ÇÂ66†VGVÆSòç&öf–ÆW2À¢66†VGVÆS¢WfVçBç7F÷&Uö–BÓÓÒ66†VGVÆSòç7F÷&Uö–Bò66†VGVÆR¢çVÆÂÀ¢Ò“°¢–b‚&÷rç7F÷&TæÖRbbWfVçBç7F÷&W3òææÖR’&÷rç7F÷&TæÖRÒWfVçBç7F÷&W2ææÖS°¢–b†WfVçBç6÷W&6R’&÷rç6÷W&6W2æFB†WfVçBç6÷W&6R“°¢6öç7B7W'&VçBÒ&÷ræWfVçG5¶WfVçBæWfVçE÷G—UÓ°¢6öç7B¶VWÆFW7BÒWfVçBæWfVçE÷G—RÓÓÒv'&VµöVæBrÇÂWfVçBæWfVçE÷G—RÓÓÒv6Æö6µö÷WBs°¢–b‚7W'&VçBÇÂ†¶VWÆFW7BòWfVçBæö67W'&VEöBâ7W'&VçBæö67W'&VEöB¢WfVçBæö67W'&VEöBÂ7W'&VçBæö67W'&VEöB’’°¢&÷ræWfVçG5¶WfVçBæWfVçE÷G—UÒÒWfVçC°¢Ğ¢Ò“° ¢&WGW&â²ââç&÷w2çfÇVW2‚•Òç6÷'B‚†Â"’Óâ°¢–b†ç7F÷&T÷&FW"ÓÒ"ç7F÷&T÷&FW"’&WGW&âç7F÷&T÷&FW"Ò"ç7F÷&T÷&FW#°¢6öç7B7F'BÒç66†VGVÆSòç7F'G5öBÇÂs““£“’s°¢6öç7B%7F'BÒ"ç66†VGVÆSòç7F'G5öBÇÂs““£“’s°¢&WGW&â7F'BæÆö6ÆT6ö×&R†%7F'B¢ÇÂæV×Æ÷–VTæÖRæÆö6ÆT6ö×&R†"æV×Æ÷–VTæÖRÂ7FFRæÆærÓÓÒw¦‚ròw¦‚Ô4âr¢vW2ÔU2r¢ÇÂæV×Æ÷–VTæòæÆö6ÆT6ö×&R†"æV×Æ÷–VTæò“°¢Ò“°§Ğ ¦gVæ7F–öâFöF”GFVæFæ6U7FGW2‡&÷r’°¢–b‡&÷ræWfVçG2æ6Æö6µö÷WB’&WGW&â²6Æ74æÖS¢vö²rÂÆ&VÃ¢Â‚~[{.Kˆ¾xúÒrÂtf–æÆ—¦Fòr’Ó°¢–b‡&÷ræWfVçG2æ'&Vµ÷7F'Bbb&÷ræWfVçG2æ'&VµöVæB’&WGW&â²6Æ74æÖS¢wVæF–ærrÂÆ&VÃ¢Â‚~KÉhşKŠÒrÂtVâW6r’Ó°¢–b‡&÷ræWfVçG2æ6Æö6µö–â’&WGW&â²6Æ74æÖS¢vö²rÂÆ&VÃ¢Â‚~[z^KÙÎKŠÒrÂuG&&¦æFòr’Ó°¢&WGW&â²6Æ74æÖS¢rrÂÆ&VÃ¢Â‚~iÊ®Kˆ®xúÒrÂu6–âVçG&Fr’Ó°§Ğ ¦gVæ7F–öâFöF”GFVæFæ6U7VÖÖ'’†WfVçG2’°¢6öç7B&÷w2ÒFöF”GFVæFæ6U&÷w2†WfVçG2“°¢–b‚&÷w2æÆVæwF‚’&WGW&âÆF—b6Æ73Ò&V×G’#âG´Â‚~K¸®ZJi¨.izhé.xúŞY(Îh™>XÚŠë[ÙRrÂt†÷’æò†’†÷&&–÷2æ’f–6†¦W2r—ÓÂöF—cæ°¢6öç7Bw&÷W2ÒæWrÖ‚“°¢&÷w2æf÷$V6‚‚‡&÷r’Óâ°¢6öç7Bw&÷W¶W’Ò&÷rç7F÷&T–BÇÂ&÷rç7F÷&TæÖRÇÂwVæ¶æ÷vâs°¢–b‚w&÷W2æ†2†w&÷W¶W’’’w&÷W2ç6WB†w&÷W¶W’Â²æÖS¢&÷rç7F÷&TæÖRÇÂÂ‚~iÊ®ŠønXŠ¾[©~™;¢rÂuF–VæF6–â–FVçF–f–6"r’Â&÷w3¢µÒÒ“°¢w&÷W2ævWB†w&÷W¶W’’ç&÷w2çW6‚‡&÷r“°¢Ò“° ¢6öç7BF–ÖT6VÆÂÒ†WfVçB’ÓâWfVçBòÆ"6Æ73Ò&Æ—fR×Væ6‚×F–ÖR#âG·F–ÖUFW‡B†WfVçBæö67W'&VEöB—ÓÂö#æ¢sÇ7â6Æ73Ò&Æ—fR×Væ6‚ÖV×G’#î(	CÂ÷7ãâs°¢6öç7B†÷Fô'WGFöç2Ò‡&÷r’Óâ°¢²v6Æö6µö–ârÂÂ‚~Kˆ®xúŞxZrrÂtVçG&Fr•ÒÀ¢²v6Æö6µö÷WBrÂÂ‚~Kˆ¾xúŞxZrrÂu6Æ–Fr•ÒÀ¢ÒæÖ‚…·G—RÂÆ&VÅÒ’Óâ°¢6öç7BWfVçBÒ&÷ræWfVçG5·G—UÓ°¢&WGW&âWfVçCòæÖWFFFòç†÷Fõ÷F€¢òÆ'WGFöâ6Æ73Ò&v†÷7BÖ'Fâ†÷FòÖ'WGFöâ"FF×f–Wr×†÷FóÒ"G¶WfVçBæ–GÒ"G—SÒ&'WGFöâ#âG¶Æ&VÇÓÂö'WGFöãæ ¢¢rs°¢Ò’æf–ÇFW"„&ööÆVâ’æ¦ö–â‚rr“° ¢&WGW&âÆF—b6Æ73Ò&Æ—fR×7F÷&RÖÆ—7B#âGµ²ââæw&÷W2çfÇVW2‚•ÒæÖ‚†w&÷W’ÓâÇ6V7F–öâ6Æ73Ò&Æ—fR×7F÷&RÖw&÷W#à¢ÆF—b6Æ73Ò&Æ—fR×7F÷&RÖ†VB#ãÆƒ3âG¶W66T…DÔÂ†w&÷WææÖR—ÓÂöƒ3ãÇ7¹ÒÚ$z{-®éÜj×lass="live-employee"><b>${escapeHTML(row.employeeName)}</b><small>${escapeHTML(row.employeeNo)}</small></td><td>${row.schedule ? `${timeText(row.schedule.starts_at)}â€”${timeText(row.schedule.ends_at)}` : `<span class="status alert">${L('æ— æ’ç­', 'Sin horario')}</span>`}</td><td>${timeCell(row.events.clock_in)}</td><td>${timeCell(row.events.break_start)}</td><td>${timeCell(row.events.break_end)}</td><td>${timeCell(row.events.clock_out)}</td><td><span class="status ${status.className}">${status.label}</span></td><td>${sources ? `<span class="status ${row.sources.has('gps') ? 'pending' : 'ok'}">${escapeHTML(sources)}</span>` : 'â€”'}</td><td><div class="live-photo-actions">${photos || 'â€”'}</div></td></tr>`;
     }).join('')}</tbody></table></div>
   </section>`).join('')}</div>`;
 }
@@ -2076,7 +1005,7 @@ function renderCurrent() {
 async function initialize() {
   document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : 'es';
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js?v=20260922-2').then((registration) => registration.update()).catch(() => {});
+    navigator.serviceWorker.register('./sw.js?v=20260922-3').then((registration) => registration.update()).catch(() => {});
   }
   if (!configured) { renderConfigurationError(); return; }
   try {
