@@ -312,6 +312,12 @@ function monthDates(monthString) {
   return dates;
 }
 
+function previousMonthString(monthString) {
+  const [year, month] = String(monthString).split('-').map(Number);
+  if (!year || month < 1 || month > 12) return '';
+  return new Date(Date.UTC(year, month - 2, 1)).toISOString().slice(0, 7);
+}
+
 function currentScheduleMonth() {
   const current = madridDate().slice(0, 7);
   return state.scheduleMonth || (current < SCHEDULE_START_MONTH ? SCHEDULE_START_MONTH : current);
@@ -1282,6 +1288,7 @@ function renderSchedule() {
   }).join('');
   return `<article class="card"><div class="section-head"><div><h2>${L('整月排班','Horario mensual')}</h2><p>${L('点击日期即可临时换班、换店或安排休息。','Pulsa una fecha para cambiar el turno, la tienda o el descanso.')}</p></div><span class="status">${state.data.annualLeaveReady ? L(`年假 ${used}/30 天`,`Vacaciones ${used}/30 días`) : L('年假待核对','Vacaciones pendientes')}</span></div>
     <div class="form-row"><label>${L('员工','Empleado')}<select id="weeklyEmployee">${employeeOptions(true,employee.user_id)}</select></label><label>${L('月份','Mes')}<input id="weeklyMonth" type="month" min="${SCHEDULE_START_MONTH}" value="${month}"></label></div>
+    <div class="button-row"><button class="secondary-btn" id="copyPreviousMonth" type="button">${L('复制上月排班','Copiar horario del mes anterior')}</button><span class="muted">${L('按上月最常用的周一至周日班次生成本月，临时调班不会优先采用。','Genera este mes con el patrón semanal más habitual del mes anterior; los cambios puntuales no tienen prioridad.')}</span></div>
     <div class="month-calendar"><div class="calendar-weekdays">${weekdayNames().map(x=>`<b>${x}</b>`).join('')}</div><div class="calendar-grid">${blanks}${cells}</div></div></article>
     <details class="card compact-details"><summary>${L('按周模板生成整月','Generar el mes con una plantilla semanal')}</summary><form id="weeklyScheduleForm" class="stack-form"><p>${L('仅在建立或重新安排整月时使用；会覆盖工作与休息排班，已登记年假保留。','Úsalo para crear o reorganizar el mes. Sustituye trabajo y descanso; conserva las vacaciones.')}</p><div id="weeklyRows" class="weekly-schedule">${renderWeeklyRows(employee)}</div><label>${L('备注（可选）','Nota opcional')}<input id="weeklyNotes" maxlength="500"></label><button class="primary-btn" type="submit">${L('生成整月排班','Generar horario mensual')}</button></form></details>`;
 }
@@ -1517,6 +1524,7 @@ function bindPortal() {
   $$('[data-delete-employee]').forEach((button) => button.addEventListener('click', () => deleteEmployee(button)));
   $$('[data-reset]').forEach((button) => button.addEventListener('click', () => resetEmployeeCredential(button)));
   $('#weeklyScheduleForm')?.addEventListener('submit', saveMonthlySchedule);
+  $('#copyPreviousMonth')?.addEventListener('click', copyPreviousMonthSchedule);
   $('#weeklyEmployee')?.addEventListener('change', changeWeeklyEmployee);
   $('#weeklyMonth')?.addEventListener('change', changeScheduleMonth);
   bindWeeklyRows();
@@ -1774,6 +1782,71 @@ function editSchedule(button) {
   $('#singleScheduleForm').addEventListener('submit',saveSingleSchedule);
   $('#singleScheduleKind').addEventListener('change',toggleSingleScheduleTimes);
   toggleSingleScheduleTimes({target:$('#singleScheduleKind')});
+}
+
+function mostCommonPreviousMonthPattern(items, fallbackStoreId) {
+  return Array.from({ length: 7 }, (_, weekday) => {
+    const candidates = items.filter((item) => scheduleKind(item) !== 'annual_leave'
+      && scheduleWeekdayIndex(item.work_date) === weekday);
+    if (!candidates.length) return null;
+    const choices = new Map();
+    candidates.forEach((item) => {
+      const dayOff = scheduleKind(item) === 'day_off';
+      const choice = {
+        dayOff,
+        storeId: item.store_id || fallbackStoreId || '',
+        start: madridTimeValue(item.starts_at, '10:00'),
+        end: madridTimeValue(item.ends_at, '17:00'),
+      };
+      const key = JSON.stringify(choice);
+      const current = choices.get(key) || { choice, count: 0, lastDate: '' };
+      current.count += 1;
+      if (item.work_date > current.lastDate) current.lastDate = item.work_date;
+      choices.set(key, current);
+    });
+    return [...choices.values()].sort((left, right) => right.count - left.count
+      || right.lastDate.localeCompare(left.lastDate))[0].choice;
+  });
+}
+
+async function copyPreviousMonthSchedule(event) {
+  const button = event.currentTarget;
+  const employee = selectedScheduleEmployee();
+  const targetMonth = $('#weeklyMonth')?.value || currentScheduleMonth();
+  const sourceMonth = previousMonthString(targetMonth);
+  if (!employee || !sourceMonth) return;
+  button.disabled = true;
+  try {
+    const sourceResult = await client.from('schedules').select('work_date,store_id,starts_at,ends_at,is_day_off,schedule_kind,published')
+      .eq('employee_id', employee.user_id).eq('published', true)
+      .gte('work_date', `${sourceMonth}-01`).lte('work_date', monthLastDate(sourceMonth))
+      .order('work_date').abortSignal(AbortSignal.timeout(8000));
+    if (sourceResult.error) throw sourceResult.error;
+    const pattern = mostCommonPreviousMonthPattern(sourceResult.data || [], employee.home_store_id);
+    if (pattern.some((item) => !item) || pattern.every((item) => item.dayOff)
+      || pattern.some((item) => !item.storeId || (!item.dayOff && (!item.start || !item.end || item.end <= item.start)))) {
+      toast(L('上月没有完整的周一至周日排班，无法自动复制。请使用周模板生成。', 'El mes anterior no tiene un horario completo de lunes a domingo. Usa la plantilla semanal.'), true);
+      return;
+    }
+    const sourceLabel = new Intl.DateTimeFormat(state.lang === 'zh' ? 'zh-CN' : 'es-ES', { year: 'numeric', month: 'long', timeZone: 'UTC' }).format(new Date(`${sourceMonth}-15T12:00:00Z`));
+    const targetLabel = new Intl.DateTimeFormat(state.lang === 'zh' ? 'zh-CN' : 'es-ES', { year: 'numeric', month: 'long', timeZone: 'UTC' }).format(new Date(`${targetMonth}-15T12:00:00Z`));
+    if (!confirm(L(
+      `将按 ${employee.full_name} ${sourceLabel} 最常用的每周排班生成 ${targetLabel}，覆盖本月工作日和休息日；已登记年假保留。确定继续？`,
+      `Se generará ${targetLabel} para ${employee.full_name} usando el patrón semanal más habitual de ${sourceLabel}. Se sustituirán los días laborables y libres; las vacaciones registradas se conservarán. ¿Continuar?`,
+    ))) return;
+    const result = await adminAction({
+      action: 'publish_month_schedule',
+      employeeId: employee.user_id,
+      month: targetMonth,
+      pattern,
+      notes: `Copied from ${sourceMonth}`,
+    });
+    await finishMutation(L(`已复制上月排班，共生成${result.count}天`, `Horario anterior copiado: ${result.count} días`));
+  } catch (error) {
+    toast(errorText(error), true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function saveMonthlySchedule(event) {
@@ -2200,7 +2273,7 @@ function renderCurrent() {
 async function initialize() {
   document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : 'es';
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js?v=20261001-2').then((registration) => registration.update()).catch(() => {});
+    navigator.serviceWorker.register('./sw.js?v=20261001-3').then((registration) => registration.update()).catch(() => {});
   }
   if (!configured) { renderConfigurationError(); return; }
   try {
