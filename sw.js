@@ -1,6 +1,6 @@
-const CACHE_NAME = 'hola-sevilla-production-v41';
+const CACHE_NAME = 'hola-sevilla-production-v42';
 const BASE = new URL('./', self.location.href);
-const SHELL = ['', 'index.html', 'styles.css?v=20261002-2', 'app.js?v=20261002-2', 'config.js?v=20261002-2', 'manifest.webmanifest', 'icon.svg']
+const SHELL = ['', 'index.html', 'styles.css?v=20261002-3', 'app.js?v=20261002-3', 'config.js?v=20261002-3', 'manifest.webmanifest', 'icon.svg']
   .map((path) => new URL(path, BASE).href);
 
 self.addEventListener('install', (event) => {

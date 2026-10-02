@@ -307,6 +307,16 @@ function payrollAttendance(item) {
   };
 }
 
+function actualAttendance(item) {
+  return {
+    ...item,
+    clock_in: attendanceValue(item, 'actual', 'clock_in'),
+    break_start: attendanceValue(item, 'actual', 'break_start'),
+    break_end: attendanceValue(item, 'actual', 'break_end'),
+    clock_out: attendanceValue(item, 'actual', 'clock_out'),
+  };
+}
+
 function dualTimeCell(actual, payroll) {
   return `<div class="dual-time"><span><small>${L('实际','Real')}</small>${escapeHTML(actual)}</span><span><small>${L('计薪','Nómina')}</small>${escapeHTML(payroll)}</span></div>`;
 }
@@ -824,7 +834,11 @@ async function loadEmployeeData() {
     const merged = { ...existing };
     for (const event of effectiveEvents) {
       const field = ({ clock_in: 'clock_in', break_start: 'break_start', break_end: 'break_end', clock_out: 'clock_out' })[event.event_type];
-      if (field && !merged[field]) merged[field] = event.occurred_at;
+      if (!field) continue;
+      const actualField = `actual_${field}`;
+      if (!merged[actualField]) merged[actualField] = event.occurred_at;
+      // Compatibility fallback for deployments that do not yet expose actual_*.
+      if (!merged[field]) merged[field] = event.occurred_at;
     }
     if (existingIndex >= 0) attendanceRows[existingIndex] = merged;
     else attendanceRows.unshift(merged);
@@ -932,15 +946,16 @@ function renderEmployeeHome() {
   const today = madridDate();
   const schedule = state.data.schedules.find((item) => item.work_date === today);
   const record = state.data.attendance.find((item) => item.work_date === today);
+  const actualRecord = actualAttendance(record || {});
   const permissions = state.data.permissions || [];
   const annualLeave = scheduleKind(schedule) === 'annual_leave';
-  const status = record?.clock_out ? L('今日已完成', 'Jornada completada') : record?.clock_in ? L('工作进行中', 'Jornada en curso') : annualLeave ? L('今天年假', 'Vacaciones') : schedule?.is_day_off ? L('今天休息', 'Día libre') : L('等待到店', 'Pendiente de entrada');
+  const status = actualRecord.clock_out ? L('今日已完成', 'Jornada completada') : actualRecord.clock_in ? L('工作进行中', 'Jornada en curso') : annualLeave ? L('今天年假', 'Vacaciones') : schedule?.is_day_off ? L('今天休息', 'Día libre') : L('等待到店', 'Pendiente de entrada');
   return `<div class="page-grid">
     <article class="card hero-card"><div><p class="eyebrow">${dateText(today)}</p><h2>${escapeHTML(state.profile.full_name)}，${status}</h2><p>${schedule ? (annualLeave ? L('排班：年假', 'Horario: vacaciones') : schedule.is_day_off ? L('排班：休息', 'Horario: descanso') : `${escapeHTML(schedule.stores?.name || '')} · ${timeText(schedule.starts_at)}—${timeText(schedule.ends_at)}`) : L('VIVI尚未发布今天的排班', 'VIVI todavía no ha publicado el horario de hoy')}</p></div><div class="hero-meta"><span>${L('手机定位：店铺100米内打卡', 'Móvil: fichaje dentro de 100 m')}</span><span>${L('店铺电脑：PIN打卡', 'Ordenador: fichaje con PIN')}</span></div></article>
-    <article class="card summary-card"><div class="metric"><span>${L('上班', 'Entrada')}</span><b>${timeText(record?.clock_in)}</b></div><div class="metric"><span>${L('休息', 'Pausa')}</span><b>${timeText(record?.break_start)}–${timeText(record?.break_end)}</b></div><div class="metric"><span>${L('下班', 'Salida')}</span><b>${timeText(record?.clock_out)}</b></div></article>
+    <article class="card summary-card"><div class="metric"><span>${L('上班', 'Entrada')}</span><b>${timeText(actualRecord.clock_in)}</b></div><div class="metric"><span>${L('休息', 'Pausa')}</span><b>${timeText(actualRecord.break_start)}–${timeText(actualRecord.break_end)}</b></div><div class="metric"><span>${L('下班', 'Salida')}</span><b>${timeText(actualRecord.clock_out)}</b></div></article>
   </div>
-  ${renderScheduledMobilePunch(schedule, record)}
-  ${permissions.map((permission) => renderGpsCard(permission, record)).join('')}
+  ${renderScheduledMobilePunch(schedule, actualRecord)}
+  ${permissions.map((permission) => renderGpsCard(permission, actualRecord)).join('')}
   <article class="card"><div class="section-head"><div><p class="eyebrow">NEXT 7 DAYS</p><h2>${L('近期排班', 'Próximos turnos')}</h2></div></div>${scheduleTable(state.data.schedules.filter((item) => item.work_date >= today).slice(0, 7), false)}</article>`;
 }
 
@@ -1687,17 +1702,18 @@ async function submitRequest(event) {
 async function confirmEmployeePunch(eventType, previousValue) {
   const field = ({ clock_in: 'clock_in', break_start: 'break_start', break_end: 'break_end', clock_out: 'clock_out' })[eventType];
   if (!field) return null;
+  const actualField = `actual_${field}`;
   await new Promise((resolve) => setTimeout(resolve, 700));
   const today = madridDate();
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const [daily, events] = await withTimeout(Promise.all([
-    client.from('attendance_daily').select(field).eq('work_date', today).maybeSingle(),
+    client.from('attendance_daily').select(actualField).eq('work_date', today).maybeSingle(),
     client.from('attendance_events').select('occurred_at').eq('employee_id', state.profile.user_id)
       .eq('event_type', eventType).gte('occurred_at', dayStart).lt('occurred_at', dayEnd)
       .order('occurred_at', { ascending: false }).limit(1),
   ]), 7_000);
-  const confirmedAt = daily.data?.[field] || events.data?.[0]?.occurred_at || null;
+  const confirmedAt = daily.data?.[actualField] || events.data?.[0]?.occurred_at || null;
   if (!confirmedAt || confirmedAt === previousValue) return null;
   return confirmedAt;
 }
@@ -1708,7 +1724,7 @@ async function gpsPunch(eventType, permissionId = null) {
   state.busy = true;
   $$('[data-gps-punch]').forEach((button) => { button.disabled = true; });
   const currentRecord = (state.data.attendance || []).find((item) => item.work_date === madridDate());
-  const previousValue = currentRecord?.[eventType] || null;
+  const previousValue = attendanceValue(currentRecord, 'actual', eventType);
   toast(L('正在确认你位于店铺100米内…', 'Comprobando que estás a menos de 100 m…'));
   try {
     const position = await new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, {
