@@ -805,7 +805,7 @@ async function loadEmployeeData() {
   const now = new Date().toISOString();
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
-  const [stores, schedules, attendance, requests, permissions, todayEvents] = await Promise.all([
+  const [stores, schedules, attendance, requests, permissions, todayEvents, portalEvents] = await Promise.all([
     client.from('stores').select('*').eq('active', true).order('name'),
     client.from('schedules').select('*, stores(name,address)').gte('work_date', scheduleStart).lte('work_date', scheduleEnd).order('work_date'),
     client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
@@ -814,13 +814,21 @@ async function loadEmployeeData() {
     client.from('attendance_events').select('employee_id,store_id,event_type,occurred_at')
       .eq('employee_id', state.profile.user_id).gte('occurred_at', dayStart).lt('occurred_at', dayEnd)
       .order('occurred_at'),
+    client.rpc('hola_portal_today_events_v1'),
   ]);
   assertQueryResults([stores, schedules, attendance, requests, permissions]);
   const attendanceRows = attendance.data || [];
   const cachedEvents = readJSON(PUNCH_CACHE_STORAGE, []).filter((item) =>
     item?.employee_id === state.profile.user_id && item?.work_date === today
   );
-  const serverEvents = !todayEvents.error ? (todayEvents.data || []) : [];
+  const serverEventMap = new Map();
+  [...(!todayEvents.error ? todayEvents.data || [] : []), ...(!portalEvents.error ? portalEvents.data || [] : [])]
+    .forEach((event) => {
+      if (event?.employee_id === state.profile.user_id) {
+        serverEventMap.set(`${event.employee_id}:${event.event_type}:${event.occurred_at}`, event);
+      }
+    });
+  const serverEvents = [...serverEventMap.values()];
   const effectiveEvents = [...serverEvents, ...cachedEvents].sort((a, b) =>
     String(a.occurred_at).localeCompare(String(b.occurred_at))
   );
@@ -844,6 +852,7 @@ async function loadEmployeeData() {
     else attendanceRows.unshift(merged);
   }
   if (todayEvents.error) console.warn('Attendance event fallback unavailable:', todayEvents.error);
+  if (portalEvents.error) console.warn('Portal live-event RPC unavailable:', portalEvents.error);
   state.data = {
     stores: stores.data || [],
     schedules: schedules.data || [],
@@ -866,12 +875,13 @@ async function loadManagerData() {
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const photoStart = new Date(Date.now() - 30 * 86_400_000).toISOString();
-  const [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, todayAttendance, audits, photoEvents, annualLeave] = await Promise.all([
+  const [stores, employees, schedules, todaySchedules, events, managerEvents, requests, permissions, devices, attendance, todayAttendance, audits, photoEvents, annualLeave] = await Promise.all([
     client.from('stores').select('*').order('name'),
     client.from('profiles').select('*, stores(name)').eq('role', 'employee').order('full_name'),
     client.from('schedules').select('*, stores(name)').gte('work_date', scheduleQueryStart).lte('work_date', scheduleQueryEnd).order('work_date'),
     client.from('schedules').select('*, stores(name)').eq('work_date', today).order('starts_at'),
     client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
+    client.rpc('hola_portal_today_events_v1'),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(100),
     client.from('gps_permissions').select('*, stores(name)').eq('active', true).gte('valid_until', new Date().toISOString()).order('valid_until'),
     client.from('kiosk_devices').select('*, stores(name)').order('created_at', { ascending: false }),
@@ -884,12 +894,19 @@ async function loadManagerData() {
     client.from('schedules').select('employee_id, work_date').eq('schedule_kind', 'annual_leave').eq('published', true)
       .gte('work_date', `${leaveYear}-01-01`).lte('work_date', `${leaveYear}-12-31`).order('work_date'),
   ]);
-  const results = [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, todayAttendance, audits, photoEvents];
+  const results = [stores, employees, schedules, todaySchedules, requests, permissions, devices, attendance, todayAttendance, audits, photoEvents];
   assertQueryResults(results);
   const employeeById = new Map((employees.data || []).map((employee) => [employee.user_id, employee]));
   const storeById = new Map((stores.data || []).map((store) => [store.id, store]));
   const attachEmployee = (items) => (items || []).map((item) => ({ ...item, profiles: employeeById.get(item.employee_id) || null }));
-  const liveEvents = attachEmployee(events.data);
+  const liveEventsById = new Map();
+  [...(events.data || []), ...(managerEvents.error ? [] : managerEvents.data || [])].forEach((event) => {
+    if (!event?.id) return;
+    const store = event.stores || storeById.get(event.store_id) || (event.store_name ? { name: event.store_name } : null);
+    liveEventsById.set(event.id, { ...event, stores: store });
+  });
+  const liveEvents = attachEmployee([...liveEventsById.values()]);
+  if (managerEvents.error) console.warn('Manager live-event RPC unavailable:', managerEvents.error);
   const liveEventKeys = new Set(liveEvents.map((event) => `${event.employee_id}:${event.event_type}`));
   (todayAttendance.data || []).forEach((record) => {
     ['clock_in', 'break_start', 'break_end', 'clock_out'].forEach((eventType) => {
