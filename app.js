@@ -866,7 +866,7 @@ async function loadManagerData() {
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const photoStart = new Date(Date.now() - 30 * 86_400_000).toISOString();
-  const [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents, annualLeave] = await Promise.all([
+  const [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, todayAttendance, audits, photoEvents, annualLeave] = await Promise.all([
     client.from('stores').select('*').order('name'),
     client.from('profiles').select('*, stores(name)').eq('role', 'employee').order('full_name'),
     client.from('schedules').select('*, stores(name)').gte('work_date', scheduleQueryStart).lte('work_date', scheduleQueryEnd).order('work_date'),
@@ -876,6 +876,7 @@ async function loadManagerData() {
     client.from('gps_permissions').select('*, stores(name)').eq('active', true).gte('valid_until', new Date().toISOString()).order('valid_until'),
     client.from('kiosk_devices').select('*, stores(name)').order('created_at', { ascending: false }),
     client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', attendanceEnd).order('work_date', { ascending: false }),
+    client.from('attendance_daily').select('*').eq('work_date', today),
     client.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(100),
     client.from('attendance_events').select('id, employee_id, store_id, event_type, source, occurred_at, metadata, stores(name)')
       .eq('source', 'kiosk').in('event_type', ['clock_in', 'clock_out']).gte('occurred_at', photoStart)
@@ -883,20 +884,44 @@ async function loadManagerData() {
     client.from('schedules').select('employee_id, work_date').eq('schedule_kind', 'annual_leave').eq('published', true)
       .gte('work_date', `${leaveYear}-01-01`).lte('work_date', `${leaveYear}-12-31`).order('work_date'),
   ]);
-  const results = [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents];
+  const results = [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, todayAttendance, audits, photoEvents];
   assertQueryResults(results);
   const employeeById = new Map((employees.data || []).map((employee) => [employee.user_id, employee]));
+  const storeById = new Map((stores.data || []).map((store) => [store.id, store]));
   const attachEmployee = (items) => (items || []).map((item) => ({ ...item, profiles: employeeById.get(item.employee_id) || null }));
+  const liveEvents = attachEmployee(events.data);
+  const liveEventKeys = new Set(liveEvents.map((event) => `${event.employee_id}:${event.event_type}`));
+  (todayAttendance.data || []).forEach((record) => {
+    ['clock_in', 'break_start', 'break_end', 'clock_out'].forEach((eventType) => {
+      const occurredAt = attendanceValue(record, 'actual', eventType);
+      const key = `${record.employee_id}:${eventType}`;
+      if (!occurredAt || liveEventKeys.has(key)) return;
+      liveEvents.push({
+        id: `daily-${record.employee_id}-${eventType}`,
+        employee_id: record.employee_id,
+        store_id: record.store_id,
+        event_type: eventType,
+        occurred_at: occurredAt,
+        source: record.source || 'daily',
+        metadata: {},
+        stores: storeById.get(record.store_id) || null,
+        profiles: employeeById.get(record.employee_id) || null,
+      });
+      liveEventKeys.add(key);
+    });
+  });
+  liveEvents.sort((a, b) => String(a.occurred_at).localeCompare(String(b.occurred_at)));
   state.data = {
     stores: stores.data || [],
     employees: employees.data || [],
     schedules: attachEmployee(schedules.data),
     todaySchedules: attachEmployee(todaySchedules.data),
-    events: attachEmployee(events.data),
+    events: liveEvents,
     requests: attachEmployee(requests.data),
     permissions: attachEmployee(permissions.data),
     devices: devices.data || [],
     attendance: attendance.data || [],
+    todayAttendance: todayAttendance.data || [],
     audits: audits.data || [],
     photoEvents: attachEmployee(photoEvents.data),
     annualLeave: annualLeave.data || [],
@@ -1264,7 +1289,9 @@ function todayAttendanceSummary(events) {
     <div class="live-store-head"><h3>${escapeHTML(group.name)}</h3><span>${group.rows.length} ${L('人', 'personas')}</span></div>
     <div class="table-wrap live-summary-table"><table><thead><tr><th>${L('员工', 'Empleado')}</th><th>${L('排班', 'Horario')}</th><th>${L('上班', 'Entrada')}</th><th>${L('开始休息', 'Inicio pausa')}</th><th>${L('结束休息', 'Fin pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('当前状态', 'Estado')}</th><th>${L('方式', 'Origen')}</th><th>${L('现场照片', 'Fotos')}</th></tr></thead><tbody>${group.rows.map((row) => {
       const status = todayAttendanceStatus(row);
-      const sources = [...row.sources].map((source) => source === 'kiosk' ? L('电脑', 'PC') : source.toUpperCase()).join(' + ');
+      const sources = [...row.sources].map((source) => source === 'kiosk'
+        ? L('电脑', 'PC')
+        : source === 'daily' ? L('打卡记录', 'Registro') : source.toUpperCase()).join(' + ');
       const photos = photoButtons(row);
       return `<tr><td class="live-employee"><b>${escapeHTML(row.employeeName)}</b></td><td>${row.schedule ? `${timeText(row.schedule.starts_at)}—${timeText(row.schedule.ends_at)}` : `<span class="status alert">${L('无排班', 'Sin horario')}</span>`}</td><td>${timeCell(row.events.clock_in)}</td><td>${timeCell(row.events.break_start)}</td><td>${timeCell(row.events.break_end)}</td><td>${timeCell(row.events.clock_out)}</td><td><span class="status ${status.className}">${status.label}</span></td><td>${sources ? `<span class="status ${row.sources.has('gps') ? 'pending' : 'ok'}">${escapeHTML(sources)}</span>` : '—'}</td><td><div class="live-photo-actions">${photos || '—'}</div></td></tr>`;
     }).join('')}</tbody></table></div>
