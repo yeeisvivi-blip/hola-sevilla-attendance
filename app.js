@@ -1171,9 +1171,9 @@ function renderManagerHome() {
   const unconfigured = state.data.stores.filter((store) => store.latitude === null || store.longitude === null);
   const unhealthy = (state.health || []).filter((item) => !item.ok);
   return `${unhealthy.length ? `<div class="callout warning"><b>${L('系统版本未同步', 'Versión sin sincronizar')}</b><span>${L('以下后台需要重新部署：', 'Hay que volver a desplegar:')} ${unhealthy.map((item) => escapeHTML(item.name)).join('、')}</span></div>` : `<div class="callout"><b>${L('系统正常', 'Sistema correcto')}</b><span>${L('网页、数据库与三套后台服务连接正常。', 'La web, la base de datos y los tres servicios están conectados.')}</span></div>`}
-  <div class="stat-grid"><article class="stat-card"><small>${L('在职员工', 'Empleados activos')}</small><b>${active.length}</b></article><article class="stat-card"><small>${L('今日已上班打卡', 'Entradas hoy')}</small><b>${punched.size}</b></article><article class="stat-card"><small>${L('待审批', 'Pendientes')}</small><b>${pending.length}</b></article><article class="stat-card"><small>${L('GPS未配置店铺', 'Tiendas sin GPS')}</small><b>${unconfigured.length}</b></article></div>
+  <div class="stat-grid"><article class="stat-card"><small>${L('在职员工', 'Empleados activos')}</small><b>${active.length}</b></article><article class="stat-card"><small>${L('今日已上班打卡', 'Entradas hoy')}</small><b id="todayPunchedCount">${punched.size}</b></article><article class="stat-card"><small>${L('待审批', 'Pendientes')}</small><b>${pending.length}</b></article><article class="stat-card"><small>${L('GPS未配置店铺', 'Tiendas sin GPS')}</small><b>${unconfigured.length}</b></article></div>
   ${unconfigured.length ? `<div class="callout warning"><b>${L('上线前必须完成', 'Pendiente antes de publicar')}</b><span>${L('请在“店铺设置”中填写四店准确地址、经纬度和有效范围。未配置的店铺不能使用GPS打卡。', 'Completa dirección, coordenadas y radio de las cuatro tiendas. Sin ello no se permite el fichaje GPS.')}</span></div>` : ''}
-  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日员工打卡汇总', 'Resumen de fichajes de hoy')}</h2><p>${L('按当天排班店铺分组，每名员工的上班、休息和下班记录集中在同一行。', 'Agrupado por la tienda programada; todos los fichajes de cada empleado aparecen en una sola fila.')}</p></div><span class="status ok">Europe/Madrid</span></div>${todayAttendanceSummary(state.data.events)}</article>`;
+  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日员工打卡汇总', 'Resumen de fichajes de hoy')}</h2><p>${L('每12秒自动更新。按当天排班店铺分组，每名员工的上班、休息和下班记录集中在同一行。', 'Actualización automática cada 12 segundos. Agrupado por tienda; todos los fichajes de cada empleado aparecen en una sola fila.')}</p></div><span class="status ok">Europe/Madrid</span></div><div id="todayAttendanceLive">${todayAttendanceSummary(state.data.events)}</div></article>`;
 }
 
 function todayAttendanceRows(events = []) {
@@ -1283,6 +1283,84 @@ function todayAttendanceSummary(events) {
       return `<tr><td class="live-employee"><b>${escapeHTML(row.employeeName)}</b></td><td>${row.schedule ? `${timeText(row.schedule.starts_at)}—${timeText(row.schedule.ends_at)}` : `<span class="status alert">${L('无排班', 'Sin horario')}</span>`}</td><td>${timeCell(row.events.clock_in)}</td><td>${timeCell(row.events.break_start)}</td><td>${timeCell(row.events.break_end)}</td><td>${timeCell(row.events.clock_out)}</td><td><span class="status ${status.className}">${status.label}</span></td><td>${sources ? `<span class="status ${row.sources.has('gps') ? 'pending' : 'ok'}">${escapeHTML(sources)}</span>` : '—'}</td><td><div class="live-photo-actions">${photos || '—'}</div></td></tr>`;
     }).join('')}</tbody></table></div>
   </section>`).join('')}</div>`;
+}
+
+function mergeTodayAttendance(records) {
+  const today = madridDate();
+  const otherDays = (state.data.attendance || []).filter((item) => item.work_date !== today);
+  state.data.todayAttendance = records;
+  state.data.attendance = [...records, ...otherDays].sort((a, b) => b.work_date.localeCompare(a.work_date));
+}
+
+function managerLiveEvents(directEvents, rpcEvents, dailyRecords) {
+  const employeeById = new Map((state.data.employees || []).map((employee) => [employee.user_id, employee]));
+  const storeById = new Map((state.data.stores || []).map((store) => [store.id, store]));
+  const eventsById = new Map();
+  [...(directEvents || []), ...(rpcEvents || [])].forEach((event) => {
+    if (!event?.id) return;
+    const store = event.stores || storeById.get(event.store_id) || (event.store_name ? { name: event.store_name } : null);
+    eventsById.set(event.id, { ...event, stores: store, profiles: employeeById.get(event.employee_id) || null });
+  });
+  const events = [...eventsById.values()];
+  const eventKeys = new Set(events.map((event) => `${event.employee_id}:${event.event_type}`));
+  (dailyRecords || []).forEach((record) => {
+    ['clock_in', 'break_start', 'break_end', 'clock_out'].forEach((eventType) => {
+      const occurredAt = attendanceValue(record, 'actual', eventType);
+      const key = `${record.employee_id}:${eventType}`;
+      if (!occurredAt || eventKeys.has(key)) return;
+      events.push({
+        id: `daily-${record.employee_id}-${eventType}`,
+        employee_id: record.employee_id,
+        store_id: record.store_id,
+        event_type: eventType,
+        occurred_at: occurredAt,
+        source: record.source || 'daily',
+        metadata: {},
+        stores: storeById.get(record.store_id) || null,
+        profiles: employeeById.get(record.employee_id) || null,
+      });
+      eventKeys.add(key);
+    });
+  });
+  return events.sort((a, b) => String(a.occurred_at).localeCompare(String(b.occurred_at)));
+}
+
+let managerLiveRefreshBusy = false;
+async function refreshManagerLiveSnapshot() {
+  if (managerLiveRefreshBusy || state.profile?.role !== 'manager') return;
+  managerLiveRefreshBusy = true;
+  try {
+    const today = madridDate();
+    const dayStart = madridLocalToIso(today, '00:00');
+    const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
+    const [direct, rpc, daily, schedules] = await Promise.all([
+      client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
+      client.rpc('hola_portal_today_events_v1'),
+      client.from('attendance_daily').select('*').eq('work_date', today),
+      client.from('schedules').select('*, stores(name)').eq('work_date', today).order('starts_at'),
+    ]);
+    if (daily.error) throw daily.error;
+    if (direct.error && rpc.error) throw direct.error;
+    const employeeById = new Map((state.data.employees || []).map((employee) => [employee.user_id, employee]));
+    state.data.todaySchedules = schedules.error ? (state.data.todaySchedules || []) : (schedules.data || []).map((item) => ({
+      ...item,
+      profiles: employeeById.get(item.employee_id) || null,
+    }));
+    mergeTodayAttendance(daily.data || []);
+    state.data.events = managerLiveEvents(direct.error ? [] : direct.data, rpc.error ? [] : rpc.data, daily.data || []);
+    if (state.view !== 'home') return;
+    const count = $('#todayPunchedCount');
+    if (count) count.textContent = String(new Set(state.data.events.filter((event) => event.event_type === 'clock_in').map((event) => event.employee_id)).size);
+    const live = $('#todayAttendanceLive');
+    if (live) {
+      live.innerHTML = todayAttendanceSummary(state.data.events);
+      $$('[data-view-photo]', live).forEach((button) => button.addEventListener('click', () => viewAttendancePhoto(button)));
+    }
+  } catch (error) {
+    console.warn('Live overview refresh failed:', error);
+  } finally {
+    managerLiveRefreshBusy = false;
+  }
 }
 
 function eventTable(items) {
@@ -1595,18 +1673,25 @@ async function checkAdminConnection() {
   } finally {button.disabled = false;}
 }
 
-async function refreshEditedRecord(body, successMessage) {
+async function refreshEditedRecord(body, successMessage, previousCorrectionId = null) {
   try {
     const table = body.action === 'upsert_schedule' ? 'schedules' : 'attendance_daily';
-    const query = client.from(table).select(table === 'schedules' ? '*, stores(name)' : '*')
-      .eq('employee_id',body.employeeId).eq('work_date',body.workDate).abortSignal(AbortSignal.timeout(8000));
-    const result = await query.maybeSingle();
-    if(result.error) throw result.error;
+    let result;
+    for (let attempt = 0; attempt < (body.action === 'correct_attendance' ? 4 : 1); attempt += 1) {
+      if (attempt) await new Promise((resolve) => setTimeout(resolve, attempt * 300));
+      result = await client.from(table).select(table === 'schedules' ? '*, stores(name)' : '*')
+        .eq('employee_id',body.employeeId).eq('work_date',body.workDate).abortSignal(AbortSignal.timeout(8000)).maybeSingle();
+      if(result.error) throw result.error;
+      if (body.action !== 'correct_attendance') break;
+      const record = result.data;
+      const correctionApplied = body.correctionKind === 'void'
+        ? !record?.corrected
+        : Boolean(record?.corrected && (!previousCorrectionId || record.correction_id !== previousCorrectionId));
+      if (correctionApplied) break;
+    }
     const field = table === 'schedules' ? 'schedules' : 'attendance';
     state.data[field] = state.data[field].filter(item=>item.employee_id !== body.employeeId || item.work_date !== body.workDate);
-    if(!result.data && body.action === 'correct_attendance' && body.correctionKind === 'void') {
-      renderPortal();toast(successMessage);return;
-    }
+    if(!result.data && body.action === 'correct_attendance' && body.correctionKind === 'void') { await loadPortalData();renderPortal();toast(successMessage);return; }
     if(!result.data) throw new Error('RECORD_NOT_FOUND');
     const record = result.data;
     state.data[field].push(record);
@@ -1614,7 +1699,10 @@ async function refreshEditedRecord(body, successMessage) {
       state.data.schedules.sort((a,b)=>a.work_date.localeCompare(b.work_date));
       state.data.annualLeave = (state.data.annualLeave || []).filter(item=>item.employee_id !== body.employeeId || item.work_date !== body.workDate);
       if(scheduleKind(record) === 'annual_leave' && record.published) state.data.annualLeave.push({employee_id:body.employeeId,work_date:body.workDate});
-    } else state.data.attendance.sort((a,b)=>b.work_date.localeCompare(a.work_date));
+    } else {
+      state.data.attendance.sort((a,b)=>b.work_date.localeCompare(a.work_date));
+      await loadPortalData();
+    }
     renderPortal();toast(successMessage);
   } catch(error) {
     toast(L('已保存，但最新记录加载失败，请点击刷新。','Guardado, pero no se pudo actualizar el registro. Pulsa actualizar.'),true);
@@ -1628,10 +1716,13 @@ async function editorSave(form, statusId, body, successMessage) {
   form.dataset.saving = 'true';controls.forEach(([element])=>{element.disabled=true;});
   status.textContent = L('正在保存，请稍候…','Guardando…');
   try {
+    const previousCorrectionId = body.action === 'correct_attendance'
+      ? state.data.attendance?.find((item) => item.employee_id === body.employeeId && item.work_date === body.workDate)?.correction_id || null
+      : null;
     const result = await adminAction(body);
     if (result?.ok !== true) throw new Error('INVALID_SERVER_RESPONSE');
     closeEditDialog();
-    await refreshEditedRecord(body, successMessage);
+    await refreshEditedRecord(body, successMessage, previousCorrectionId);
   } catch(error) {
     const uncertain = ['REQUEST_TIMEOUT','NETWORK_ERROR'].includes(normalizedErrorCode(error));
     status.textContent = uncertain
@@ -2502,6 +2593,22 @@ setInterval(() => {
   const kioskClock = $('#kioskTime'); if (kioskClock) kioskClock.textContent = timeText(new Date());
   const portalClock = $('#portalClock'); if (portalClock) portalClock.textContent = timeText(new Date());
 }, 1000);
+
+setInterval(() => {
+  if (document.visibilityState === 'visible' && state.profile?.role === 'manager' && state.view === 'home') {
+    refreshManagerLiveSnapshot();
+  }
+}, 12_000);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.profile?.role === 'manager' && state.view === 'home') {
+    refreshManagerLiveSnapshot();
+  }
+});
+
+window.addEventListener('focus', () => {
+  if (state.profile?.role === 'manager' && state.view === 'home') refreshManagerLiveSnapshot();
+});
 
 initialize().catch((error) => {
   console.error('Application startup failed', error);
