@@ -1431,31 +1431,39 @@ function attendanceCalendarCell(item) {
 
 function monthlyAttendanceCalendar(items) {
   const month = state.attendanceMonth || madridDate().slice(0, 7);
-  const validDays = monthDates(month).length;
   const employeeById = new Map((state.data.employees || []).map((employee) => [employee.user_id, employee]));
   const employeeIds = [...new Set(items.map((item) => item.employee_id))];
   const rowsByKey = new Map(items.map((item) => [`${item.employee_id}:${item.work_date}`, item]));
-  const days = Array.from({ length: 31 }, (_, index) => index + 1);
   if (!employeeIds.length) return `<div class="empty">${L('暂无考勤记录', 'No hay registros')}</div>`;
-  const header = days.map((day) => `<th class="attendance-day-head ${day > validDays ? 'outside-month' : ''}">${day}</th>`).join('');
-  const body = employeeIds.map((employeeId) => {
+  const dates = monthDates(month);
+  const leadingBlanks = scheduleWeekdayIndex(dates[0]);
+  const trailingBlanks = (7 - ((leadingBlanks + dates.length) % 7)) % 7;
+  const calendarDates = [
+    ...Array.from({ length: leadingBlanks }, () => null),
+    ...dates,
+    ...Array.from({ length: trailingBlanks }, () => null),
+  ];
+  const calendars = employeeIds.map((employeeId) => {
     const employee = employeeById.get(employeeId);
     const fallback = items.find((item) => item.employee_id === employeeId);
     const name = employee?.full_name || fallback?.employee_name || '';
     const nif = employee?.nif || '';
-    const cells = days.map((day) => {
-      if (day > validDays) return '<td class="attendance-day-cell outside-month">—</td>';
-      const date = `${month}-${String(day).padStart(2, '0')}`;
+    const cells = calendarDates.map((date) => {
+      if (!date) return '<div class="attendance-month-day outside-month" aria-hidden="true"></div>';
       const item = rowsByKey.get(`${employeeId}:${date}`);
       const status = attendanceCalendarCell(item);
       const actualIn = timeText(attendanceValue(item, 'actual', 'clock_in'));
+      const actualBreakStart = timeText(attendanceValue(item, 'actual', 'break_start'));
+      const actualBreakEnd = timeText(attendanceValue(item, 'actual', 'break_end'));
       const actualOut = timeText(attendanceValue(item, 'actual', 'clock_out'));
+      const nonWorking = item?.correction_kind === 'absence' || ['day_off', 'annual_leave'].includes(item?.display_schedule_kind);
+      const effective = nonWorking ? '0h 00m' : scheduledEffectiveText(item || {});
       const detail = `${date} · ${status.label}${item?.store_name ? ` · ${item.store_name}` : ''}${actualIn !== '—' || actualOut !== '—' ? ` · ${actualIn}–${actualOut}` : ''}`;
-      return `<td class="attendance-day-cell"><button type="button" class="attendance-calendar-button ${status.className}" data-calendar-correct="${escapeHTML(employeeId)}" data-work-date="${date}" title="${escapeHTML(detail)}" aria-label="${escapeHTML(`${name} ${detail}`)}"><b>${status.short}</b></button></td>`;
+      return `<button type="button" class="attendance-month-day ${status.className}" data-calendar-correct="${escapeHTML(employeeId)}" data-work-date="${date}" title="${escapeHTML(detail)}" aria-label="${escapeHTML(`${name} ${detail}`)}"><span class="attendance-month-date">${Number(date.slice(-2))}</span><strong>${status.label}</strong><small>${escapeHTML(item?.store_name || '—')}</small><span>${L('上','E')} ${actualIn} · ${L('下','S')} ${actualOut}</span><span>${L('休','P')} ${actualBreakStart}–${actualBreakEnd}</span><b>${L('有效','Efectivas')} ${effective}</b></button>`;
     }).join('');
-    return `<tr><th class="attendance-employee-cell"><b>${escapeHTML(name)}</b><small>${escapeHTML(nif || L('无NIF', 'Sin NIF'))}</small></th>${cells}</tr>`;
+    return `<section class="attendance-month"><header><div><h3>${escapeHTML(name)}</h3><p>NIF · ${escapeHTML(nif || L('未填写', 'Sin NIF'))}</p></div></header><div class="attendance-month-weekdays">${weekdayNames().map((day) => `<b>${day}</b>`).join('')}</div><div class="attendance-month-grid">${cells}</div></section>`;
   }).join('');
-  return `<div class="attendance-calendar-wrap"><table class="attendance-calendar-table"><thead><tr><th class="attendance-employee-head">${L('员工 / NIF', 'Empleado / NIF')}</th>${header}</tr></thead><tbody>${body}</tbody></table></div>`;
+  return `<div class="attendance-month-list">${calendars}</div>`;
 }
 
 function renderExport() {
@@ -2360,6 +2368,16 @@ function monthlyReportRow(date, schedule, attendance) {
   };
 }
 
+function monthlyReportStatus(row) {
+  if (row.sickLeave) return { className: 'sick-leave', label: '病假 / Baja' };
+  if (row.absence) return { className: 'absence', label: '缺勤 / Ausencia' };
+  if (row.annualLeave) return { className: 'annual-leave', label: '年假 / Vacaciones' };
+  if (row.dayOff) return { className: 'day-off', label: '休息 / Libre' };
+  if (row.future && row.actualClockIn === '—') return { className: 'pending', label: '待打卡 / Pendiente' };
+  if (row.actualClockIn === '—' && row.actualClockOut === '—') return { className: 'missing', label: '未打卡 / Sin fichajes' };
+  return { className: row.hasIncident ? 'incident' : 'worked', label: '工作 / Trabajo' };
+}
+
 function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
   const ownSchedules = schedules.filter((item) => item.employee_id === employee.user_id);
   const ownAttendance = attendance.filter((item) => item.employee_id === employee.user_id);
@@ -2374,12 +2392,23 @@ function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
   const annualLeaveDays = rows.filter((row) => row.annualLeave).length;
   const incidentCount = rows.filter((row) => row.hasIncident).length;
   const monthLabel = new Intl.DateTimeFormat('es-ES', { timeZone: 'UTC', year: 'numeric', month: 'long' }).format(new Date(`${month}-15T12:00:00Z`));
-  const rowHtml = rows.length ? rows.map((row) => `<tr class="${row.hasIncident ? 'report-incident' : ''}"><td>${escapeHTML(reportDateText(row.date))}</td><td>${escapeHTML(row.store)}</td><td>${L('上','E')} ${row.actualClockIn}<br>${L('休','P')} ${row.actualBreakStart}–${row.actualBreakEnd}<br>${L('下','S')} ${row.actualClockOut}</td><td>${reportDuration(row.effectiveMinutes)}</td><td>${escapeHTML(row.note)}</td></tr>`).join('') : `<tr><td colspan="5">本月没有已发布排班或考勤记录 / No hay horarios ni fichajes publicados</td></tr>`;
+  const leadingBlanks = scheduleWeekdayIndex(`${month}-01`);
+  const trailingBlanks = (7 - ((leadingBlanks + rows.length) % 7)) % 7;
+  const calendarRows = [
+    ...Array.from({ length: leadingBlanks }, () => null),
+    ...rows,
+    ...Array.from({ length: trailingBlanks }, () => null),
+  ];
+  const calendarHtml = calendarRows.map((row) => {
+    if (!row) return '<div class="report-calendar-day outside-month"></div>';
+    const status = monthlyReportStatus(row);
+    return `<div class="report-calendar-day ${status.className}"><div class="report-calendar-date"><b>${Number(row.date.slice(-2))}</b><strong>${status.label}</strong></div><small>${escapeHTML(row.store)}</small><span>E ${row.actualClockIn} · S ${row.actualClockOut}</span><span>P ${row.actualBreakStart}–${row.actualBreakEnd}</span><b>${L('有效','Efectivas')} ${reportDuration(row.effectiveMinutes)}</b>${row.hasIncident ? `<em>${escapeHTML(row.note)}</em>` : ''}</div>`;
+  }).join('');
 
   return `<article class="monthly-report-sheet">
     <header class="report-header"><div><b>HOLA!SEVILLA</b><small>NOVAKEEPS S.L.</small></div><div><h1>Registro mensual de jornada</h1><p>月度工时签字表 · ${escapeHTML(monthLabel)}</p></div></header>
     <div class="report-meta"><span><b>Empleado / 员工：</b>${escapeHTML(employee.full_name)}</span><span><b>NIF：</b>${escapeHTML(employee.nif || '—')}</span><span><b>Periodo / 统计截止：</b>${escapeHTML(month)}-01 — ${escapeHTML(reportEnd)}</span></div>
-    <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Fichajes<br><small>实际打卡时间</small></th><th>Horas efectivas<br><small>有效工时</small></th><th>Incidencias / 备注</th></tr></thead><tbody>${rowHtml}</tbody></table>
+    <div class="report-calendar"><div class="report-calendar-weekdays"><b>Lunes<br>星期一</b><b>Martes<br>星期二</b><b>Miércoles<br>星期三</b><b>Jueves<br>星期四</b><b>Viernes<br>星期五</b><b>Sábado<br>星期六</b><b>Domingo<br>星期天</b></div><div class="report-calendar-grid">${calendarHtml}</div></div>
     <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Días libres / 休息日</small><b>${dayOffDays}</b></span><span><small>Ausencias / 缺勤</small><b>${rows.filter((row) => row.absence && !row.sickLeave).length}</b></span><span><small>Baja médica / 病假</small><b>${sickLeaveDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Horas efectivas / 有效工时</small><b>${reportDuration(effectiveTotal)}</b></span><span class="${incidentCount ? 'alert' : ''}"><small>Incidencias / 异常</small><b>${incidentCount}</b></span></div>
     <p class="report-note">Solo se muestran los fichajes reales. Las horas efectivas parten de la duración del turno programado y descuentan la pausa registrada entre inicio y fin de pausa. Una pausa incompleta debe corregirse. Los retrasos y salidas anticipadas se mantienen como incidencias.<br>只显示员工实际打卡时间。有效工时以排班起止时间为基础，再减去“开始休息—结束休息”的实际时长；休息记录不完整时必须补正。迟到和早退仍保留为异常备注。</p>
     <div class="report-signatures"><div><span>Firma del trabajador / 员工签字</span><i></i><small>Fecha / 日期：________________</small></div><div><span>Firma de la empresa / 公司签字</span><i></i><small>Fecha / 日期：________________</small></div></div>
