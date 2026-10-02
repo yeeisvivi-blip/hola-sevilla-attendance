@@ -894,37 +894,15 @@ async function loadManagerData() {
   const results = [stores, employees, schedules, todaySchedules, requests, permissions, devices, attendance, todayAttendance, audits, photoEvents];
   assertQueryResults(results);
   const employeeById = new Map((employees.data || []).map((employee) => [employee.user_id, employee]));
-  const storeById = new Map((stores.data || []).map((store) => [store.id, store]));
   const attachEmployee = (items) => (items || []).map((item) => ({ ...item, profiles: employeeById.get(item.employee_id) || null }));
-  const liveEventsById = new Map();
-  [...(events.data || []), ...(managerEvents.error ? [] : managerEvents.data || [])].forEach((event) => {
-    if (!event?.id) return;
-    const store = event.stores || storeById.get(event.store_id) || (event.store_name ? { name: event.store_name } : null);
-    liveEventsById.set(event.id, { ...event, stores: store });
-  });
-  const liveEvents = attachEmployee([...liveEventsById.values()]);
+  const liveEvents = managerLiveEvents(
+    events.data || [],
+    managerEvents.error ? [] : managerEvents.data || [],
+    todayAttendance.data || [],
+    employees.data || [],
+    stores.data || [],
+  );
   if (managerEvents.error) console.warn('Manager live-event RPC unavailable:', managerEvents.error);
-  const liveEventKeys = new Set(liveEvents.map((event) => `${event.employee_id}:${event.event_type}`));
-  (todayAttendance.data || []).forEach((record) => {
-    ['clock_in', 'break_start', 'break_end', 'clock_out'].forEach((eventType) => {
-      const occurredAt = attendanceValue(record, 'actual', eventType);
-      const key = `${record.employee_id}:${eventType}`;
-      if (!occurredAt || liveEventKeys.has(key)) return;
-      liveEvents.push({
-        id: `daily-${record.employee_id}-${eventType}`,
-        employee_id: record.employee_id,
-        store_id: record.store_id,
-        event_type: eventType,
-        occurred_at: occurredAt,
-        source: record.source || 'daily',
-        metadata: {},
-        stores: storeById.get(record.store_id) || null,
-        profiles: employeeById.get(record.employee_id) || null,
-      });
-      liveEventKeys.add(key);
-    });
-  });
-  liveEvents.sort((a, b) => String(a.occurred_at).localeCompare(String(b.occurred_at)));
   state.data = {
     stores: stores.data || [],
     employees: employees.data || [],
@@ -1195,7 +1173,7 @@ function renderManagerHome() {
   return `${unhealthy.length ? `<div class="callout warning"><b>${L('系统版本未同步', 'Versión sin sincronizar')}</b><span>${L('以下后台需要重新部署：', 'Hay que volver a desplegar:')} ${unhealthy.map((item) => escapeHTML(item.name)).join('、')}</span></div>` : `<div class="callout"><b>${L('系统正常', 'Sistema correcto')}</b><span>${L('网页、数据库与三套后台服务连接正常。', 'La web, la base de datos y los tres servicios están conectados.')}</span></div>`}
   <div class="stat-grid"><article class="stat-card"><small>${L('在职员工', 'Empleados activos')}</small><b>${active.length}</b></article><article class="stat-card"><small>${L('今日已上班打卡', 'Entradas hoy')}</small><b id="todayPunchedCount">${punched.size}</b></article><article class="stat-card"><small>${L('待审批', 'Pendientes')}</small><b>${pending.length}</b></article><article class="stat-card"><small>${L('GPS未配置店铺', 'Tiendas sin GPS')}</small><b>${unconfigured.length}</b></article></div>
   ${unconfigured.length ? `<div class="callout warning"><b>${L('上线前必须完成', 'Pendiente antes de publicar')}</b><span>${L('请在“店铺设置”中填写四店准确地址、经纬度和有效范围。未配置的店铺不能使用GPS打卡。', 'Completa dirección, coordenadas y radio de las cuatro tiendas. Sin ello no se permite el fichaje GPS.')}</span></div>` : ''}
-  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日员工打卡汇总', 'Resumen de fichajes de hoy')}</h2><p>${L('每12秒自动更新。按当天排班店铺分组，每名员工的上班、休息和下班记录集中在同一行。', 'Actualización automática cada 12 segundos. Agrupado por tienda; todos los fichajes de cada empleado aparecen en una sola fila.')}</p></div><span class="status ok">Europe/Madrid</span></div><div id="todayAttendanceLive">${todayAttendanceSummary(state.data.events)}</div></article>`;
+  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日员工打卡汇总', 'Resumen de fichajes de hoy')}</h2><p>${L('保存修改后立即更新，并每5秒自动同步。按当天排班店铺分组，每名员工的生效时间集中在同一行。', 'Se actualiza al guardar y se sincroniza automáticamente cada 5 segundos. Agrupado por tienda con las horas vigentes de cada empleado.')}</p></div><span class="status ok">Europe/Madrid</span></div><div id="todayAttendanceLive">${todayAttendanceSummary(state.data.events)}</div></article>`;
 }
 
 function todayAttendanceRows(events = []) {
@@ -1249,9 +1227,11 @@ function todayAttendanceRows(events = []) {
     });
     if (!row.storeName && event.stores?.name) row.storeName = event.stores.name;
     if (event.source) row.sources.add(event.source);
+    if (event.corrected) row.sources.add('correction');
     const current = row.events[event.event_type];
     const keepLatest = event.event_type === 'break_end' || event.event_type === 'clock_out';
-    if (!current || (keepLatest ? event.occurred_at > current.occurred_at : event.occurred_at < current.occurred_at)) {
+    if (!current || event.corrected || (!current.corrected
+      && (keepLatest ? event.occurred_at > current.occurred_at : event.occurred_at < current.occurred_at))) {
       row.events[event.event_type] = event;
     }
   });
@@ -1300,7 +1280,8 @@ function todayAttendanceSummary(events) {
       const status = todayAttendanceStatus(row);
       const sources = [...row.sources].map((source) => source === 'kiosk'
         ? L('电脑', 'PC')
-        : source === 'daily' ? L('打卡记录', 'Registro') : source.toUpperCase()).join(' + ');
+        : source === 'daily' ? L('打卡记录', 'Registro')
+        : source === 'correction' ? L('已修改', 'Modificado') : source.toUpperCase()).join(' + ');
       const photos = photoButtons(row);
       return `<tr><td class="live-employee"><b>${escapeHTML(row.employeeName)}</b></td><td>${row.schedule ? `${timeText(row.schedule.starts_at)}—${timeText(row.schedule.ends_at)}` : `<span class="status alert">${L('无排班', 'Sin horario')}</span>`}</td><td>${timeCell(row.events.clock_in)}</td><td>${timeCell(row.events.break_start)}</td><td>${timeCell(row.events.break_end)}</td><td>${timeCell(row.events.clock_out)}</td><td><span class="status ${status.className}">${status.label}</span></td><td>${sources ? `<span class="status ${row.sources.has('gps') ? 'pending' : 'ok'}">${escapeHTML(sources)}</span>` : '—'}</td><td><div class="live-photo-actions">${photos || '—'}</div></td></tr>`;
     }).join('')}</tbody></table></div>
@@ -1314,34 +1295,50 @@ function mergeTodayAttendance(records) {
   state.data.attendance = [...records, ...otherDays].sort((a, b) => b.work_date.localeCompare(a.work_date));
 }
 
-function managerLiveEvents(directEvents, rpcEvents, dailyRecords) {
-  const employeeById = new Map((state.data.employees || []).map((employee) => [employee.user_id, employee]));
-  const storeById = new Map((state.data.stores || []).map((store) => [store.id, store]));
+function managerLiveEvents(directEvents, rpcEvents, dailyRecords, employees = state.data.employees || [], stores = state.data.stores || []) {
+  const employeeById = new Map(employees.map((employee) => [employee.user_id, employee]));
+  const storeById = new Map(stores.map((store) => [store.id, store]));
   const eventsById = new Map();
-  [...(directEvents || []), ...(rpcEvents || [])].forEach((event) => {
-    if (!event?.id) return;
+  [...(directEvents || []), ...(rpcEvents || [])].forEach((event, index) => {
+    if (!event?.employee_id || !event?.event_type || !event?.occurred_at) return;
     const store = event.stores || storeById.get(event.store_id) || (event.store_name ? { name: event.store_name } : null);
-    eventsById.set(event.id, { ...event, stores: store, profiles: employeeById.get(event.employee_id) || null });
+    const key = event.id || `${event.employee_id}:${event.event_type}:${event.occurred_at}:${index}`;
+    eventsById.set(key, { ...event, id: event.id || key, stores: store, profiles: employeeById.get(event.employee_id) || null });
   });
-  const events = [...eventsById.values()];
-  const eventKeys = new Set(events.map((event) => `${event.employee_id}:${event.event_type}`));
+  const rawEvents = [...eventsById.values()];
+  let events = [...rawEvents];
+  const eventTypes = ['clock_in', 'break_start', 'break_end', 'clock_out'];
   (dailyRecords || []).forEach((record) => {
-    ['clock_in', 'break_start', 'break_end', 'clock_out'].forEach((eventType) => {
-      const occurredAt = attendanceValue(record, 'actual', eventType);
+    const corrected = Boolean(record?.corrected && record?.correction_kind !== 'void');
+    const effectiveRecord = record?.correction_kind === 'absence'
+      ? { clock_in: null, break_start: null, break_end: null, clock_out: null }
+      : effectiveAttendance(record);
+    if (corrected) {
+      events = events.filter((event) => event.employee_id !== record.employee_id || !eventTypes.includes(event.event_type));
+    }
+    eventTypes.forEach((eventType) => {
+      const occurredAt = effectiveRecord[eventType];
       const key = `${record.employee_id}:${eventType}`;
-      if (!occurredAt || eventKeys.has(key)) return;
+      if (!occurredAt || (!corrected && events.some((event) => `${event.employee_id}:${event.event_type}` === key))) return;
+      const rawCandidates = rawEvents.filter((event) => event.employee_id === record.employee_id && event.event_type === eventType);
+      const keepLatest = eventType === 'break_end' || eventType === 'clock_out';
+      const rawEvent = rawCandidates.sort((a, b) => keepLatest
+        ? String(b.occurred_at).localeCompare(String(a.occurred_at))
+        : String(a.occurred_at).localeCompare(String(b.occurred_at)))[0];
+      const storeId = rawEvent?.store_id || record.store_id;
       events.push({
-        id: `daily-${record.employee_id}-${eventType}`,
+        ...(rawEvent || {}),
+        id: rawEvent?.id || `daily-${record.employee_id}-${eventType}`,
         employee_id: record.employee_id,
-        store_id: record.store_id,
+        store_id: storeId,
         event_type: eventType,
         occurred_at: occurredAt,
-        source: record.source || 'daily',
-        metadata: {},
-        stores: storeById.get(record.store_id) || null,
+        source: rawEvent?.source || record.source || 'daily',
+        metadata: rawEvent?.metadata || {},
+        corrected,
+        stores: rawEvent?.stores || storeById.get(storeId) || null,
         profiles: employeeById.get(record.employee_id) || null,
       });
-      eventKeys.add(key);
     });
   });
   return events.sort((a, b) => String(a.occurred_at).localeCompare(String(b.occurred_at)));
@@ -1783,7 +1780,11 @@ function bindPortal() {
   $('#languageToggle')?.addEventListener('click', () => setLang(state.lang === 'zh' ? 'es' : 'zh'));
   $('#logout')?.addEventListener('click', logout);
   $('#refreshData')?.addEventListener('click', refreshPortal);
-  $$('[data-view]').forEach((button) => button.addEventListener('click', () => { state.view = button.dataset.view; renderPortal(); }));
+  $$('[data-view]').forEach((button) => button.addEventListener('click', () => {
+    state.view = button.dataset.view;
+    renderPortal();
+    if (state.profile?.role === 'manager' && state.view === 'home') refreshManagerLiveSnapshot();
+  }));
   $('#requestForm')?.addEventListener('submit', submitRequest);
   $$('[data-request-missed]').forEach((button) => button.addEventListener('click', () => {
     state.view = 'requests';
@@ -2585,7 +2586,7 @@ function renderCurrent() {
 async function initialize() {
   document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : 'es';
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js?v=20261001-3').then((registration) => registration.update()).catch(() => {});
+    navigator.serviceWorker.register('./sw.js?v=20261002-11').then((registration) => registration.update()).catch(() => {});
   }
   if (!configured) { renderConfigurationError(); return; }
   try {
@@ -2630,7 +2631,7 @@ setInterval(() => {
   if (document.visibilityState === 'visible' && state.profile?.role === 'manager' && state.view === 'home') {
     refreshManagerLiveSnapshot();
   }
-}, 12_000);
+}, 5_000);
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.profile?.role === 'manager' && state.view === 'home') {
