@@ -231,6 +231,8 @@ tr:last-child td { border-bottom: 0; }
 .report-calendar-day.sick-leave { background: #faeefb; }
 .report-calendar-day.annual-leave { background: #eef0ff; }
 .report-calendar-day.pending { background: #fff8e8; }
+.report-calendar-day.today { position: relative; z-index: 1; box-shadow: inset 0 0 0 2px #d18413; }
+.report-calendar-day.today .report-calendar-date > b { color: #8d5100; }
 .report-calendar-date { display: flex; justify-content: space-between; gap: 3px; align-items: center; }
 .report-calendar-date b { font-size: 12px; }
 .report-calendar-date strong { font-size: 7px; text-align: right; }
@@ -343,7 +345,7 @@ tr:last-child td { border-bottom: 0; }
 .attendance-calendar-button:hover,.attendance-calendar-button:focus-visible { outline: 2px solid #1f654d; outline-offset: 1px; }
 .attendance-calendar-button.worked { color: #176249; background: #dcf1e5; }
 .attendance-calendar-button.day-off,.attendance-calendar-button.unscheduled { color: #68736d; background: #edf1ee; }
-.attendance-calendar-button.absence,.attendance-calendar-button.missing { color: #9d3833; background: #fae1df; }
+.attendance-calendar-button.absence,.attendance-calendar-button.missing,.attendance-calendar-button.incident { color: #9d3833; background: #fae1df; }
 .attendance-calendar-button.sick-leave { color: #793c86; background: #f2e2f5; }
 .attendance-calendar-button.annual-leave { color: #374a95; background: #e6eaff; }
 .attendance-calendar-button.pending { color: #8a5c0d; background: #fff0c9; }
@@ -367,13 +369,16 @@ tr:last-child td { border-bottom: 0; }
 .attendance-month-day.worked { background: #eef9f2; }
 .attendance-month-day.worked .attendance-month-date { background: #176249; }
 .attendance-month-day.day-off,.attendance-month-day.unscheduled { background: #f1f3f1; }
-.attendance-month-day.absence,.attendance-month-day.missing { background: #fff0ef; }
-.attendance-month-day.absence .attendance-month-date,.attendance-month-day.missing .attendance-month-date { background: #a33d36; }
+.attendance-month-day.absence,.attendance-month-day.missing,.attendance-month-day.incident { background: #fff0ef; }
+.attendance-month-day.absence .attendance-month-date,.attendance-month-day.missing .attendance-month-date,.attendance-month-day.incident .attendance-month-date { background: #a33d36; }
 .attendance-month-day.sick-leave { background: #f9eefb; }
 .attendance-month-day.sick-leave .attendance-month-date { background: #793c86; }
 .attendance-month-day.annual-leave { background: #eef0ff; }
 .attendance-month-day.annual-leave .attendance-month-date { background: #4457a6; }
 .attendance-month-day.pending,.attendance-month-day.corrected { background: #fff8e8; }
+.attendance-month-day.today { position: relative; z-index: 1; box-shadow: inset 0 0 0 3px #d18413; }
+.attendance-month-day.today .attendance-month-date { color: #3c2900; background: #ffc95c; }
+.attendance-today-label { position: absolute; top: 9px; right: 9px; padding: 3px 7px; border-radius: 999px; color: #6b3d00; background: #ffe5a8; font-size: 9px !important; font-weight: 900; }
 .edit-dialog .modal-head { margin-bottom: 20px; }
 .save-status { color: #843424; white-space: normal; overflow-wrap: anywhere; }
 .save-status:empty { display:none; }
