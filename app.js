@@ -956,6 +956,28 @@ function scheduleKind(item) {
 
 const SICK_LEAVE_MARKER = '[SICK_LEAVE]';
 
+const CORRECTION_REASON_PRESETS = Object.freeze({
+  missed_punch: { zh: '员工忘记打卡', es: 'La persona trabajadora olvidó fichar.' },
+  approved_request: { zh: '根据已批准的员工补卡申请修正', es: 'Corrección realizada conforme a la solicitud de fichaje aprobada.' },
+  system_error: { zh: '打卡系统无法完成操作', es: 'El sistema de fichaje no permitió completar la operación.' },
+  wrong_time: { zh: '原打卡时间与实际情况不符', es: 'La hora registrada no coincide con la hora real.' },
+  early_departure: { zh: '员工实际提前离开店铺', es: 'La persona trabajadora salió de la tienda antes de la hora prevista.' },
+  verified: { zh: '管理员核对排班及记录后修正', es: 'Corrección realizada por la administración tras verificar el horario y los registros.' },
+  absence: { zh: '员工当天缺勤', es: 'La persona trabajadora estuvo ausente ese día.' },
+  sick_leave: { zh: '员工当天病假', es: 'La persona trabajadora estuvo de baja médica ese día.' },
+});
+
+function splitBilingualReason(value) {
+  const cleaned = String(value || '').replace(SICK_LEAVE_MARKER, '').trim();
+  const bilingual = cleaned.match(/^\s*中文[：:]\s*([\s\S]*?)\s*\n\s*(?:Español|ES)[\s:：]+([\s\S]*)$/i);
+  if (bilingual) return { zh: bilingual[1].trim(), es: bilingual[2].trim() };
+  return /[\u3400-\u9fff]/.test(cleaned) ? { zh: cleaned, es: '' } : { zh: '', es: cleaned };
+}
+
+function bilingualReason(zh, es) {
+  return `中文：${String(zh || '').trim()}\nEspañol: ${String(es || '').trim()}`;
+}
+
 function isSickLeaveRecord(item) {
   if (item?.correction_kind !== 'absence') return false;
   const reason = String(item.correction_reason || '');
@@ -1384,9 +1406,18 @@ function openCorrectionDialog(employeeId, date) {
     <label>${L('处理类型','Tipo')}<select id="correctionKind"><option value="attendance">${L('补充／修正打卡','Corregir fichajes')}</option><option value="sick_leave">${L('病假','Baja médica')}</option><option value="absence">${L('缺勤','Ausencia')}</option></select></label>
     <p id="correctionLoadStatus" role="status"></p><button id="loadCorrection" type="button" class="ghost-btn">${L('重新载入','Recargar')}</button>
     <div id="correctionTimeFields"><div class="form-row"><label>${L('上班','Entrada')}<input id="correctionClockIn" type="time"></label><label>${L('下班','Salida')}<input id="correctionClockOut" type="time"></label></div><div class="form-row"><label>${L('开始休息','Inicio pausa')}<input id="correctionBreakStart" type="time"></label><label>${L('结束休息','Fin pausa')}<input id="correctionBreakEnd" type="time"></label></div></div>
-    <label>${L('修改原因','Motivo del cambio')}<textarea id="correctionReason" minlength="5" required placeholder="${L('请说明本次修改原因','Indica el motivo de este cambio')}"></textarea></label><p id="correctionSaveStatus" class="save-status" role="status"></p><button class="primary-btn" type="submit" disabled>${L('保存修改','Guardar cambios')}</button></form>`);
+    <label>${L('常用修改原因（自动双语）','Motivo habitual (bilingüe automático)')}<select id="correctionReasonPreset"><option value="">${L('自定义原因','Motivo personalizado')}</option><option value="missed_punch">${L('忘记打卡','Olvido de fichaje')}</option><option value="approved_request">${L('已批准的补卡申请','Solicitud de fichaje aprobada')}</option><option value="system_error">${L('打卡系统无法操作','Error del sistema de fichaje')}</option><option value="wrong_time">${L('记录时间与实际不符','Hora registrada incorrecta')}</option><option value="early_departure">${L('实际提前离店','Salida anticipada real')}</option><option value="verified">${L('核对排班及记录后修正','Corrección tras verificación')}</option><option value="absence">${L('缺勤','Ausencia')}</option><option value="sick_leave">${L('病假','Baja médica')}</option></select></label>
+    <p>${L('常用原因会自动填写中文和西班牙语；自定义原因请同时填写两种语言。','Los motivos habituales completan automáticamente chino y español. Para un motivo personalizado, completa ambos idiomas.')}</p>
+    <label>中文·修改原因<textarea id="correctionReasonZh" minlength="2" required placeholder="请用中文说明修改原因"></textarea></label>
+    <label>Español · Motivo del cambio<textarea id="correctionReasonEs" minlength="5" required placeholder="Indica el motivo de la corrección en español"></textarea></label><p id="correctionSaveStatus" class="save-status" role="status"></p><button class="primary-btn" type="submit" disabled>${L('保存双语修改','Guardar corrección bilingüe')}</button></form>`);
   $('#correctionForm').addEventListener('submit',saveCorrection);
   $('#correctionKind').addEventListener('change',toggleCorrectionFields);
+  $('#correctionReasonPreset').addEventListener('change', (event) => {
+    const preset = CORRECTION_REASON_PRESETS[event.currentTarget.value];
+    if (!preset) return;
+    $('#correctionReasonZh').value = preset.zh;
+    $('#correctionReasonEs').value = preset.es;
+  });
   $('#loadCorrection').onclick = () => {
     if($('#modalRoot').dataset.dirty === 'true' && !confirm(L('重新载入会替换当前填写内容，继续？','La recarga sustituye los datos del formulario. ¿Continuar?'))) return;
     loadCorrectionRecord();
@@ -2001,13 +2032,18 @@ async function loadCorrectionRecord() {
   const fields = ['correctionClockIn', 'correctionBreakStart', 'correctionBreakEnd', 'correctionClockOut'];
   submit.disabled = true;
   fields.forEach((id) => { $('#' + id).value = ''; $('#' + id).disabled = true; });
-  $('#correctionReason').value = '';
+  $('#correctionReasonPreset').value = '';
+  $('#correctionReasonZh').value = '';
+  $('#correctionReasonEs').value = '';
   status.textContent = L('正在载入最新记录…', 'Cargando registro actual…');
   try {
     const result = await client.from('attendance_daily').select('*').eq('employee_id', employeeId).eq('work_date', workDate).abortSignal(AbortSignal.timeout(8000)).maybeSingle();
     if (sequence !== correctionLoadSequence || !form.isConnected) return;
     if (result.error) throw result.error;
     const record = result.data;
+    const existingReason = splitBilingualReason(record?.correction_reason);
+    $('#correctionReasonZh').value = existingReason.zh;
+    $('#correctionReasonEs').value = existingReason.es;
     $('#correctionKind').value = isSickLeaveRecord(record) ? 'sick_leave' : record?.correction_kind === 'absence' ? 'absence' : 'attendance';
     toggleCorrectionFields();
     ['clock_in', 'break_start', 'break_end', 'clock_out'].forEach((key, index) => {
@@ -2057,6 +2093,12 @@ async function saveCorrection(event) {
   if (suppliedTimes.some((value, index) => index > 0 && value <= suppliedTimes[index - 1])) {
     toast(errorText('INVALID_TIME_RANGE'), true); return;
   }
+  const reasonZh = $('#correctionReasonZh').value.trim();
+  const reasonEs = $('#correctionReasonEs').value.trim();
+  if (reasonZh.length < 2 || reasonEs.length < 5) {
+    toast(L('修改原因必须同时填写中文和西班牙语', 'El motivo debe estar escrito en chino y en español'), true); return;
+  }
+  const reason = bilingualReason(reasonZh, reasonEs);
   if (button.disabled) return;
   await editorSave(form,'#correctionSaveStatus',{
     action:'correct_attendance',correctionKind:backendCorrectionKind,employeeId,workDate:date,
@@ -2064,7 +2106,7 @@ async function saveCorrection(event) {
     breakStart:backendCorrectionKind === 'absence' ? null : iso('#correctionBreakStart'),
     breakEnd:backendCorrectionKind === 'absence' ? null : iso('#correctionBreakEnd'),
     clockOut:backendCorrectionKind === 'absence' ? null : iso('#correctionClockOut'),
-    reason:correctionKind === 'sick_leave' ? `${SICK_LEAVE_MARKER} ${$('#correctionReason').value}` : $('#correctionReason').value,
+    reason:correctionKind === 'sick_leave' ? `${SICK_LEAVE_MARKER} ${reason}` : reason,
   },L('考勤修改已保存','Corrección guardada'));
 }
 
