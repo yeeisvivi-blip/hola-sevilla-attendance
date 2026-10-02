@@ -316,6 +316,25 @@ tr:last-child td { border-bottom: 0; }
 .calendar-day.day_off { background: #f0f3ef; }
 .calendar-day.annual_leave { background: #fff3d8; border-color: #e4c880; }
 .calendar-day.empty { background: #fafbf9; border-style: dashed; }
+.attendance-calendar-wrap { margin-top: 18px; overflow: auto; max-height: min(68vh, 720px); border: 1px solid var(--line); border-radius: 14px; background: white; }
+.attendance-calendar-table { width: max-content; min-width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; }
+.attendance-calendar-table th,.attendance-calendar-table td { height: 46px; padding: 4px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); text-align: center; }
+.attendance-calendar-table thead th { position: sticky; top: 0; z-index: 3; background: #f2f6f3; }
+.attendance-employee-head,.attendance-employee-cell { position: sticky; left: 0; z-index: 2; width: 190px; min-width: 190px; max-width: 190px; padding: 8px 10px !important; text-align: left !important; background: #fffefa; }
+.attendance-calendar-table thead .attendance-employee-head { z-index: 4; background: #eaf2ed; }
+.attendance-employee-cell b,.attendance-employee-cell small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attendance-employee-cell small { margin-top: 3px; color: var(--muted); font-size: 10px; font-weight: 600; }
+.attendance-day-head,.attendance-day-cell { width: 38px; min-width: 38px; max-width: 38px; }
+.attendance-calendar-button { width: 31px; height: 31px; padding: 0; border: 1px solid transparent; border-radius: 9px; font-size: 11px; font-weight: 900; }
+.attendance-calendar-button:hover,.attendance-calendar-button:focus-visible { outline: 2px solid #1f654d; outline-offset: 1px; }
+.attendance-calendar-button.worked { color: #176249; background: #dcf1e5; }
+.attendance-calendar-button.day-off,.attendance-calendar-button.unscheduled { color: #68736d; background: #edf1ee; }
+.attendance-calendar-button.absence,.attendance-calendar-button.missing { color: #9d3833; background: #fae1df; }
+.attendance-calendar-button.sick-leave { color: #793c86; background: #f2e2f5; }
+.attendance-calendar-button.annual-leave { color: #374a95; background: #e6eaff; }
+.attendance-calendar-button.pending { color: #8a5c0d; background: #fff0c9; }
+.attendance-calendar-button.corrected { color: #185a74; background: #dff1f7; }
+.attendance-calendar-table .outside-month { color: #b8bfbb; background: #f8f9f7; }
 .edit-dialog .modal-head { margin-bottom: 20px; }
 .save-status { color: #843424; white-space: normal; overflow-wrap: anywhere; }
 .save-status:empty { display:none; }

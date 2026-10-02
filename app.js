@@ -1441,12 +1441,61 @@ function filteredAttendance() {
   return attendanceRowsForView().filter(item => !state.attendanceEmployeeId || item.employee_id === state.attendanceEmployeeId);
 }
 
+function attendanceCalendarCell(item) {
+  if (!item) return { className: 'unscheduled', short: '—', label: L('未排班', 'Sin horario') };
+  if (isSickLeaveRecord(item)) return { className: 'sick-leave', short: L('病', 'B'), label: L('病假', 'Baja médica') };
+  if (item.correction_kind === 'absence') return { className: 'absence', short: L('缺', 'A'), label: L('缺勤', 'Ausencia') };
+  if (item.display_schedule_kind === 'annual_leave') return { className: 'annual-leave', short: L('年', 'V'), label: L('年假', 'Vacaciones') };
+  if (item.display_schedule_kind === 'day_off') return { className: 'day-off', short: L('休', 'L'), label: L('休息日', 'Día libre') };
+  const hasPunch = ['clock_in', 'break_start', 'break_end', 'clock_out']
+    .some((field) => Boolean(attendanceValue(item, 'actual', field)));
+  if (item.display_schedule_kind === 'work' && !hasPunch) {
+    return item.work_date > madridDate()
+      ? { className: 'pending', short: L('待', 'P'), label: L('工作日 · 待打卡', 'Laborable · Pendiente') }
+      : { className: 'missing', short: L('未', 'SF'), label: L('工作日 · 未打卡', 'Laborable · Sin fichajes') };
+  }
+  if (item.corrected) return { className: 'corrected', short: L('改', 'C'), label: L('工作日 · 已修正', 'Laborable · Corregido') };
+  if (hasPunch) return { className: 'worked', short: L('工', 'T'), label: L('工作日', 'Día laborable') };
+  return { className: 'unscheduled', short: '—', label: L('未排班', 'Sin horario') };
+}
+
+function monthlyAttendanceCalendar(items) {
+  const month = state.attendanceMonth || madridDate().slice(0, 7);
+  const validDays = monthDates(month).length;
+  const employeeById = new Map((state.data.employees || []).map((employee) => [employee.user_id, employee]));
+  const employeeIds = [...new Set(items.map((item) => item.employee_id))];
+  const rowsByKey = new Map(items.map((item) => [`${item.employee_id}:${item.work_date}`, item]));
+  const days = Array.from({ length: 31 }, (_, index) => index + 1);
+  if (!employeeIds.length) return `<div class="empty">${L('暂无考勤记录', 'No hay registros')}</div>`;
+  const header = days.map((day) => `<th class="attendance-day-head ${day > validDays ? 'outside-month' : ''}">${day}</th>`).join('');
+  const body = employeeIds.map((employeeId) => {
+    const employee = employeeById.get(employeeId);
+    const fallback = items.find((item) => item.employee_id === employeeId);
+    const name = employee?.full_name || fallback?.employee_name || '';
+    const nif = employee?.nif || '';
+    const cells = days.map((day) => {
+      if (day > validDays) return '<td class="attendance-day-cell outside-month">—</td>';
+      const date = `${month}-${String(day).padStart(2, '0')}`;
+      const item = rowsByKey.get(`${employeeId}:${date}`);
+      const status = attendanceCalendarCell(item);
+      const actualIn = timeText(attendanceValue(item, 'actual', 'clock_in'));
+      const actualOut = timeText(attendanceValue(item, 'actual', 'clock_out'));
+      const detail = `${date} · ${status.label}${item?.store_name ? ` · ${item.store_name}` : ''}${actualIn !== '—' || actualOut !== '—' ? ` · ${actualIn}–${actualOut}` : ''}`;
+      return `<td class="attendance-day-cell"><button type="button" class="attendance-calendar-button ${status.className}" data-calendar-correct="${escapeHTML(employeeId)}" data-work-date="${date}" title="${escapeHTML(detail)}" aria-label="${escapeHTML(`${name} ${detail}`)}"><b>${status.short}</b></button></td>`;
+    }).join('');
+    return `<tr><th class="attendance-employee-cell"><b>${escapeHTML(name)}</b><small>${escapeHTML(nif || L('无NIF', 'Sin NIF'))}</small></th>${cells}</tr>`;
+  }).join('');
+  return `<div class="attendance-calendar-wrap"><table class="attendance-calendar-table"><thead><tr><th class="attendance-employee-head">${L('员工 / NIF', 'Empleado / NIF')}</th>${header}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
 function renderExport() {
   const month = state.attendanceMonth || madridDate().slice(0,7);
+  const attendanceItems = filteredAttendance();
   return `<article class="card"><div class="section-head"><div><h2>${L('整月考勤日历','Calendario mensual de jornada')}</h2><p>${L('当月每天均显示工作日、休息日、缺勤、病假和年假；没有打卡也不会漏掉。','Cada día del mes muestra jornada laboral, descanso, ausencia, baja médica o vacaciones, incluso sin fichajes.')}</p></div><button class="primary-btn" type="button" id="newCorrection">${L('补充记录','Añadir registro')}</button></div>
     <form id="monthlyReportForm" class="report-controls"><label>${L('月份','Mes')}<input id="reportMonth" type="month" min="${SCHEDULE_START_MONTH}" max="${madridDate().slice(0,7)}" value="${month}" required></label><label>${L('员工','Empleado')}<select id="reportEmployee"><option value="">${L('全部员工','Todos')}</option>${employeeOptions(false,state.attendanceEmployeeId)}</select></label><div class="form-actions"><button class="secondary-btn" id="previewEmployeeReport" type="submit">${L('打印签字表','Imprimir registro')}</button><button class="ghost-btn" id="exportCsv" type="button">${L('下载CSV','Descargar CSV')}</button></div></form>
-    <div class="button-row attendance-legend"><span class="status ok">${L('工作日','Día laborable')}</span><span class="status">${L('休息日','Día libre')}</span><span class="status alert">${L('缺勤','Ausencia')}</span><span class="status sick-leave">${L('病假','Baja médica')}</span><span class="status annual-leave">${L('年假','Vacaciones')}</span></div>
-    ${attendanceTable(filteredAttendance(),true,true)}</article>
+    <div class="button-row attendance-legend"><span class="status ok">${L('工：工作日','T: trabajado')}</span><span class="status">${L('休：休息日','L: libre')}</span><span class="status alert">${L('缺：缺勤','A: ausencia')}</span><span class="status sick-leave">${L('病：病假','B: baja médica')}</span><span class="status annual-leave">${L('年：年假','V: vacaciones')}</span><span class="status pending">${L('待：待打卡','P: pendiente')}</span><span class="status alert">${L('未：未打卡','SF: sin fichajes')}</span></div>
+    ${monthlyAttendanceCalendar(attendanceItems)}</article>
+      <details class="card compact-details"><summary>${L('查看每日详细时间与修改历史','Ver horas diarias y correcciones')}</summary>${attendanceTable(attendanceItems,true,true)}</details>
       <details class="card compact-details"><summary>${L('打卡照片', 'Fotos de fichaje')}</summary><p>${L('只有上班和下班打卡拍照。点击“查看照片”时生成短时有效链接，照片不会下载到店铺电脑。', 'Solo se fotografían la entrada y la salida. “Ver foto” crea un enlace temporal; la foto no se descarga en el ordenador de tienda.')}</p>${eventTable(state.data.photoEvents || [])}</details>
   <details class="card compact-details"><summary>${L('修改历史', 'Historial de cambios')}</summary>${auditTable()}</details>
     <details class="card compact-details"><summary>${L('连接检查','Comprobar conexión')}</summary><p>${L('保存异常时检查后台服务。','Comprueba el servidor si falla un guardado.')}</p><button id="checkAdminConnection" type="button" class="secondary-btn">${L('检查后台连接','Comprobar servidor')}</button><pre id="connectionResult" role="status"></pre></details>`;
@@ -1670,6 +1719,7 @@ function bindPortal() {
   $('#monthlyReportForm')?.addEventListener('submit', (event) => generateMonthlyReports(event, !$('#reportEmployee').value));
   $('#previewAllReports')?.addEventListener('click', (event) => generateMonthlyReports(event, true));
   $('#newCorrection')?.addEventListener('click', () => openCorrectionDialog());
+  $$('[data-calendar-correct]').forEach(button => button.addEventListener('click', () => openCorrectionDialog(button.dataset.calendarCorrect, button.dataset.workDate)));
   $$('[data-edit-attendance]').forEach(button => button.addEventListener('click', () => openCorrectionDialog(button.dataset.editAttendance,button.dataset.workDate)));
   $$('[data-void-attendance]').forEach(button => button.addEventListener('click', () => openVoidCorrectionDialog(button.dataset.voidAttendance,button.dataset.workDate)));
   $('#reportEmployee')?.addEventListener('change', event => { state.attendanceEmployeeId = event.target.value; renderPortal(); });
