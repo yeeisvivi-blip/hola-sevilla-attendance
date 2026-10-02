@@ -113,9 +113,6 @@ tr:last-child td { border-bottom: 0; }
 .status.rejected, .status.alert { color: #9d3833; background: #fae3e1; }
 .status.annual-leave { color: #3d4f96; background: #e8ebff; }
 .status.sick-leave { color: #7b3f88; background: #f3e5f5; }
-.dual-time { display: grid; gap: 4px; min-width: 104px; }
-.dual-time span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; white-space: nowrap; }
-.dual-time small { color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; }
 .live-store-list { display: grid; gap: 16px; margin-top: 18px; }
 .live-store-group { overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: #fff; }
 .live-store-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 16px; color: white; background: var(--green); }
@@ -217,13 +214,13 @@ tr:last-child td { border-bottom: 0; }
 .report-table { min-width: 0; table-layout: fixed; border: 1px solid #89928e; }
 .report-table th, .report-table td { padding: 3px 4px; border: 1px solid #aeb5b1; color: #111; font-size: 8px; line-height: 1.15; }
 .report-table th { color: #263b33; background: #edf3f0; text-transform: none; letter-spacing: 0; }
-.report-table th:nth-child(1) { width: 7%; }
-.report-table th:nth-child(2) { width: 12%; }
-.report-table th:nth-child(n+3):nth-child(-n+6) { width: 7.2%; }
-.report-table th:nth-child(n+7):nth-child(-n+9) { width: 6.8%; }
-.report-table th:last-child { width: 23%; }
+.report-table th:nth-child(1) { width: 9%; }
+.report-table th:nth-child(2) { width: 14%; }
+.report-table th:nth-child(3) { width: 22%; }
+.report-table th:nth-child(4) { width: 12%; }
+.report-table th:last-child { width: 43%; }
 .report-table .report-incident td { background: #fff1e8; }
-.report-totals { display: grid; grid-template-columns: repeat(6, 1fr); margin-top: 8px; border: 1px solid #aeb5b1; }
+.report-totals { display: grid; grid-template-columns: repeat(7, 1fr); margin-top: 8px; border: 1px solid #aeb5b1; }
 .report-totals span { padding: 6px 8px; border-right: 1px solid #aeb5b1; }
 .report-totals span:last-child { border: 0; }
 .report-totals small, .report-totals b { display: block; }
