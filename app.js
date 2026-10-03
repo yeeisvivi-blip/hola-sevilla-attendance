@@ -15,7 +15,7 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
-const BUILD_VERSION = '20261003-restore1';
+const BUILD_VERSION = '20261003-restore2';
 
 function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
@@ -247,7 +247,7 @@ function dateText(value) {
 }
 
 function attendanceSchedule(item) {
-  return (state.data.schedules || []).find((schedule) => schedule.employee_id === item?.employee_id
+  return item?.display_schedule || (state.data.schedules || []).find((schedule) => schedule.employee_id === item?.employee_id
     && schedule.work_date === item?.work_date && scheduleKind(schedule) === 'work') || null;
 }
 
@@ -303,6 +303,14 @@ function monthLastDate(monthString) {
   const [year, month] = String(monthString).split('-').map(Number);
   if (!year || month < 1 || month > 12) return '';
   return new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+}
+
+function monthDates(monthString) {
+  const lastDate = monthLastDate(monthString);
+  if (!lastDate) return [];
+  const dates = [];
+  for (let date = `${monthString}-01`; date <= lastDate; date = addDays(date, 1)) dates.push(date);
+  return dates;
 }
 
 function currentScheduleMonth() {
@@ -758,13 +766,13 @@ async function checkSystemHealth() {
 async function loadEmployeeData() {
   const today = madridDate();
   const monthStart = `${today.slice(0, 7)}-01`;
-  const scheduleStart = monthStart < addDays(today, -7) ? monthStart : addDays(today, -7);
+  const scheduleEnd = monthLastDate(today.slice(0, 7)) > addDays(today, 14) ? monthLastDate(today.slice(0, 7)) : addDays(today, 14);
   const now = new Date().toISOString();
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const [stores, schedules, attendance, requests, permissions, todayEvents] = await Promise.all([
     client.from('stores').select('*').eq('active', true).order('name'),
-    client.from('schedules').select('*, stores(name,address)').gte('work_date', scheduleStart).lte('work_date', addDays(today, 14)).order('work_date'),
+    client.from('schedules').select('*, stores(name,address)').gte('work_date', monthStart).lte('work_date', scheduleEnd).order('work_date'),
     client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(50),
     client.from('gps_permissions').select('*, stores(name,address,latitude,longitude,radius_m)').eq('active', true).lte('valid_from', now).gte('valid_until', now).order('valid_until'),
@@ -937,6 +945,7 @@ function renderGpsCard(permission, record) {
 
 function scheduleKind(item) {
   if (item?.schedule_kind === 'annual_leave') return 'annual_leave';
+  if (['sick_leave', 'sick', 'medical_leave'].includes(item?.schedule_kind)) return 'sick_leave';
   return item?.is_day_off ? 'day_off' : 'work';
 }
 
@@ -946,12 +955,65 @@ function scheduleTable(items, showEmployee = true, editable = false) {
 }
 
 function renderRecords() {
-  return `<article class="card"><div class="section-head"><div><p class="eyebrow">OFFICIAL RECORDS</p><h2>${L('本月考勤记录', 'Registros de este mes')}</h2></div></div>${attendanceTable(state.data.attendance, false)}</article>`;
+  const month = madridDate().slice(0, 7);
+  return `<article class="card"><div class="section-head"><div><p class="eyebrow">OFFICIAL RECORDS</p><h2>${L('本月完整考勤', 'Registro completo del mes')}</h2><p>${L('显示本月1日至月底；没有打卡的日期也会保留。', 'Se muestran todos los días del mes, incluso los días sin fichajes.')}</p></div><span class="status ok">${escapeHTML(month)}</span></div>${attendanceTable(calendarAttendanceRows(month, state.profile.user_id), false)}</article>`;
+}
+
+function calendarAttendanceRows(month, selectedEmployeeId = '') {
+  const dates = monthDates(month);
+  const attendance = state.data.attendance || [];
+  const schedules = state.data.schedules || [];
+  const employees = state.profile?.role === 'employee'
+    ? [state.profile]
+    : (state.data.employees || []).filter((employee) => !selectedEmployeeId || employee.user_id === selectedEmployeeId);
+  const attendanceByDay = new Map(attendance.map((item) => [`${item.employee_id}::${item.work_date}`, item]));
+  const scheduleByDay = new Map(schedules.filter((item) => item.published !== false).map((item) => [`${item.employee_id}::${item.work_date}`, item]));
+
+  return employees.flatMap((employee) => dates.map((workDate) => {
+    const key = `${employee.user_id}::${workDate}`;
+    const record = attendanceByDay.get(key) || {};
+    const schedule = scheduleByDay.get(key) || null;
+    return {
+      ...record,
+      employee_id: employee.user_id,
+      employee_name: record.employee_name || employee.full_name || '',
+      employee_no: record.employee_no || employee.employee_no || '',
+      work_date: workDate,
+      store_name: record.store_name || schedule?.stores?.name || '',
+      display_schedule: schedule,
+      calendar_only: !attendanceByDay.has(key),
+    };
+  }));
+}
+
+function attendanceStatus(item) {
+  const schedule = item.display_schedule || attendanceSchedule(item);
+  const kind = scheduleKind(schedule);
+  const hasPunch = Boolean(item.clock_in || item.break_start || item.break_end || item.clock_out);
+  const today = madridDate();
+  if (['sick_leave', 'sick', 'medical_leave'].includes(item.correction_kind) || kind === 'sick_leave') {
+    return { label: L('病假', 'Baja médica'), className: 'pending', zeroHours: true };
+  }
+  if (item.correction_kind === 'absence' || (schedule && kind === 'work' && item.work_date < today && !hasPunch)) {
+    return { label: L('缺勤', 'Ausencia'), className: 'alert', zeroHours: true };
+  }
+  if (kind === 'annual_leave') return { label: L('年假', 'Vacaciones'), className: 'annual-leave', zeroHours: true };
+  if (kind === 'day_off') return { label: L('休息日', 'Día libre'), className: '', zeroHours: true };
+  if (schedule && kind === 'work') {
+    return { label: hasPunch ? L('工作日', 'Día trabajado') : L('工作日 · 待打卡', 'Día laboral · pendiente'), className: hasPunch ? 'ok' : 'pending' };
+  }
+  if (hasPunch) return { label: L('工作日', 'Día trabajado'), className: item.corrected ? 'pending' : 'ok' };
+  return { label: L('未排班', 'Sin horario'), className: '' };
 }
 
 function attendanceTable(items, showEmployee = true, editable = false) {
   if (!items.length) return `<div class="empty">${L('暂无考勤记录', 'No hay registros')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th><th>${L('状态', 'Estado')}</th>${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${item.correction_kind === 'absence' ? '0h 00m' : shiftDurationText(item)}</td><td><span class="status ${item.correction_kind === 'absence' ? 'alert' : item.corrected ? 'pending' : 'ok'}">${item.correction_kind === 'absence' ? L('缺勤', 'Ausencia') : item.corrected ? L('已审计修正', 'Corregido') : L('原始记录', 'Original')}</span></td>${editable ? `<td><div class="button-row"><button type="button" class="ghost-btn" data-edit-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${item.corrected ? L('再次修改', 'Volver a corregir') : L('修改', 'Corregir')}</button>${item.corrected ? `<button type="button" class="ghost-btn danger" data-void-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${L('撤销修正', 'Anular corrección')}</button>` : ''}</div></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th><th>${L('状态', 'Estado')}</th>${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => {
+    const status = attendanceStatus(item);
+    const noTimes = !item.clock_in && !item.break_start && !item.break_end && !item.clock_out;
+    const hours = status.zeroHours ? '0h 00m' : noTimes ? '—' : shiftDurationText(item);
+    return `<tr class="attendance-row ${item.calendar_only ? 'calendar-only' : ''}">${showEmployee ? `<td><b>${escapeHTML(item.employee_name || '')}</b></td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '—')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${hours}</td><td><span class="status ${status.className}">${status.label}</span>${item.corrected && item.correction_kind !== 'absence' ? `<br><small>${L('已审计修正', 'Corregido')}</small>` : ''}</td>${editable ? `<td><div class="button-row"><button type="button" class="ghost-btn" data-edit-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${item.corrected ? L('再次修改', 'Volver a corregir') : L('修改', 'Corregir')}</button>${item.corrected ? `<button type="button" class="ghost-btn danger" data-void-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${L('撤销修正', 'Anular corrección')}</button>` : ''}</div></td>` : ''}</tr>`;
+  }).join('')}</tbody></table></div>`;
 }
 
 function renderEmployeeRequests() {
@@ -1216,7 +1278,7 @@ function deviceTable() {
 }
 
 function filteredAttendance() {
-  return state.data.attendance.filter(item => !state.attendanceEmployeeId || item.employee_id === state.attendanceEmployeeId);
+  return calendarAttendanceRows(state.attendanceMonth || madridDate().slice(0, 7), state.attendanceEmployeeId);
 }
 
 function renderExport() {
@@ -1907,7 +1969,8 @@ function exportCsv() {
   const header = ['employee_no', 'employee', 'date', 'store', 'clock_in_effective', 'scheduled_start', 'counted_start', 'break_start', 'break_end', 'clock_out', 'effective_work', 'break_duration', 'record_kind', 'corrected', 'correction_reason'];
   const rows = filteredAttendance().map((item) => {
     const schedule = attendanceSchedule(item);
-    return [item.employee_no, item.employee_name, item.work_date, item.store_name, timeText(item.clock_in), timeText(schedule?.starts_at), timeText(countedStart(item, schedule)), timeText(item.break_start), timeText(item.break_end), timeText(item.clock_out), item.correction_kind === 'absence' ? '0h 00m' : shiftDurationText(item, schedule), item.correction_kind === 'absence' ? '0m' : breakDurationText(item), item.correction_kind || 'attendance', item.corrected ? 'YES' : 'NO', item.correction_reason || ''];
+    const status = attendanceStatus(item);
+    return [item.employee_no, item.employee_name, item.work_date, item.store_name, timeText(item.clock_in), timeText(schedule?.starts_at), timeText(countedStart(item, schedule)), timeText(item.break_start), timeText(item.break_end), timeText(item.clock_out), status.zeroHours ? '0h 00m' : shiftDurationText(item, schedule), status.zeroHours ? '0m' : breakDurationText(item), status.label, item.corrected ? 'YES' : 'NO', item.correction_reason || ''];
   });
   const csv = '\uFEFF' + [header, ...rows].map((row) => row.map(csvCell).join(';')).join('\r\n');
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
