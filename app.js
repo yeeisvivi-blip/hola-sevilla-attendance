@@ -15,6 +15,7 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
+const BUILD_VERSION = '20261003-restore1';
 
 function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
@@ -250,72 +251,46 @@ function attendanceSchedule(item) {
     && schedule.work_date === item?.work_date && scheduleKind(schedule) === 'work') || null;
 }
 
-function scheduledEffectiveMinutes(item, schedule = attendanceSchedule(item)) {
-  const effectiveRecord = effectiveAttendance(item);
-  const presenceMinutes = durationMinutes(effectiveRecord.clock_in, effectiveRecord.clock_out);
-  if (presenceMinutes === null) return null;
-  const hasBreakStart = Boolean(effectiveRecord.break_start);
-  const hasBreakEnd = Boolean(effectiveRecord.break_end);
+function countedStart(item, schedule = attendanceSchedule(item)) {
+  if (!item?.clock_in) return null;
+  const clockIn = new Date(item.clock_in);
+  if (Number.isNaN(clockIn.getTime())) return null;
+  const scheduledStart = new Date(schedule?.starts_at);
+  if (Number.isNaN(scheduledStart.getTime())) return clockIn;
+  return clockIn < scheduledStart ? scheduledStart : clockIn;
+}
+
+function countedWorkMinutes(item, schedule = attendanceSchedule(item)) {
+  if (!item?.clock_in || !item?.clock_out) return null;
+  const hasBreakStart = Boolean(item.break_start);
+  const hasBreakEnd = Boolean(item.break_end);
   if (hasBreakStart !== hasBreakEnd) return null;
-  const breakMinutes = hasBreakStart ? durationMinutes(effectiveRecord.break_start, effectiveRecord.break_end) : 0;
-  if (breakMinutes === null || breakMinutes > presenceMinutes) return null;
-  if (hasBreakStart && (new Date(effectiveRecord.break_start) < new Date(effectiveRecord.clock_in)
-    || new Date(effectiveRecord.break_end) > new Date(effectiveRecord.clock_out))) return null;
+  const start = countedStart(item, schedule);
+  const clockIn = new Date(item.clock_in);
+  const end = new Date(item.clock_out);
+  if (!start || [clockIn, end].some((value) => Number.isNaN(value.getTime())) || end < start) return null;
+  const presenceMinutes = Math.round((end - start) / 60000);
+  if (!hasBreakStart) return Math.max(0, presenceMinutes);
+  const breakStart = new Date(item.break_start);
+  const breakEnd = new Date(item.break_end);
+  if ([breakStart, breakEnd].some((value) => Number.isNaN(value.getTime()))) return null;
+  if (clockIn > breakStart || breakStart > breakEnd || breakEnd > end || end < start) return null;
+  const countedBreakStart = breakStart < start ? start : breakStart;
+  const breakMinutes = breakEnd <= countedBreakStart ? 0 : Math.round((breakEnd - countedBreakStart) / 60000);
   return Math.max(0, presenceMinutes - breakMinutes);
 }
 
-function scheduledEffectiveText(item, schedule = attendanceSchedule(item)) {
-  const minutes = scheduledEffectiveMinutes(item, schedule);
+function shiftDurationText(item, schedule = attendanceSchedule(item)) {
+  const minutes = countedWorkMinutes(item, schedule);
   if (minutes === null) return '—';
   return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`;
 }
 
-function attendanceValue(item, dataset, field) {
-  const key = `${dataset}_${field}`;
-  return Object.prototype.hasOwnProperty.call(item || {}, key) ? item[key] : item?.[field] || null;
-}
-
-function payrollAttendance(item) {
-  return {
-    ...item,
-    clock_in: attendanceValue(item, 'payroll', 'clock_in'),
-    break_start: attendanceValue(item, 'payroll', 'break_start'),
-    break_end: attendanceValue(item, 'payroll', 'break_end'),
-    clock_out: attendanceValue(item, 'payroll', 'clock_out'),
-  };
-}
-
-function actualAttendance(item) {
-  return {
-    ...item,
-    clock_in: attendanceValue(item, 'actual', 'clock_in'),
-    break_start: attendanceValue(item, 'actual', 'break_start'),
-    break_end: attendanceValue(item, 'actual', 'break_end'),
-    clock_out: attendanceValue(item, 'actual', 'clock_out'),
-  };
-}
-
-function effectiveAttendance(item) {
-  return item?.corrected && item?.correction_kind !== 'absence'
-    ? payrollAttendance(item)
-    : actualAttendance(item);
-}
-
-function signedMinuteDifference(referenceValue, actualValue) {
-  if (!referenceValue || !actualValue) return null;
-  const reference = new Date(referenceValue);
-  const actual = new Date(actualValue);
-  if (Number.isNaN(reference.getTime()) || Number.isNaN(actual.getTime())) return null;
-  return Math.round((actual - reference) / 60_000);
-}
-
-function attendanceScheduleDeviation(item, schedule = attendanceSchedule(item)) {
-  if (!schedule || scheduleKind(schedule) !== 'work') return null;
-  const record = effectiveAttendance(item);
-  const start = signedMinuteDifference(schedule.starts_at, record.clock_in);
-  const end = signedMinuteDifference(schedule.ends_at, record.clock_out);
-  const abnormal = [start, end].some((minutes) => Number.isFinite(minutes) && Math.abs(minutes) >= 10);
-  return { start, end, abnormal };
+function breakDurationText(item) {
+  if (!item?.break_start && !item?.break_end) return '0m';
+  if (!item?.break_start || !item?.break_end) return '—';
+  const minutes = Math.max(0, Math.round((new Date(item.break_end) - new Date(item.break_start)) / 60000));
+  return `${minutes}m`;
 }
 
 function addDays(dateString, amount) {
@@ -328,20 +303,6 @@ function monthLastDate(monthString) {
   const [year, month] = String(monthString).split('-').map(Number);
   if (!year || month < 1 || month > 12) return '';
   return new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
-}
-
-function monthDates(monthString) {
-  const end = monthLastDate(monthString);
-  if (!end) return [];
-  const dates = [];
-  for (let date = `${monthString}-01`; date <= end; date = addDays(date, 1)) dates.push(date);
-  return dates;
-}
-
-function previousMonthString(monthString) {
-  const [year, month] = String(monthString).split('-').map(Number);
-  if (!year || month < 1 || month > 12) return '';
-  return new Date(Date.UTC(year, month - 2, 1)).toISOString().slice(0, 7);
 }
 
 function currentScheduleMonth() {
@@ -645,7 +606,7 @@ function renderKiosk() {
 
 function renderEmployeeChoices(employees, selected) {
   if (!employees.length) return `<div class="empty">${L('今天没有排在此店的员工，请检查已发布排班', 'No hay empleados asignados hoy a esta tienda. Revisa el horario publicado')}</div>`;
-  return employees.map((employee) => `<button class="employee-choice ${selected?.user_id === employee.user_id ? 'active' : ''}" type="button" data-employee="${employee.user_id}"><b>${escapeHTML(employee.full_name)}</b><small>${employee.events.length ? eventLabel(employee.events.at(-1).event_type) + ' ' + timeText(employee.events.at(-1).occurred_at) : L('尚未打卡', 'Sin fichar')}</small></button>`).join('');
+  return employees.map((employee) => `<button class="employee-choice ${selected?.user_id === employee.user_id ? 'active' : ''}" type="button" data-employee="${employee.user_id}"><b>${escapeHTML(employee.full_name)}</b><small>${escapeHTML(employee.employee_no)} · ${employee.events.length ? eventLabel(employee.events.at(-1).event_type) + ' ' + timeText(employee.events.at(-1).occurred_at) : L('尚未打卡', 'Sin fichar')}</small></button>`).join('');
 }
 
 function bindKiosk() {
@@ -653,7 +614,7 @@ function bindKiosk() {
   $('#kioskRefresh')?.addEventListener('click', openKiosk);
   $('#employeeSearch')?.addEventListener('input', (event) => {
     const term = event.target.value.trim().toLowerCase();
-    const list = state.kioskEmployees.filter((employee) => employee.full_name.toLowerCase().includes(term));
+    const list = state.kioskEmployees.filter((employee) => `${employee.full_name} ${employee.employee_no}`.toLowerCase().includes(term));
     $('#employeePicker').innerHTML = renderEmployeeChoices(list, state.kioskEmployees.find((item) => item.user_id === state.kioskSelected));
     bindEmployeeChoices();
   });
@@ -798,34 +759,25 @@ async function loadEmployeeData() {
   const today = madridDate();
   const monthStart = `${today.slice(0, 7)}-01`;
   const scheduleStart = monthStart < addDays(today, -7) ? monthStart : addDays(today, -7);
-  const scheduleEnd = monthLastDate(today.slice(0, 7)) > addDays(today, 14) ? monthLastDate(today.slice(0, 7)) : addDays(today, 14);
   const now = new Date().toISOString();
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
-  const [stores, schedules, attendance, requests, permissions, todayEvents, portalEvents] = await Promise.all([
+  const [stores, schedules, attendance, requests, permissions, todayEvents] = await Promise.all([
     client.from('stores').select('*').eq('active', true).order('name'),
-    client.from('schedules').select('*, stores(name,address)').gte('work_date', scheduleStart).lte('work_date', scheduleEnd).order('work_date'),
+    client.from('schedules').select('*, stores(name,address)').gte('work_date', scheduleStart).lte('work_date', addDays(today, 14)).order('work_date'),
     client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(50),
     client.from('gps_permissions').select('*, stores(name,address,latitude,longitude,radius_m)').eq('active', true).lte('valid_from', now).gte('valid_until', now).order('valid_until'),
     client.from('attendance_events').select('employee_id,store_id,event_type,occurred_at')
       .eq('employee_id', state.profile.user_id).gte('occurred_at', dayStart).lt('occurred_at', dayEnd)
       .order('occurred_at'),
-    client.rpc('hola_portal_today_events_v1'),
   ]);
   assertQueryResults([stores, schedules, attendance, requests, permissions]);
   const attendanceRows = attendance.data || [];
   const cachedEvents = readJSON(PUNCH_CACHE_STORAGE, []).filter((item) =>
     item?.employee_id === state.profile.user_id && item?.work_date === today
   );
-  const serverEventMap = new Map();
-  [...(!todayEvents.error ? todayEvents.data || [] : []), ...(!portalEvents.error ? portalEvents.data || [] : [])]
-    .forEach((event) => {
-      if (event?.employee_id === state.profile.user_id) {
-        serverEventMap.set(`${event.employee_id}:${event.event_type}:${event.occurred_at}`, event);
-      }
-    });
-  const serverEvents = [...serverEventMap.values()];
+  const serverEvents = !todayEvents.error ? (todayEvents.data || []) : [];
   const effectiveEvents = [...serverEvents, ...cachedEvents].sort((a, b) =>
     String(a.occurred_at).localeCompare(String(b.occurred_at))
   );
@@ -839,17 +791,12 @@ async function loadEmployeeData() {
     const merged = { ...existing };
     for (const event of effectiveEvents) {
       const field = ({ clock_in: 'clock_in', break_start: 'break_start', break_end: 'break_end', clock_out: 'clock_out' })[event.event_type];
-      if (!field) continue;
-      const actualField = `actual_${field}`;
-      if (!merged[actualField]) merged[actualField] = event.occurred_at;
-      // Compatibility fallback for deployments that do not yet expose actual_*.
-      if (!merged[field]) merged[field] = event.occurred_at;
+      if (field && !merged[field]) merged[field] = event.occurred_at;
     }
     if (existingIndex >= 0) attendanceRows[existingIndex] = merged;
     else attendanceRows.unshift(merged);
   }
   if (todayEvents.error) console.warn('Attendance event fallback unavailable:', todayEvents.error);
-  if (portalEvents.error) console.warn('Portal live-event RPC unavailable:', portalEvents.error);
   state.data = {
     stores: stores.data || [],
     schedules: schedules.data || [],
@@ -872,18 +819,16 @@ async function loadManagerData() {
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const photoStart = new Date(Date.now() - 30 * 86_400_000).toISOString();
-  const [stores, employees, schedules, todaySchedules, events, managerEvents, requests, permissions, devices, attendance, todayAttendance, audits, photoEvents, annualLeave] = await Promise.all([
+  const [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents, annualLeave] = await Promise.all([
     client.from('stores').select('*').order('name'),
     client.from('profiles').select('*, stores(name)').eq('role', 'employee').order('full_name'),
     client.from('schedules').select('*, stores(name)').gte('work_date', scheduleQueryStart).lte('work_date', scheduleQueryEnd).order('work_date'),
     client.from('schedules').select('*, stores(name)').eq('work_date', today).order('starts_at'),
     client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
-    client.rpc('hola_portal_today_events_v1'),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(100),
     client.from('gps_permissions').select('*, stores(name)').eq('active', true).gte('valid_until', new Date().toISOString()).order('valid_until'),
     client.from('kiosk_devices').select('*, stores(name)').order('created_at', { ascending: false }),
     client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', attendanceEnd).order('work_date', { ascending: false }),
-    client.from('attendance_daily').select('*').eq('work_date', today),
     client.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(100),
     client.from('attendance_events').select('id, employee_id, store_id, event_type, source, occurred_at, metadata, stores(name)')
       .eq('source', 'kiosk').in('event_type', ['clock_in', 'clock_out']).gte('occurred_at', photoStart)
@@ -891,29 +836,20 @@ async function loadManagerData() {
     client.from('schedules').select('employee_id, work_date').eq('schedule_kind', 'annual_leave').eq('published', true)
       .gte('work_date', `${leaveYear}-01-01`).lte('work_date', `${leaveYear}-12-31`).order('work_date'),
   ]);
-  const results = [stores, employees, schedules, todaySchedules, requests, permissions, devices, attendance, todayAttendance, audits, photoEvents];
+  const results = [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents];
   assertQueryResults(results);
   const employeeById = new Map((employees.data || []).map((employee) => [employee.user_id, employee]));
   const attachEmployee = (items) => (items || []).map((item) => ({ ...item, profiles: employeeById.get(item.employee_id) || null }));
-  const liveEvents = managerLiveEvents(
-    events.data || [],
-    managerEvents.error ? [] : managerEvents.data || [],
-    todayAttendance.data || [],
-    employees.data || [],
-    stores.data || [],
-  );
-  if (managerEvents.error) console.warn('Manager live-event RPC unavailable:', managerEvents.error);
   state.data = {
     stores: stores.data || [],
     employees: employees.data || [],
     schedules: attachEmployee(schedules.data),
     todaySchedules: attachEmployee(todaySchedules.data),
-    events: liveEvents,
+    events: attachEmployee(events.data),
     requests: attachEmployee(requests.data),
     permissions: attachEmployee(permissions.data),
     devices: devices.data || [],
     attendance: attendance.data || [],
-    todayAttendance: todayAttendance.data || [],
     audits: audits.data || [],
     photoEvents: attachEmployee(photoEvents.data),
     annualLeave: annualLeave.data || [],
@@ -943,7 +879,7 @@ function renderPortal() {
   app.innerHTML = `<div class="app-layout">
     <aside class="sidebar"><div class="brand-lockup"><span class="brand-mark">H</span><span><b>HOLA!SEVILLA</b><small>CONTROL HORARIO</small></span></div>
       <nav>${renderNavigation(items)}</nav>
-      <div class="sidebar-bottom"><div class="account-chip"><b>${escapeHTML(state.profile.full_name)}</b><small>${state.profile.role === 'manager' ? 'VIVI · MANAGER' : escapeHTML(state.profile.stores?.name || '')}</small></div><button class="ghost-btn" id="logout" type="button">${L('退出登录', 'Cerrar sesión')}</button></div>
+      <div class="sidebar-bottom"><div class="account-chip"><b>${escapeHTML(state.profile.full_name)}</b><small>${state.profile.role === 'manager' ? 'VIVI · MANAGER' : `${escapeHTML(state.profile.employee_no)} · ${escapeHTML(state.profile.stores?.name || '')}`}</small></div><button class="ghost-btn" id="logout" type="button">${L('退出登录', 'Cerrar sesión')}</button></div>
     </aside>
     <main class="main-area"><header class="topbar"><div><p class="eyebrow">${state.profile.role === 'manager' ? 'VIVI · 4 STORES' : escapeHTML(state.profile.stores?.name || 'HOLA!SEVILLA')}</p><h1>${currentTitle}</h1></div><div class="top-actions">${languageButton()}<button class="ghost-btn" id="refreshData" type="button">↻</button><div class="date-chip"><b id="portalClock">${timeText(new Date())}</b><small>${madridDisplay()}</small></div></div></header>
       <section class="view">${renderPortalView()}</section></main>
@@ -963,16 +899,15 @@ function renderEmployeeHome() {
   const today = madridDate();
   const schedule = state.data.schedules.find((item) => item.work_date === today);
   const record = state.data.attendance.find((item) => item.work_date === today);
-  const actualRecord = actualAttendance(record || {});
   const permissions = state.data.permissions || [];
   const annualLeave = scheduleKind(schedule) === 'annual_leave';
-  const status = actualRecord.clock_out ? L('今日已完成', 'Jornada completada') : actualRecord.clock_in ? L('工作进行中', 'Jornada en curso') : annualLeave ? L('今天年假', 'Vacaciones') : schedule?.is_day_off ? L('今天休息', 'Día libre') : L('等待到店', 'Pendiente de entrada');
+  const status = record?.clock_out ? L('今日已完成', 'Jornada completada') : record?.clock_in ? L('工作进行中', 'Jornada en curso') : annualLeave ? L('今天年假', 'Vacaciones') : schedule?.is_day_off ? L('今天休息', 'Día libre') : L('等待到店', 'Pendiente de entrada');
   return `<div class="page-grid">
     <article class="card hero-card"><div><p class="eyebrow">${dateText(today)}</p><h2>${escapeHTML(state.profile.full_name)}，${status}</h2><p>${schedule ? (annualLeave ? L('排班：年假', 'Horario: vacaciones') : schedule.is_day_off ? L('排班：休息', 'Horario: descanso') : `${escapeHTML(schedule.stores?.name || '')} · ${timeText(schedule.starts_at)}—${timeText(schedule.ends_at)}`) : L('VIVI尚未发布今天的排班', 'VIVI todavía no ha publicado el horario de hoy')}</p></div><div class="hero-meta"><span>${L('手机定位：店铺100米内打卡', 'Móvil: fichaje dentro de 100 m')}</span><span>${L('店铺电脑：PIN打卡', 'Ordenador: fichaje con PIN')}</span></div></article>
-    <article class="card summary-card"><div class="metric"><span>${L('上班', 'Entrada')}</span><b>${timeText(actualRecord.clock_in)}</b></div><div class="metric"><span>${L('休息', 'Pausa')}</span><b>${timeText(actualRecord.break_start)}–${timeText(actualRecord.break_end)}</b></div><div class="metric"><span>${L('下班', 'Salida')}</span><b>${timeText(actualRecord.clock_out)}</b></div></article>
+    <article class="card summary-card"><div class="metric"><span>${L('上班', 'Entrada')}</span><b>${timeText(record?.clock_in)}</b></div><div class="metric"><span>${L('休息', 'Pausa')}</span><b>${timeText(record?.break_start)}–${timeText(record?.break_end)}</b></div><div class="metric"><span>${L('下班', 'Salida')}</span><b>${timeText(record?.clock_out)}</b></div></article>
   </div>
-  ${renderScheduledMobilePunch(schedule, actualRecord)}
-  ${permissions.map((permission) => renderGpsCard(permission, actualRecord)).join('')}
+  ${renderScheduledMobilePunch(schedule, record)}
+  ${permissions.map((permission) => renderGpsCard(permission, record)).join('')}
   <article class="card"><div class="section-head"><div><p class="eyebrow">NEXT 7 DAYS</p><h2>${L('近期排班', 'Próximos turnos')}</h2></div></div>${scheduleTable(state.data.schedules.filter((item) => item.work_date >= today).slice(0, 7), false)}</article>`;
 }
 
@@ -1005,142 +940,18 @@ function scheduleKind(item) {
   return item?.is_day_off ? 'day_off' : 'work';
 }
 
-const SICK_LEAVE_MARKER = '[SICK_LEAVE]';
-
-const CORRECTION_REASON_PRESETS = Object.freeze({
-  missed_punch: { zh: '员工忘记打卡', es: 'La persona trabajadora olvidó fichar.' },
-  approved_request: { zh: '根据已批准的员工补卡申请修正', es: 'Corrección realizada conforme a la solicitud de fichaje aprobada.' },
-  system_error: { zh: '打卡系统无法完成操作', es: 'El sistema de fichaje no permitió completar la operación.' },
-  wrong_time: { zh: '原打卡时间与实际情况不符', es: 'La hora registrada no coincide con la hora real.' },
-  early_departure: { zh: '员工实际提前离开店铺', es: 'La persona trabajadora salió de la tienda antes de la hora prevista.' },
-  verified: { zh: '管理员核对排班及记录后修正', es: 'Corrección realizada por la administración tras verificar el horario y los registros.' },
-  absence: { zh: '员工当天缺勤', es: 'La persona trabajadora estuvo ausente ese día.' },
-  sick_leave: { zh: '员工当天病假', es: 'La persona trabajadora estuvo de baja médica ese día.' },
-});
-
-function splitBilingualReason(value) {
-  const cleaned = String(value || '').replace(SICK_LEAVE_MARKER, '').trim();
-  const bilingual = cleaned.match(/^\s*中文[：:]\s*([\s\S]*?)\s*\n\s*(?:Español|ES)[\s:：]+([\s\S]*)$/i);
-  if (bilingual) return { zh: bilingual[1].trim(), es: bilingual[2].trim() };
-  return /[\u3400-\u9fff]/.test(cleaned) ? { zh: cleaned, es: '' } : { zh: '', es: cleaned };
-}
-
-function bilingualReason(zh, es) {
-  return `中文：${String(zh || '').trim()}\nEspañol: ${String(es || '').trim()}`;
-}
-
-function isSickLeaveRecord(item) {
-  if (item?.correction_kind !== 'absence') return false;
-  const reason = String(item.correction_reason || '');
-  return reason.includes(SICK_LEAVE_MARKER) || /(^|[\s:：])(病假|baja médica)([\s:：]|$)/i.test(reason);
-}
-
-function visibleCorrectionReason(item) {
-  return String(item?.correction_reason || '').replace(SICK_LEAVE_MARKER, '').trim();
-}
-
-function attendanceRowsForView() {
-  const month = state.attendanceMonth || madridDate().slice(0, 7);
-  const start = `${month}-01`;
-  const end = monthLastDate(month);
-  const employees = state.data.employees || (state.profile ? [state.profile] : []);
-  const employeeById = new Map(employees.map((employee) => [employee.user_id, employee]));
-  const schedules = (state.data.schedules || []).filter((item) => item.published !== false
-    && item.work_date >= start && item.work_date <= end);
-  const scheduleByKey = new Map(schedules.map((item) => [`${item.employee_id}:${item.work_date}`, item]));
-  const rows = (state.data.attendance || []).filter((item) => item.work_date >= start && item.work_date <= end).map((item) => {
-    const schedule = scheduleByKey.get(`${item.employee_id}:${item.work_date}`);
-    const employee = employeeById.get(item.employee_id) || schedule?.profiles;
-    return {
-      ...item,
-      employee_name: item.employee_name || employee?.full_name || '',
-      store_name: item.store_name || schedule?.stores?.name || '',
-      display_schedule_kind: schedule ? scheduleKind(schedule) : null,
-      display_schedule: schedule || null,
-    };
-  });
-  const existing = new Set(rows.map((item) => `${item.employee_id}:${item.work_date}`));
-  schedules.forEach((schedule) => {
-    const key = `${schedule.employee_id}:${schedule.work_date}`;
-    if (existing.has(key)) return;
-    const employee = employeeById.get(schedule.employee_id) || schedule.profiles;
-    rows.push({
-      employee_id: schedule.employee_id,
-      employee_name: employee?.full_name || '',
-      work_date: schedule.work_date,
-      store_id: schedule.store_id || null,
-      store_name: schedule.stores?.name || '',
-      display_schedule_kind: scheduleKind(schedule),
-      display_schedule: schedule,
-      schedule_only: true,
-      clock_in: null,
-      break_start: null,
-      break_end: null,
-      clock_out: null,
-    });
-  });
-  const represented = new Set(rows.map((item) => `${item.employee_id}:${item.work_date}`));
-  employees.forEach((employee) => monthDates(month).forEach((date) => {
-    const key = `${employee.user_id}:${date}`;
-    if (represented.has(key)) return;
-    rows.push({
-      employee_id: employee.user_id,
-      employee_name: employee.full_name || '',
-      work_date: date,
-      store_name: '',
-      display_schedule_kind: null,
-      display_schedule: null,
-      calendar_only: true,
-      clock_in: null,
-      break_start: null,
-      break_end: null,
-      clock_out: null,
-    });
-  }));
-  return rows.sort((a, b) => b.work_date.localeCompare(a.work_date)
-    || String(a.employee_name).localeCompare(String(b.employee_name), 'es'));
-}
-
 function scheduleTable(items, showEmployee = true, editable = false) {
   if (!items.length) return `<div class="empty">${L('暂无排班', 'No hay horarios')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('时间', 'Horario')}</th>${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td><b>${escapeHTML(item.profiles?.full_name || '')}</b></td>` : ''}<td>${dateText(item.work_date)}</td><td>${scheduleKind(item) === 'annual_leave' ? '—' : escapeHTML(item.stores?.name || '')}</td><td>${scheduleKind(item) === 'annual_leave' ? `<span class="status annual-leave">${L('年假', 'Vacaciones')}</span>` : item.is_day_off ? `<span class="status">${L('休息', 'Libre')}</span>` : `${timeText(item.starts_at)}—${timeText(item.ends_at)}`}</td>${editable ? `<td>${item.profiles?.active === false ? '—' : `<button class="ghost-btn" data-edit-schedule="${item.id}" type="button">${L('修改', 'Modificar')}</button>`}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('时间', 'Horario')}</th>${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td><b>${escapeHTML(item.profiles?.full_name || '')}</b><br><small>${escapeHTML(item.profiles?.employee_no || '')}</small></td>` : ''}<td>${dateText(item.work_date)}</td><td>${scheduleKind(item) === 'annual_leave' ? '—' : escapeHTML(item.stores?.name || '')}</td><td>${scheduleKind(item) === 'annual_leave' ? `<span class="status annual-leave">${L('年假', 'Vacaciones')}</span>` : item.is_day_off ? `<span class="status">${L('休息', 'Libre')}</span>` : `${timeText(item.starts_at)}—${timeText(item.ends_at)}`}</td>${editable ? `<td>${item.profiles?.active === false ? '—' : `<button class="ghost-btn" data-edit-schedule="${item.id}" type="button">${L('修改', 'Modificar')}</button>`}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function renderRecords() {
-  return `<article class="card">${attendanceTable(attendanceRowsForView(), true)}</article>`;
-}
-
-function attendanceRowStatus(item) {
-  if (isSickLeaveRecord(item)) return { className: 'sick-leave', label: L('病假', 'Baja médica') };
-  if (item.correction_kind === 'absence') return { className: 'alert', label: L('缺勤', 'Ausencia') };
-  if (item.display_schedule_kind === 'annual_leave') return { className: 'annual-leave', label: L('年假', 'Vacaciones') };
-  if (item.display_schedule_kind === 'day_off') return { className: '', label: L('休息日', 'Día libre') };
-  if (attendanceScheduleDeviation(item, item.display_schedule)?.abnormal) return { className: 'alert', label: L('工作日 · 时间异常', 'Laborable · Hora anómala') };
-  if (item.corrected) return { className: 'pending', label: L('工作日 · 已核实', 'Laborable · Verificado') };
-  const hasPunch = ['clock_in', 'break_start', 'break_end', 'clock_out']
-    .some((field) => Boolean(attendanceValue(item, 'actual', field)));
-  if (!hasPunch && item.work_date > madridDate() && item.display_schedule_kind === 'work') return { className: 'pending', label: L('工作日 · 待打卡', 'Laborable · Pendiente') };
-  if (!hasPunch && item.display_schedule_kind === 'work') return { className: 'alert', label: L('工作日 · 未打卡', 'Laborable · Sin fichajes') };
-  if (!hasPunch && !item.display_schedule_kind) return { className: '', label: L('未排班', 'Sin horario') };
-  return { className: 'ok', label: L('工作日', 'Día laborable') };
+  return `<article class="card"><div class="section-head"><div><p class="eyebrow">OFFICIAL RECORDS</p><h2>${L('本月考勤记录', 'Registros de este mes')}</h2></div></div>${attendanceTable(state.data.attendance, false)}</article>`;
 }
 
 function attendanceTable(items, showEmployee = true, editable = false) {
   if (!items.length) return `<div class="empty">${L('暂无考勤记录', 'No hay registros')}</div>`;
-  const requestable = !editable && state.role === 'employee';
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th>${requestable ? `<th>${L('补卡申请', 'Solicitar fichaje')}</th>` : ''}${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => {
-    const status = attendanceRowStatus(item);
-    const nonWorking = item.correction_kind === 'absence' || ['day_off', 'annual_leave'].includes(item.display_schedule_kind);
-    const canCorrect = !['day_off', 'annual_leave'].includes(item.display_schedule_kind);
-    const effectiveRecord = effectiveAttendance(item);
-    const actualIn = timeText(effectiveRecord.clock_in);
-    const actualBreak = `${timeText(effectiveRecord.break_start)}–${timeText(effectiveRecord.break_end)}`;
-    const actualOut = timeText(effectiveRecord.clock_out);
-    const canRequest = canCorrect && item.work_date <= madridDate();
-    const effectiveText = nonWorking ? '0h 00m' : scheduledEffectiveText(item);
-    const hoursCell = requestable ? effectiveText : `<b>${effectiveText}</b><br><span class="status ${status.className}">${status.label}</span>`;
-    return `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '—')}</td><td>${actualIn}</td><td>${actualBreak}</td><td>${actualOut}</td><td>${hoursCell}</td>${requestable ? `<td>${canRequest ? `<button type="button" class="ghost-btn" data-request-missed="${escapeHTML(item.work_date)}">${L('补卡申请','Solicitar')}</button>` : '—'}</td>` : ''}${editable ? `<td>${canCorrect ? `<div class="button-row"><button type="button" class="ghost-btn" data-edit-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${item.corrected ? L('再次修改', 'Volver a corregir') : L('修改', 'Corregir')}</button>${item.corrected ? `<button type="button" class="ghost-btn danger" data-void-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${L('撤销修正', 'Anular corrección')}</button>` : ''}</div>` : '—'}</td>` : ''}</tr>`;
-  }).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th><th>${L('状态', 'Estado')}</th>${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td>${escapeHTML(item.employee_name || '')}</td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${item.correction_kind === 'absence' ? '0h 00m' : shiftDurationText(item)}</td><td><span class="status ${item.correction_kind === 'absence' ? 'alert' : item.corrected ? 'pending' : 'ok'}">${item.correction_kind === 'absence' ? L('缺勤', 'Ausencia') : item.corrected ? L('已审计修正', 'Corregido') : L('原始记录', 'Original')}</span></td>${editable ? `<td><div class="button-row"><button type="button" class="ghost-btn" data-edit-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${item.corrected ? L('再次修改', 'Volver a corregir') : L('修改', 'Corregir')}</button>${item.corrected ? `<button type="button" class="ghost-btn danger" data-void-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${L('撤销修正', 'Anular corrección')}</button>` : ''}</div></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function renderEmployeeRequests() {
@@ -1161,7 +972,7 @@ function requestTypeLabel(type) { return ({ missed_punch: L('补卡', 'Correcci�
 function statusLabel(status) { return ({ pending: L('待审批', 'Pendiente'), approved: L('已批准', 'Aprobada'), rejected: L('已拒绝', 'Rechazada') })[status] || status; }
 
 function renderProfile() {
-  return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>NIF ${escapeHTML(state.profile.nif || '—')} · ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('在职', 'En activo') : L('停用', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article><article class="card summary-card"><p class="eyebrow">PRIVACY</p><h3>${L('数据、位置与照片', 'Datos, ubicación y fotos')}</h3><p>${L('GPS只在手机打卡时读取一次，不会持续追踪。店铺电脑的上班和下班打卡会拍摄现场照片，照片直接上传至私有云端，不保存在店铺电脑，并在30天后自动删除。', 'El GPS solo se obtiene al fichar con el móvil y no realiza seguimiento continuo. En el ordenador de tienda se hace una foto en la entrada y la salida; se sube directamente al almacenamiento privado, no se guarda en el ordenador y se elimina automáticamente después de 30 días.')}</p></article></div>`;
+  return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>${escapeHTML(state.profile.employee_no)} · ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('在职', 'En activo') : L('停用', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article><article class="card summary-card"><p class="eyebrow">PRIVACY</p><h3>${L('数据、位置与照片', 'Datos, ubicación y fotos')}</h3><p>${L('GPS只在手机打卡时读取一次，不会持续追踪。店铺电脑的上班和下班打卡会拍摄现场照片，照片直接上传至私有云端，不保存在店铺电脑，并在30天后自动删除。', 'El GPS solo se obtiene al fichar con el móvil y no realiza seguimiento continuo. En el ordenador de tienda se hace una foto en la entrada y la salida; se sube directamente al almacenamiento privado, no se guarda en el ordenador y se elimina automáticamente después de 30 días.')}</p></article></div>`;
 }
 
 function renderManagerHome() {
@@ -1171,9 +982,9 @@ function renderManagerHome() {
   const unconfigured = state.data.stores.filter((store) => store.latitude === null || store.longitude === null);
   const unhealthy = (state.health || []).filter((item) => !item.ok);
   return `${unhealthy.length ? `<div class="callout warning"><b>${L('系统版本未同步', 'Versión sin sincronizar')}</b><span>${L('以下后台需要重新部署：', 'Hay que volver a desplegar:')} ${unhealthy.map((item) => escapeHTML(item.name)).join('、')}</span></div>` : `<div class="callout"><b>${L('系统正常', 'Sistema correcto')}</b><span>${L('网页、数据库与三套后台服务连接正常。', 'La web, la base de datos y los tres servicios están conectados.')}</span></div>`}
-  <div class="stat-grid"><article class="stat-card"><small>${L('在职员工', 'Empleados activos')}</small><b>${active.length}</b></article><article class="stat-card"><small>${L('今日已上班打卡', 'Entradas hoy')}</small><b id="todayPunchedCount">${punched.size}</b></article><article class="stat-card"><small>${L('待审批', 'Pendientes')}</small><b>${pending.length}</b></article><article class="stat-card"><small>${L('GPS未配置店铺', 'Tiendas sin GPS')}</small><b>${unconfigured.length}</b></article></div>
+  <div class="stat-grid"><article class="stat-card"><small>${L('在职员工', 'Empleados activos')}</small><b>${active.length}</b></article><article class="stat-card"><small>${L('今日已上班打卡', 'Entradas hoy')}</small><b>${punched.size}</b></article><article class="stat-card"><small>${L('待审批', 'Pendientes')}</small><b>${pending.length}</b></article><article class="stat-card"><small>${L('GPS未配置店铺', 'Tiendas sin GPS')}</small><b>${unconfigured.length}</b></article></div>
   ${unconfigured.length ? `<div class="callout warning"><b>${L('上线前必须完成', 'Pendiente antes de publicar')}</b><span>${L('请在“店铺设置”中填写四店准确地址、经纬度和有效范围。未配置的店铺不能使用GPS打卡。', 'Completa dirección, coordenadas y radio de las cuatro tiendas. Sin ello no se permite el fichaje GPS.')}</span></div>` : ''}
-  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日员工打卡汇总', 'Resumen de fichajes de hoy')}</h2><p>${L('保存修改后立即更新，并每5秒自动同步。按当天排班店铺分组，每名员工的生效时间集中在同一行。', 'Se actualiza al guardar y se sincroniza automáticamente cada 5 segundos. Agrupado por tienda con las horas vigentes de cada empleado.')}</p></div><span class="status ok">Europe/Madrid</span></div><div id="todayAttendanceLive">${todayAttendanceSummary(state.data.events)}</div></article>`;
+  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日员工打卡汇总', 'Resumen de fichajes de hoy')}</h2><p>${L('按当天排班店铺分组，每名员工的上班、休息和下班记录集中在同一行。', 'Agrupado por la tienda programada; todos los fichajes de cada empleado aparecen en una sola fila.')}</p></div><span class="status ok">Europe/Madrid</span></div>${todayAttendanceSummary(state.data.events)}</article>`;
 }
 
 function todayAttendanceRows(events = []) {
@@ -1227,11 +1038,9 @@ function todayAttendanceRows(events = []) {
     });
     if (!row.storeName && event.stores?.name) row.storeName = event.stores.name;
     if (event.source) row.sources.add(event.source);
-    if (event.corrected) row.sources.add('correction');
     const current = row.events[event.event_type];
     const keepLatest = event.event_type === 'break_end' || event.event_type === 'clock_out';
-    if (!current || event.corrected || (!current.corrected
-      && (keepLatest ? event.occurred_at > current.occurred_at : event.occurred_at < current.occurred_at))) {
+    if (!current || (keepLatest ? event.occurred_at > current.occurred_at : event.occurred_at < current.occurred_at)) {
       row.events[event.event_type] = event;
     }
   });
@@ -1278,108 +1087,11 @@ function todayAttendanceSummary(events) {
     <div class="live-store-head"><h3>${escapeHTML(group.name)}</h3><span>${group.rows.length} ${L('人', 'personas')}</span></div>
     <div class="table-wrap live-summary-table"><table><thead><tr><th>${L('员工', 'Empleado')}</th><th>${L('排班', 'Horario')}</th><th>${L('上班', 'Entrada')}</th><th>${L('开始休息', 'Inicio pausa')}</th><th>${L('结束休息', 'Fin pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('当前状态', 'Estado')}</th><th>${L('方式', 'Origen')}</th><th>${L('现场照片', 'Fotos')}</th></tr></thead><tbody>${group.rows.map((row) => {
       const status = todayAttendanceStatus(row);
-      const sources = [...row.sources].map((source) => source === 'kiosk'
-        ? L('电脑', 'PC')
-        : source === 'daily' ? L('打卡记录', 'Registro')
-        : source === 'correction' ? L('已修改', 'Modificado') : source.toUpperCase()).join(' + ');
+      const sources = [...row.sources].map((source) => source === 'kiosk' ? L('电脑', 'PC') : source.toUpperCase()).join(' + ');
       const photos = photoButtons(row);
-      return `<tr><td class="live-employee"><b>${escapeHTML(row.employeeName)}</b></td><td>${row.schedule ? `${timeText(row.schedule.starts_at)}—${timeText(row.schedule.ends_at)}` : `<span class="status alert">${L('无排班', 'Sin horario')}</span>`}</td><td>${timeCell(row.events.clock_in)}</td><td>${timeCell(row.events.break_start)}</td><td>${timeCell(row.events.break_end)}</td><td>${timeCell(row.events.clock_out)}</td><td><span class="status ${status.className}">${status.label}</span></td><td>${sources ? `<span class="status ${row.sources.has('gps') ? 'pending' : 'ok'}">${escapeHTML(sources)}</span>` : '—'}</td><td><div class="live-photo-actions">${photos || '—'}</div></td></tr>`;
+      return `<tr><td class="live-employee"><b>${escapeHTML(row.employeeName)}</b><small>${escapeHTML(row.employeeNo)}</small></td><td>${row.schedule ? `${timeText(row.schedule.starts_at)}—${timeText(row.schedule.ends_at)}` : `<span class="status alert">${L('无排班', 'Sin horario')}</span>`}</td><td>${timeCell(row.events.clock_in)}</td><td>${timeCell(row.events.break_start)}</td><td>${timeCell(row.events.break_end)}</td><td>${timeCell(row.events.clock_out)}</td><td><span class="status ${status.className}">${status.label}</span></td><td>${sources ? `<span class="status ${row.sources.has('gps') ? 'pending' : 'ok'}">${escapeHTML(sources)}</span>` : '—'}</td><td><div class="live-photo-actions">${photos || '—'}</div></td></tr>`;
     }).join('')}</tbody></table></div>
   </section>`).join('')}</div>`;
-}
-
-function mergeTodayAttendance(records) {
-  const today = madridDate();
-  const otherDays = (state.data.attendance || []).filter((item) => item.work_date !== today);
-  state.data.todayAttendance = records;
-  state.data.attendance = [...records, ...otherDays].sort((a, b) => b.work_date.localeCompare(a.work_date));
-}
-
-function managerLiveEvents(directEvents, rpcEvents, dailyRecords, employees = state.data.employees || [], stores = state.data.stores || []) {
-  const employeeById = new Map(employees.map((employee) => [employee.user_id, employee]));
-  const storeById = new Map(stores.map((store) => [store.id, store]));
-  const eventsById = new Map();
-  [...(directEvents || []), ...(rpcEvents || [])].forEach((event, index) => {
-    if (!event?.employee_id || !event?.event_type || !event?.occurred_at) return;
-    const store = event.stores || storeById.get(event.store_id) || (event.store_name ? { name: event.store_name } : null);
-    const key = event.id || `${event.employee_id}:${event.event_type}:${event.occurred_at}:${index}`;
-    eventsById.set(key, { ...event, id: event.id || key, stores: store, profiles: employeeById.get(event.employee_id) || null });
-  });
-  const rawEvents = [...eventsById.values()];
-  let events = [...rawEvents];
-  const eventTypes = ['clock_in', 'break_start', 'break_end', 'clock_out'];
-  (dailyRecords || []).forEach((record) => {
-    const corrected = Boolean(record?.corrected && record?.correction_kind !== 'void');
-    const effectiveRecord = record?.correction_kind === 'absence'
-      ? { clock_in: null, break_start: null, break_end: null, clock_out: null }
-      : effectiveAttendance(record);
-    if (corrected) {
-      events = events.filter((event) => event.employee_id !== record.employee_id || !eventTypes.includes(event.event_type));
-    }
-    eventTypes.forEach((eventType) => {
-      const occurredAt = effectiveRecord[eventType];
-      const key = `${record.employee_id}:${eventType}`;
-      if (!occurredAt || (!corrected && events.some((event) => `${event.employee_id}:${event.event_type}` === key))) return;
-      const rawCandidates = rawEvents.filter((event) => event.employee_id === record.employee_id && event.event_type === eventType);
-      const keepLatest = eventType === 'break_end' || eventType === 'clock_out';
-      const rawEvent = rawCandidates.sort((a, b) => keepLatest
-        ? String(b.occurred_at).localeCompare(String(a.occurred_at))
-        : String(a.occurred_at).localeCompare(String(b.occurred_at)))[0];
-      const storeId = rawEvent?.store_id || record.store_id;
-      events.push({
-        ...(rawEvent || {}),
-        id: rawEvent?.id || `daily-${record.employee_id}-${eventType}`,
-        employee_id: record.employee_id,
-        store_id: storeId,
-        event_type: eventType,
-        occurred_at: occurredAt,
-        source: rawEvent?.source || record.source || 'daily',
-        metadata: rawEvent?.metadata || {},
-        corrected,
-        stores: rawEvent?.stores || storeById.get(storeId) || null,
-        profiles: employeeById.get(record.employee_id) || null,
-      });
-    });
-  });
-  return events.sort((a, b) => String(a.occurred_at).localeCompare(String(b.occurred_at)));
-}
-
-let managerLiveRefreshBusy = false;
-async function refreshManagerLiveSnapshot() {
-  if (managerLiveRefreshBusy || state.profile?.role !== 'manager') return;
-  managerLiveRefreshBusy = true;
-  try {
-    const today = madridDate();
-    const dayStart = madridLocalToIso(today, '00:00');
-    const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
-    const [direct, rpc, daily, schedules] = await Promise.all([
-      client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
-      client.rpc('hola_portal_today_events_v1'),
-      client.from('attendance_daily').select('*').eq('work_date', today),
-      client.from('schedules').select('*, stores(name)').eq('work_date', today).order('starts_at'),
-    ]);
-    if (daily.error) throw daily.error;
-    if (direct.error && rpc.error) throw direct.error;
-    const employeeById = new Map((state.data.employees || []).map((employee) => [employee.user_id, employee]));
-    state.data.todaySchedules = schedules.error ? (state.data.todaySchedules || []) : (schedules.data || []).map((item) => ({
-      ...item,
-      profiles: employeeById.get(item.employee_id) || null,
-    }));
-    mergeTodayAttendance(daily.data || []);
-    state.data.events = managerLiveEvents(direct.error ? [] : direct.data, rpc.error ? [] : rpc.data, daily.data || []);
-    if (state.view !== 'home') return;
-    const count = $('#todayPunchedCount');
-    if (count) count.textContent = String(new Set(state.data.events.filter((event) => event.event_type === 'clock_in').map((event) => event.employee_id)).size);
-    const live = $('#todayAttendanceLive');
-    if (live) {
-      live.innerHTML = todayAttendanceSummary(state.data.events);
-      $$('[data-view-photo]', live).forEach((button) => button.addEventListener('click', () => viewAttendancePhoto(button)));
-    }
-  } catch (error) {
-    console.warn('Live overview refresh failed:', error);
-  } finally {
-    managerLiveRefreshBusy = false;
-  }
 }
 
 function eventTable(items) {
@@ -1388,7 +1100,7 @@ function eventTable(items) {
 }
 
 function storeOptions(selected = '') { return state.data.stores.filter((store) => store.active !== false).map((store) => `<option value="${store.id}" ${selected === store.id ? 'selected' : ''}>${escapeHTML(store.name)}</option>`).join(''); }
-function employeeOptions(activeOnly = true, selected = '') { return state.data.employees.filter((employee) => !activeOnly || employee.active).map((employee) => `<option value="${employee.user_id}" ${selected === employee.user_id ? 'selected' : ''}>${escapeHTML(employee.full_name)}</option>`).join(''); }
+function employeeOptions(activeOnly = true, selected = '') { return state.data.employees.filter((employee) => !activeOnly || employee.active).map((employee) => `<option value="${employee.user_id}" ${selected === employee.user_id ? 'selected' : ''}>${escapeHTML(employee.full_name)} · ${escapeHTML(employee.employee_no)}</option>`).join(''); }
 
 function renderEmployees() {
   const hasStores = state.data.stores.some((store) => store.active !== false);
@@ -1401,7 +1113,7 @@ function renderEmployees() {
 
 function employeeTable() {
   if (!state.data.employees.length) return `<div class="empty">${L('尚未创建员工', 'Todavía no hay empleados')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>${L('员工', 'Empleado')}</th><th>NIF</th><th>${L('手机号', 'Teléfono')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('状态', 'Estado')}</th><th>${L('操作', 'Acción')}</th></tr></thead><tbody>${state.data.employees.map((employee) => `<tr><td><b>${escapeHTML(employee.full_name)}</b></td><td>${escapeHTML(employee.nif || '—')}</td><td>${escapeHTML(employee.phone)}</td><td>${escapeHTML(employee.stores?.name || '')}</td><td><span class="status ${employee.active ? 'ok' : 'alert'}">${employee.active ? L('在职', 'Activo') : L('停用', 'Inactivo')}</span></td><td><div class="button-row"><button class="ghost-btn" data-reset="password" data-id="${employee.user_id}">${L('改密码', 'Contraseña')}</button><button class="ghost-btn" data-reset="pin" data-id="${employee.user_id}">PIN</button><button class="${employee.active ? 'danger-btn' : 'secondary-btn'}" data-toggle-employee="${employee.user_id}" data-active="${employee.active ? 'false' : 'true'}">${employee.active ? L('停用', 'Desactivar') : L('启用', 'Activar')}</button>${employee.active ? '' : `<button class="danger-btn" data-delete-employee="${employee.user_id}">${L('删除误建账号', 'Eliminar cuenta errónea')}</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>${L('员工', 'Empleado')}</th><th>${L('手机号', 'Teléfono')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('状态', 'Estado')}</th><th>${L('操作', 'Acción')}</th></tr></thead><tbody>${state.data.employees.map((employee) => `<tr><td><b>${escapeHTML(employee.full_name)}</b><br><small>${escapeHTML(employee.employee_no)}</small></td><td>${escapeHTML(employee.phone)}</td><td>${escapeHTML(employee.stores?.name || '')}</td><td><span class="status ${employee.active ? 'ok' : 'alert'}">${employee.active ? L('在职', 'Activo') : L('停用', 'Inactivo')}</span></td><td><div class="button-row"><button class="ghost-btn" data-reset="password" data-id="${employee.user_id}">${L('改密码', 'Contraseña')}</button><button class="ghost-btn" data-reset="pin" data-id="${employee.user_id}">PIN</button><button class="${employee.active ? 'danger-btn' : 'secondary-btn'}" data-toggle-employee="${employee.user_id}" data-active="${employee.active ? 'false' : 'true'}">${employee.active ? L('停用', 'Desactivar') : L('启用', 'Activar')}</button>${employee.active ? '' : `<button class="danger-btn" data-delete-employee="${employee.user_id}">${L('删除误建账号', 'Eliminar cuenta errónea')}</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function weekdayNames() {
@@ -1470,7 +1182,6 @@ function renderSchedule() {
   }).join('');
   return `<article class="card"><div class="section-head"><div><h2>${L('整月排班','Horario mensual')}</h2><p>${L('点击日期即可临时换班、换店或安排休息。','Pulsa una fecha para cambiar el turno, la tienda o el descanso.')}</p></div><span class="status">${state.data.annualLeaveReady ? L(`年假 ${used}/30 天`,`Vacaciones ${used}/30 días`) : L('年假待核对','Vacaciones pendientes')}</span></div>
     <div class="form-row"><label>${L('员工','Empleado')}<select id="weeklyEmployee">${employeeOptions(true,employee.user_id)}</select></label><label>${L('月份','Mes')}<input id="weeklyMonth" type="month" min="${SCHEDULE_START_MONTH}" value="${month}"></label></div>
-    <div class="button-row"><button class="secondary-btn" id="copyPreviousMonth" type="button">${L('复制上月排班','Copiar horario del mes anterior')}</button><span class="muted">${L('按上月最常用的周一至周日班次生成本月，临时调班不会优先采用。','Genera este mes con el patrón semanal más habitual del mes anterior; los cambios puntuales no tienen prioridad.')}</span></div>
     <div class="month-calendar"><div class="calendar-weekdays">${weekdayNames().map(x=>`<b>${x}</b>`).join('')}</div><div class="calendar-grid">${blanks}${cells}</div></div></article>
     <details class="card compact-details"><summary>${L('按周模板生成整月','Generar el mes con una plantilla semanal')}</summary><form id="weeklyScheduleForm" class="stack-form"><p>${L('仅在建立或重新安排整月时使用；会覆盖工作与休息排班，已登记年假保留。','Úsalo para crear o reorganizar el mes. Sustituye trabajo y descanso; conserva las vacaciones.')}</p><div id="weeklyRows" class="weekly-schedule">${renderWeeklyRows(employee)}</div><label>${L('备注（可选）','Nota opcional')}<input id="weeklyNotes" maxlength="500"></label><button class="primary-btn" type="submit">${L('生成整月排班','Generar horario mensual')}</button></form></details>`;
 }
@@ -1505,75 +1216,14 @@ function deviceTable() {
 }
 
 function filteredAttendance() {
-  return attendanceRowsForView().filter(item => !state.attendanceEmployeeId || item.employee_id === state.attendanceEmployeeId);
-}
-
-function attendanceCalendarCell(item) {
-  if (!item) return { className: 'unscheduled', short: '—', label: L('未排班', 'Sin horario') };
-  if (isSickLeaveRecord(item)) return { className: 'sick-leave', short: L('病', 'B'), label: L('病假', 'Baja médica') };
-  if (item.correction_kind === 'absence') return { className: 'absence', short: L('缺', 'A'), label: L('缺勤', 'Ausencia') };
-  if (item.display_schedule_kind === 'annual_leave') return { className: 'annual-leave', short: L('年', 'V'), label: L('年假', 'Vacaciones') };
-  if (item.display_schedule_kind === 'day_off') return { className: 'day-off', short: L('休', 'L'), label: L('休息日', 'Día libre') };
-  if (attendanceScheduleDeviation(item, item.display_schedule)?.abnormal) return { className: 'incident', short: L('异', 'I'), label: L('工作日 · 时间异常', 'Laborable · Hora anómala') };
-  if (item.corrected) return { className: 'corrected', short: L('核', 'C'), label: L('工作日 · 已核实', 'Laborable · Verificado') };
-  const hasPunch = ['clock_in', 'break_start', 'break_end', 'clock_out']
-    .some((field) => Boolean(attendanceValue(item, 'actual', field)));
-  if (item.display_schedule_kind === 'work' && !hasPunch) {
-    return item.work_date > madridDate()
-      ? { className: 'pending', short: L('待', 'P'), label: L('工作日 · 待打卡', 'Laborable · Pendiente') }
-      : { className: 'missing', short: L('未', 'SF'), label: L('工作日 · 未打卡', 'Laborable · Sin fichajes') };
-  }
-  if (hasPunch) return { className: 'worked', short: L('工', 'T'), label: L('工作日', 'Día laborable') };
-  return { className: 'unscheduled', short: '—', label: L('未排班', 'Sin horario') };
-}
-
-function monthlyAttendanceCalendar(items) {
-  const month = state.attendanceMonth || madridDate().slice(0, 7);
-  const today = madridDate();
-  const employeeById = new Map((state.data.employees || []).map((employee) => [employee.user_id, employee]));
-  const employeeIds = [...new Set(items.map((item) => item.employee_id))];
-  const rowsByKey = new Map(items.map((item) => [`${item.employee_id}:${item.work_date}`, item]));
-  if (!employeeIds.length) return `<div class="empty">${L('暂无考勤记录', 'No hay registros')}</div>`;
-  const dates = monthDates(month);
-  const leadingBlanks = scheduleWeekdayIndex(dates[0]);
-  const trailingBlanks = (7 - ((leadingBlanks + dates.length) % 7)) % 7;
-  const calendarDates = [
-    ...Array.from({ length: leadingBlanks }, () => null),
-    ...dates,
-    ...Array.from({ length: trailingBlanks }, () => null),
-  ];
-  const calendars = employeeIds.map((employeeId) => {
-    const employee = employeeById.get(employeeId);
-    const fallback = items.find((item) => item.employee_id === employeeId);
-    const name = employee?.full_name || fallback?.employee_name || '';
-    const nif = employee?.nif || '';
-    const cells = calendarDates.map((date) => {
-      if (!date) return '<div class="attendance-month-day outside-month" aria-hidden="true"></div>';
-      const item = rowsByKey.get(`${employeeId}:${date}`);
-      const status = attendanceCalendarCell(item);
-      const effectiveRecord = effectiveAttendance(item);
-      const actualIn = timeText(effectiveRecord.clock_in);
-      const actualBreakStart = timeText(effectiveRecord.break_start);
-      const actualBreakEnd = timeText(effectiveRecord.break_end);
-      const actualOut = timeText(effectiveRecord.clock_out);
-      const nonWorking = item?.correction_kind === 'absence' || ['day_off', 'annual_leave'].includes(item?.display_schedule_kind);
-      const effective = nonWorking ? '0h 00m' : scheduledEffectiveText(item || {});
-      const detail = `${date} · ${status.label}${item?.store_name ? ` · ${item.store_name}` : ''}${actualIn !== '—' || actualOut !== '—' ? ` · ${actualIn}–${actualOut}` : ''}`;
-      return `<button type="button" class="attendance-month-day ${status.className} ${date === today ? 'today' : ''}" data-calendar-correct="${escapeHTML(employeeId)}" data-work-date="${date}" title="${escapeHTML(detail)}" aria-label="${escapeHTML(`${name} ${detail}`)}"><span class="attendance-month-date">${Number(date.slice(-2))}</span>${date === today ? `<span class="attendance-today-label">${L('今天','Hoy')}</span>` : ''}<strong>${status.label}</strong><small>${escapeHTML(item?.store_name || '—')}</small><span>${L('上','E')} ${actualIn} · ${L('下','S')} ${actualOut}</span><span>${L('休','P')} ${actualBreakStart}–${actualBreakEnd}</span><b>${L('有效','Efectivas')} ${effective}</b></button>`;
-    }).join('');
-    return `<section class="attendance-month"><header><div><h3>${escapeHTML(name)}</h3><p>NIF · ${escapeHTML(nif || L('未填写', 'Sin NIF'))}</p></div></header><div class="attendance-month-weekdays">${weekdayNames().map((day) => `<b>${day}</b>`).join('')}</div><div class="attendance-month-grid">${cells}</div></section>`;
-  }).join('');
-  return `<div class="attendance-month-list">${calendars}</div>`;
+  return state.data.attendance.filter(item => !state.attendanceEmployeeId || item.employee_id === state.attendanceEmployeeId);
 }
 
 function renderExport() {
   const month = state.attendanceMonth || madridDate().slice(0,7);
-  const attendanceItems = filteredAttendance();
-  return `<article class="card"><div class="section-head"><div><h2>${L('整月考勤日历','Calendario mensual de jornada')}</h2><p>${L('当月每天均显示工作日、休息日、缺勤、病假和年假；没有打卡也不会漏掉。','Cada día del mes muestra jornada laboral, descanso, ausencia, baja médica o vacaciones, incluso sin fichajes.')}</p></div><button class="primary-btn" type="button" id="newCorrection">${L('补充记录','Añadir registro')}</button></div>
+  return `<article class="card"><div class="section-head"><div><h2>${L('考勤记录','Registro de jornada')}</h2><p>${L('找到日期，点击“修改”。补卡和再次修正都在记录里完成。','Busca la fecha y pulsa Editar para añadir o corregir fichajes.')}</p></div><button class="primary-btn" type="button" id="newCorrection">${L('补充记录','Añadir registro')}</button></div>
     <form id="monthlyReportForm" class="report-controls"><label>${L('月份','Mes')}<input id="reportMonth" type="month" min="${SCHEDULE_START_MONTH}" max="${madridDate().slice(0,7)}" value="${month}" required></label><label>${L('员工','Empleado')}<select id="reportEmployee"><option value="">${L('全部员工','Todos')}</option>${employeeOptions(false,state.attendanceEmployeeId)}</select></label><div class="form-actions"><button class="secondary-btn" id="previewEmployeeReport" type="submit">${L('打印签字表','Imprimir registro')}</button><button class="ghost-btn" id="exportCsv" type="button">${L('下载CSV','Descargar CSV')}</button></div></form>
-    <div class="button-row attendance-legend"><span class="status ok">${L('工：工作日','T: trabajado')}</span><span class="status">${L('休：休息日','L: libre')}</span><span class="status alert">${L('异：与排班相差≥10分钟','I: diferencia ≥10 min')}</span><span class="status alert">${L('缺：缺勤','A: ausencia')}</span><span class="status sick-leave">${L('病：病假','B: baja médica')}</span><span class="status annual-leave">${L('年：年假','V: vacaciones')}</span><span class="status pending">${L('待：待打卡','P: pendiente')}</span><span class="status alert">${L('未：未打卡','SF: sin fichajes')}</span></div>
-    ${monthlyAttendanceCalendar(attendanceItems)}</article>
-      <details class="card compact-details"><summary>${L('查看每日详细时间与修改历史','Ver horas diarias y correcciones')}</summary>${attendanceTable(attendanceItems,true,true)}</details>
+    ${attendanceTable(filteredAttendance(),true,true)}</article>
       <details class="card compact-details"><summary>${L('打卡照片', 'Fotos de fichaje')}</summary><p>${L('只有上班和下班打卡拍照。点击“查看照片”时生成短时有效链接，照片不会下载到店铺电脑。', 'Solo se fotografían la entrada y la salida. “Ver foto” crea un enlace temporal; la foto no se descarga en el ordenador de tienda.')}</p>${eventTable(state.data.photoEvents || [])}</details>
   <details class="card compact-details"><summary>${L('修改历史', 'Historial de cambios')}</summary>${auditTable()}</details>
     <details class="card compact-details"><summary>${L('连接检查','Comprobar conexión')}</summary><p>${L('保存异常时检查后台服务。','Comprueba el servidor si falla un guardado.')}</p><button id="checkAdminConnection" type="button" class="secondary-btn">${L('检查后台连接','Comprobar servidor')}</button><pre id="connectionResult" role="status"></pre></details>`;
@@ -1623,21 +1273,12 @@ function openCorrectionDialog(employeeId, date) {
   const title = fixed ? `${employee.full_name} · ${dateText(date)}` : L('补充考勤记录','Añadir registro');
   openEditDialog(title, `<form id="correctionForm" class="stack-form">
     ${fixed ? `<input type="hidden" id="correctionEmployee" value="${employeeId}"><input type="hidden" id="correctionDate" value="${date}">` : `<div class="form-row"><label>${L('员工','Empleado')}<select id="correctionEmployee">${employeeOptions(false,state.attendanceEmployeeId)}</select></label><label>${L('日期','Fecha')}<input id="correctionDate" type="date" value="${madridDate()}" required></label></div>`}
-    <label>${L('处理类型','Tipo')}<select id="correctionKind"><option value="attendance">${L('补充／修正打卡','Corregir fichajes')}</option><option value="sick_leave">${L('病假','Baja médica')}</option><option value="absence">${L('缺勤','Ausencia')}</option></select></label>
+    <label>${L('处理类型','Tipo')}<select id="correctionKind"><option value="attendance">${L('补充／修正打卡','Corregir fichajes')}</option><option value="absence">${L('缺勤','Ausencia')}</option></select></label>
     <p id="correctionLoadStatus" role="status"></p><button id="loadCorrection" type="button" class="ghost-btn">${L('重新载入','Recargar')}</button>
     <div id="correctionTimeFields"><div class="form-row"><label>${L('上班','Entrada')}<input id="correctionClockIn" type="time"></label><label>${L('下班','Salida')}<input id="correctionClockOut" type="time"></label></div><div class="form-row"><label>${L('开始休息','Inicio pausa')}<input id="correctionBreakStart" type="time"></label><label>${L('结束休息','Fin pausa')}<input id="correctionBreakEnd" type="time"></label></div></div>
-    <label>${L('常用修改原因（自动双语）','Motivo habitual (bilingüe automático)')}<select id="correctionReasonPreset"><option value="">${L('自定义原因','Motivo personalizado')}</option><option value="missed_punch">${L('忘记打卡','Olvido de fichaje')}</option><option value="approved_request">${L('已批准的补卡申请','Solicitud de fichaje aprobada')}</option><option value="system_error">${L('打卡系统无法操作','Error del sistema de fichaje')}</option><option value="wrong_time">${L('记录时间与实际不符','Hora registrada incorrecta')}</option><option value="early_departure">${L('实际提前离店','Salida anticipada real')}</option><option value="verified">${L('核对排班及记录后修正','Corrección tras verificación')}</option><option value="absence">${L('缺勤','Ausencia')}</option><option value="sick_leave">${L('病假','Baja médica')}</option></select></label>
-    <p>${L('常用原因会自动填写中文和西班牙语；自定义原因请同时填写两种语言。','Los motivos habituales completan automáticamente chino y español. Para un motivo personalizado, completa ambos idiomas.')}</p>
-    <label>中文·修改原因<textarea id="correctionReasonZh" minlength="2" required placeholder="请用中文说明修改原因"></textarea></label>
-    <label>Español · Motivo del cambio<textarea id="correctionReasonEs" minlength="5" required placeholder="Indica el motivo de la corrección en español"></textarea></label><p id="correctionSaveStatus" class="save-status" role="status"></p><button class="primary-btn" type="submit" disabled>${L('保存双语修改','Guardar corrección bilingüe')}</button></form>`);
+    <label>${L('修改原因','Motivo del cambio')}<textarea id="correctionReason" minlength="5" required placeholder="${L('请说明本次修改原因','Indica el motivo de este cambio')}"></textarea></label><p id="correctionSaveStatus" class="save-status" role="status"></p><button class="primary-btn" type="submit" disabled>${L('保存修改','Guardar cambios')}</button></form>`);
   $('#correctionForm').addEventListener('submit',saveCorrection);
   $('#correctionKind').addEventListener('change',toggleCorrectionFields);
-  $('#correctionReasonPreset').addEventListener('change', (event) => {
-    const preset = CORRECTION_REASON_PRESETS[event.currentTarget.value];
-    if (!preset) return;
-    $('#correctionReasonZh').value = preset.zh;
-    $('#correctionReasonEs').value = preset.es;
-  });
   $('#loadCorrection').onclick = () => {
     if($('#modalRoot').dataset.dirty === 'true' && !confirm(L('重新载入会替换当前填写内容，继续？','La recarga sustituye los datos del formulario. ¿Continuar?'))) return;
     loadCorrectionRecord();
@@ -1700,32 +1341,21 @@ async function refreshEditedRecord(body, successMessage, previousCorrectionId = 
     const table = body.action === 'upsert_schedule' ? 'schedules' : 'attendance_daily';
     let result;
     for (let attempt = 0; attempt < (body.action === 'correct_attendance' ? 4 : 1); attempt += 1) {
-      if (attempt) await new Promise((resolve) => setTimeout(resolve, attempt * 300));
+      if (attempt) await waitMs(attempt * 300);
       result = await client.from(table).select(table === 'schedules' ? '*, stores(name)' : '*')
-        .eq('employee_id',body.employeeId).eq('work_date',body.workDate).abortSignal(AbortSignal.timeout(8000)).maybeSingle();
+        .eq('employee_id',body.employeeId).eq('work_date',body.workDate)
+        .abortSignal(AbortSignal.timeout(8000)).maybeSingle();
       if(result.error) throw result.error;
       if (body.action !== 'correct_attendance') break;
       const record = result.data;
-      const correctionApplied = body.correctionKind === 'void'
+      const saved = body.correctionKind === 'void'
         ? !record?.corrected
         : Boolean(record?.corrected && (!previousCorrectionId || record.correction_id !== previousCorrectionId));
-      if (correctionApplied) break;
+      if (saved) break;
     }
-    const field = table === 'schedules' ? 'schedules' : 'attendance';
-    state.data[field] = state.data[field].filter(item=>item.employee_id !== body.employeeId || item.work_date !== body.workDate);
-    if(!result.data && body.action === 'correct_attendance' && body.correctionKind === 'void') { await loadPortalData();renderPortal();toast(successMessage);return; }
-    if(!result.data) throw new Error('RECORD_NOT_FOUND');
-    const record = result.data;
-    state.data[field].push(record);
-    if(table === 'schedules') {
-      state.data.schedules.sort((a,b)=>a.work_date.localeCompare(b.work_date));
-      state.data.annualLeave = (state.data.annualLeave || []).filter(item=>item.employee_id !== body.employeeId || item.work_date !== body.workDate);
-      if(scheduleKind(record) === 'annual_leave' && record.published) state.data.annualLeave.push({employee_id:body.employeeId,work_date:body.workDate});
-    } else {
-      state.data.attendance.sort((a,b)=>b.work_date.localeCompare(a.work_date));
-      await loadPortalData();
-    }
-    renderPortal();toast(successMessage);
+    if(!result?.data && !(body.action === 'correct_attendance' && body.correctionKind === 'void')) throw new Error('RECORD_NOT_FOUND');
+    await reloadPortal();
+    toast(successMessage);
   } catch(error) {
     toast(L('已保存，但最新记录加载失败，请点击刷新。','Guardado, pero no se pudo actualizar el registro. Pulsa actualizar.'),true);
   }
@@ -1780,26 +1410,14 @@ function bindPortal() {
   $('#languageToggle')?.addEventListener('click', () => setLang(state.lang === 'zh' ? 'es' : 'zh'));
   $('#logout')?.addEventListener('click', logout);
   $('#refreshData')?.addEventListener('click', refreshPortal);
-  $$('[data-view]').forEach((button) => button.addEventListener('click', () => {
-    state.view = button.dataset.view;
-    renderPortal();
-    if (state.profile?.role === 'manager' && state.view === 'home') refreshManagerLiveSnapshot();
-  }));
+  $$('[data-view]').forEach((button) => button.addEventListener('click', () => { state.view = button.dataset.view; renderPortal(); }));
   $('#requestForm')?.addEventListener('submit', submitRequest);
-  $$('[data-request-missed]').forEach((button) => button.addEventListener('click', () => {
-    state.view = 'requests';
-    renderPortal();
-    $('#requestType').value = 'missed_punch';
-    $('#requestDate').value = button.dataset.requestMissed;
-    $('#requestTime').focus();
-  }));
   $$('[data-gps-punch]').forEach((button) => button.addEventListener('click', () => gpsPunch(button.dataset.gpsPunch, button.dataset.gpsPermission || null)));
   $('#employeeForm')?.addEventListener('submit', createEmployee);
   $$('[data-toggle-employee]').forEach((button) => button.addEventListener('click', () => toggleEmployee(button)));
   $$('[data-delete-employee]').forEach((button) => button.addEventListener('click', () => deleteEmployee(button)));
   $$('[data-reset]').forEach((button) => button.addEventListener('click', () => resetEmployeeCredential(button)));
   $('#weeklyScheduleForm')?.addEventListener('submit', saveMonthlySchedule);
-  $('#copyPreviousMonth')?.addEventListener('click', copyPreviousMonthSchedule);
   $('#weeklyEmployee')?.addEventListener('change', changeWeeklyEmployee);
   $('#weeklyMonth')?.addEventListener('change', changeScheduleMonth);
   bindWeeklyRows();
@@ -1814,7 +1432,6 @@ function bindPortal() {
   $('#monthlyReportForm')?.addEventListener('submit', (event) => generateMonthlyReports(event, !$('#reportEmployee').value));
   $('#previewAllReports')?.addEventListener('click', (event) => generateMonthlyReports(event, true));
   $('#newCorrection')?.addEventListener('click', () => openCorrectionDialog());
-  $$('[data-calendar-correct]').forEach(button => button.addEventListener('click', () => openCorrectionDialog(button.dataset.calendarCorrect, button.dataset.workDate)));
   $$('[data-edit-attendance]').forEach(button => button.addEventListener('click', () => openCorrectionDialog(button.dataset.editAttendance,button.dataset.workDate)));
   $$('[data-void-attendance]').forEach(button => button.addEventListener('click', () => openVoidCorrectionDialog(button.dataset.voidAttendance,button.dataset.workDate)));
   $('#reportEmployee')?.addEventListener('change', event => { state.attendanceEmployeeId = event.target.value; renderPortal(); });
@@ -1836,18 +1453,26 @@ async function logout() {
   renderAuth();
 }
 
+let portalReloadPromise = null;
 async function reloadPortal() {
-  await withTimeout(loadPortalData());
-  renderPortal();
+  if (portalReloadPromise) return portalReloadPromise;
+  portalReloadPromise = (async () => {
+    await withTimeout(loadPortalData());
+    renderPortal();
+  })();
+  try { return await portalReloadPromise; }
+  finally { portalReloadPromise = null; }
 }
 
 async function refreshPortal() {
+  const button = $('#refreshData');
+  if (button) button.disabled = true;
   try {
     await reloadPortal();
     toast(L('已刷新', 'Actualizado'));
   } catch (error) {
     toast(errorText(error), true);
-  }
+  } finally { if (button?.isConnected) button.disabled = false; }
 }
 
 async function finishMutation(successMessage) {
@@ -1891,18 +1516,17 @@ async function submitRequest(event) {
 async function confirmEmployeePunch(eventType, previousValue) {
   const field = ({ clock_in: 'clock_in', break_start: 'break_start', break_end: 'break_end', clock_out: 'clock_out' })[eventType];
   if (!field) return null;
-  const actualField = `actual_${field}`;
   await new Promise((resolve) => setTimeout(resolve, 700));
   const today = madridDate();
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const [daily, events] = await withTimeout(Promise.all([
-    client.from('attendance_daily').select(actualField).eq('work_date', today).maybeSingle(),
+    client.from('attendance_daily').select(field).eq('work_date', today).maybeSingle(),
     client.from('attendance_events').select('occurred_at').eq('employee_id', state.profile.user_id)
       .eq('event_type', eventType).gte('occurred_at', dayStart).lt('occurred_at', dayEnd)
       .order('occurred_at', { ascending: false }).limit(1),
   ]), 7_000);
-  const confirmedAt = daily.data?.[actualField] || events.data?.[0]?.occurred_at || null;
+  const confirmedAt = daily.data?.[field] || events.data?.[0]?.occurred_at || null;
   if (!confirmedAt || confirmedAt === previousValue) return null;
   return confirmedAt;
 }
@@ -1913,7 +1537,7 @@ async function gpsPunch(eventType, permissionId = null) {
   state.busy = true;
   $$('[data-gps-punch]').forEach((button) => { button.disabled = true; });
   const currentRecord = (state.data.attendance || []).find((item) => item.work_date === madridDate());
-  const previousValue = attendanceValue(currentRecord, 'actual', eventType);
+  const previousValue = currentRecord?.[eventType] || null;
   toast(L('正在确认你位于店铺100米内…', 'Comprobando que estás a menos de 100 m…'));
   try {
     const position = await new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, {
@@ -2059,71 +1683,6 @@ function editSchedule(button) {
   $('#singleScheduleForm').addEventListener('submit',saveSingleSchedule);
   $('#singleScheduleKind').addEventListener('change',toggleSingleScheduleTimes);
   toggleSingleScheduleTimes({target:$('#singleScheduleKind')});
-}
-
-function mostCommonPreviousMonthPattern(items, fallbackStoreId) {
-  return Array.from({ length: 7 }, (_, weekday) => {
-    const candidates = items.filter((item) => scheduleKind(item) !== 'annual_leave'
-      && scheduleWeekdayIndex(item.work_date) === weekday);
-    if (!candidates.length) return null;
-    const choices = new Map();
-    candidates.forEach((item) => {
-      const dayOff = scheduleKind(item) === 'day_off';
-      const choice = {
-        dayOff,
-        storeId: item.store_id || fallbackStoreId || '',
-        start: madridTimeValue(item.starts_at, '10:00'),
-        end: madridTimeValue(item.ends_at, '17:00'),
-      };
-      const key = JSON.stringify(choice);
-      const current = choices.get(key) || { choice, count: 0, lastDate: '' };
-      current.count += 1;
-      if (item.work_date > current.lastDate) current.lastDate = item.work_date;
-      choices.set(key, current);
-    });
-    return [...choices.values()].sort((left, right) => right.count - left.count
-      || right.lastDate.localeCompare(left.lastDate))[0].choice;
-  });
-}
-
-async function copyPreviousMonthSchedule(event) {
-  const button = event.currentTarget;
-  const employee = selectedScheduleEmployee();
-  const targetMonth = $('#weeklyMonth')?.value || currentScheduleMonth();
-  const sourceMonth = previousMonthString(targetMonth);
-  if (!employee || !sourceMonth) return;
-  button.disabled = true;
-  try {
-    const sourceResult = await client.from('schedules').select('work_date,store_id,starts_at,ends_at,is_day_off,schedule_kind,published')
-      .eq('employee_id', employee.user_id).eq('published', true)
-      .gte('work_date', `${sourceMonth}-01`).lte('work_date', monthLastDate(sourceMonth))
-      .order('work_date').abortSignal(AbortSignal.timeout(8000));
-    if (sourceResult.error) throw sourceResult.error;
-    const pattern = mostCommonPreviousMonthPattern(sourceResult.data || [], employee.home_store_id);
-    if (pattern.some((item) => !item) || pattern.every((item) => item.dayOff)
-      || pattern.some((item) => !item.storeId || (!item.dayOff && (!item.start || !item.end || item.end <= item.start)))) {
-      toast(L('上月没有完整的周一至周日排班，无法自动复制。请使用周模板生成。', 'El mes anterior no tiene un horario completo de lunes a domingo. Usa la plantilla semanal.'), true);
-      return;
-    }
-    const sourceLabel = new Intl.DateTimeFormat(state.lang === 'zh' ? 'zh-CN' : 'es-ES', { year: 'numeric', month: 'long', timeZone: 'UTC' }).format(new Date(`${sourceMonth}-15T12:00:00Z`));
-    const targetLabel = new Intl.DateTimeFormat(state.lang === 'zh' ? 'zh-CN' : 'es-ES', { year: 'numeric', month: 'long', timeZone: 'UTC' }).format(new Date(`${targetMonth}-15T12:00:00Z`));
-    if (!confirm(L(
-      `将按 ${employee.full_name} ${sourceLabel} 最常用的每周排班生成 ${targetLabel}，覆盖本月工作日和休息日；已登记年假保留。确定继续？`,
-      `Se generará ${targetLabel} para ${employee.full_name} usando el patrón semanal más habitual de ${sourceLabel}. Se sustituirán los días laborables y libres; las vacaciones registradas se conservarán. ¿Continuar?`,
-    ))) return;
-    const result = await adminAction({
-      action: 'publish_month_schedule',
-      employeeId: employee.user_id,
-      month: targetMonth,
-      pattern,
-      notes: `Copied from ${sourceMonth}`,
-    });
-    await finishMutation(L(`已复制上月排班，共生成${result.count}天`, `Horario anterior copiado: ${result.count} días`));
-  } catch (error) {
-    toast(errorText(error), true);
-  } finally {
-    button.disabled = false;
-  }
 }
 
 async function saveMonthlySchedule(event) {
@@ -2278,25 +1837,19 @@ async function loadCorrectionRecord() {
   const fields = ['correctionClockIn', 'correctionBreakStart', 'correctionBreakEnd', 'correctionClockOut'];
   submit.disabled = true;
   fields.forEach((id) => { $('#' + id).value = ''; $('#' + id).disabled = true; });
-  $('#correctionReasonPreset').value = '';
-  $('#correctionReasonZh').value = '';
-  $('#correctionReasonEs').value = '';
+  $('#correctionReason').value = '';
   status.textContent = L('正在载入最新记录…', 'Cargando registro actual…');
   try {
     const result = await client.from('attendance_daily').select('*').eq('employee_id', employeeId).eq('work_date', workDate).abortSignal(AbortSignal.timeout(8000)).maybeSingle();
     if (sequence !== correctionLoadSequence || !form.isConnected) return;
     if (result.error) throw result.error;
     const record = result.data;
-    const existingReason = splitBilingualReason(record?.correction_reason);
-    $('#correctionReasonZh').value = existingReason.zh;
-    $('#correctionReasonEs').value = existingReason.es;
-    $('#correctionKind').value = isSickLeaveRecord(record) ? 'sick_leave' : record?.correction_kind === 'absence' ? 'absence' : 'attendance';
+    $('#correctionKind').value = record?.correction_kind === 'absence' ? 'absence' : 'attendance';
     toggleCorrectionFields();
     ['clock_in', 'break_start', 'break_end', 'clock_out'].forEach((key, index) => {
-      const value = attendanceValue(record, 'payroll', key);
-      $('#' + fields[index]).value = value ? new Intl.DateTimeFormat('en-GB', {
+      $('#' + fields[index]).value = record?.[key] ? new Intl.DateTimeFormat('en-GB', {
         timeZone: MADRID_TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-      }).format(new Date(value)) : '';
+      }).format(new Date(record[key])) : '';
     });
     status.textContent = record
       ? L('已载入当前生效记录，可再次修改并填写本次原因。', 'Registro vigente cargado. Puedes corregirlo de nuevo indicando el motivo.')
@@ -2314,11 +1867,11 @@ function toggleCorrectionFields() {
   const kind = $('#correctionKind');
   const fields = $('#correctionTimeFields');
   if (!kind || !fields) return;
-  const nonAttendance = kind.value !== 'attendance';
-  fields.hidden = nonAttendance;
+  const absence = kind.value === 'absence';
+  fields.hidden = absence;
   fields.querySelectorAll('input').forEach((input) => {
-    input.disabled = nonAttendance;
-    if (nonAttendance) input.value = '';
+    input.disabled = absence;
+    if (absence) input.value = '';
   });
 }
 
@@ -2328,7 +1881,6 @@ async function saveCorrection(event) {
   const button = form.querySelector('button[type="submit"]');
   const date = $('#correctionDate').value;
   const correctionKind = $('#correctionKind').value;
-  const backendCorrectionKind = correctionKind === 'attendance' ? 'attendance' : 'absence';
   const employeeId = $('#correctionEmployee').value;
   const iso = (selector) => $(selector).value ? madridLocalToIso(date, $(selector).value) : null;
   if (correctionKind === 'attendance' && !$('#correctionClockIn').value && !$('#correctionClockOut').value && !$('#correctionBreakStart').value && !$('#correctionBreakEnd').value) {
@@ -2340,39 +1892,22 @@ async function saveCorrection(event) {
   if (suppliedTimes.some((value, index) => index > 0 && value <= suppliedTimes[index - 1])) {
     toast(errorText('INVALID_TIME_RANGE'), true); return;
   }
-  const reasonZh = $('#correctionReasonZh').value.trim();
-  const reasonEs = $('#correctionReasonEs').value.trim();
-  if (reasonZh.length < 2 || reasonEs.length < 5) {
-    toast(L('修改原因必须同时填写中文和西班牙语', 'El motivo debe estar escrito en chino y en español'), true); return;
-  }
-  const reason = bilingualReason(reasonZh, reasonEs);
   if (button.disabled) return;
   await editorSave(form,'#correctionSaveStatus',{
-    action:'correct_attendance',correctionKind:backendCorrectionKind,employeeId,workDate:date,
-    clockIn:backendCorrectionKind === 'absence' ? null : iso('#correctionClockIn'),
-    breakStart:backendCorrectionKind === 'absence' ? null : iso('#correctionBreakStart'),
-    breakEnd:backendCorrectionKind === 'absence' ? null : iso('#correctionBreakEnd'),
-    clockOut:backendCorrectionKind === 'absence' ? null : iso('#correctionClockOut'),
-    reason:correctionKind === 'sick_leave' ? `${SICK_LEAVE_MARKER} ${reason}` : reason,
+    action:'correct_attendance',correctionKind,employeeId,workDate:date,
+    clockIn:correctionKind === 'absence' ? null : iso('#correctionClockIn'),
+    breakStart:correctionKind === 'absence' ? null : iso('#correctionBreakStart'),
+    breakEnd:correctionKind === 'absence' ? null : iso('#correctionBreakEnd'),
+    clockOut:correctionKind === 'absence' ? null : iso('#correctionClockOut'),reason:$('#correctionReason').value,
   },L('考勤修改已保存','Corrección guardada'));
 }
 
 function csvCell(value) { return `"${String(value ?? '').replaceAll('"', '""')}"`; }
 function exportCsv() {
-  const header = ['nif', 'employee', 'date', 'store', 'clock_in', 'break_start', 'break_end', 'clock_out', 'scheduled_start', 'scheduled_end', 'effective_work_minus_recorded_break', 'record_kind', 'corrected', 'correction_reason'];
-  const employeeById = new Map(state.data.employees.map((employee) => [employee.user_id, employee]));
+  const header = ['employee_no', 'employee', 'date', 'store', 'clock_in_effective', 'scheduled_start', 'counted_start', 'break_start', 'break_end', 'clock_out', 'effective_work', 'break_duration', 'record_kind', 'corrected', 'correction_reason'];
   const rows = filteredAttendance().map((item) => {
     const schedule = attendanceSchedule(item);
-    const nonWorking = item.correction_kind === 'absence' || ['day_off', 'annual_leave'].includes(item.display_schedule_kind);
-    const recordKind = isSickLeaveRecord(item) ? 'sick_leave'
-      : item.correction_kind === 'absence' ? 'absence'
-      : item.display_schedule_kind || item.correction_kind || 'unscheduled';
-    const effectiveRecord = effectiveAttendance(item);
-    return [employeeById.get(item.employee_id)?.nif || '', item.employee_name, item.work_date, item.store_name,
-      timeText(effectiveRecord.clock_in), timeText(effectiveRecord.break_start),
-      timeText(effectiveRecord.break_end), timeText(effectiveRecord.clock_out),
-      timeText(schedule?.starts_at), timeText(schedule?.ends_at), nonWorking ? '0h 00m' : scheduledEffectiveText(item, schedule),
-      recordKind, item.corrected ? 'YES' : 'NO', visibleCorrectionReason(item)];
+    return [item.employee_no, item.employee_name, item.work_date, item.store_name, timeText(item.clock_in), timeText(schedule?.starts_at), timeText(countedStart(item, schedule)), timeText(item.break_start), timeText(item.break_end), timeText(item.clock_out), item.correction_kind === 'absence' ? '0h 00m' : shiftDurationText(item, schedule), item.correction_kind === 'absence' ? '0m' : breakDurationText(item), item.correction_kind || 'attendance', item.corrected ? 'YES' : 'NO', item.correction_reason || ''];
   });
   const csv = '\uFEFF' + [header, ...rows].map((row) => row.map(csvCell).join(';')).join('\r\n');
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
@@ -2400,47 +1935,43 @@ function reportDateText(dateString) {
 
 function monthlyReportRow(date, schedule, attendance) {
   const absence = attendance?.correction_kind === 'absence';
-  const sickLeave = isSickLeaveRecord(attendance);
-  const effectiveRecord = effectiveAttendance(attendance);
-  const actualClockIn = effectiveRecord.clock_in;
-  const actualBreakStart = effectiveRecord.break_start;
-  const actualBreakEnd = effectiveRecord.break_end;
-  const actualClockOut = effectiveRecord.clock_out;
-  const hasPunch = Boolean(actualClockIn || actualBreakStart || actualBreakEnd || actualClockOut);
+  const hasPunch = Boolean(attendance && (attendance.clock_in || attendance.break_start || attendance.break_end || attendance.clock_out));
   const dayOff = Boolean(schedule?.is_day_off);
   const annualLeave = scheduleKind(schedule) === 'annual_leave';
-  const future = date > madridDate();
-  const rawPresenceMinutes = durationMinutes(actualClockIn, actualClockOut);
-  const hasBreakStart = Boolean(actualBreakStart);
-  const hasBreakEnd = Boolean(actualBreakEnd);
+  const rawPresenceMinutes = durationMinutes(attendance?.clock_in, attendance?.clock_out);
+  const countedClockIn = countedStart(attendance, schedule);
+  const presenceMinutes = durationMinutes(countedClockIn, attendance?.clock_out);
+  const hasBreakStart = Boolean(attendance?.break_start);
+  const hasBreakEnd = Boolean(attendance?.break_end);
   const hasCompleteBreak = hasBreakStart && hasBreakEnd;
-  const rawBreakMinutes = durationMinutes(actualBreakStart, actualBreakEnd);
+  const rawBreakMinutes = durationMinutes(attendance?.break_start, attendance?.break_end);
   const breakPairValid = hasBreakStart === hasBreakEnd;
-  const sequenceValid = rawPresenceMinutes !== null && breakPairValid
+  const sequenceValid = rawPresenceMinutes !== null && presenceMinutes !== null && breakPairValid
     && (!hasCompleteBreak || (rawBreakMinutes !== null
-      && new Date(actualClockIn) <= new Date(actualBreakStart)
-      && new Date(actualBreakEnd) <= new Date(actualClockOut)
+      && new Date(attendance.clock_in) <= new Date(attendance.break_start)
+      && new Date(attendance.break_end) <= new Date(attendance.clock_out)
       && rawBreakMinutes <= rawPresenceMinutes));
-  const effectiveMinutes = scheduledEffectiveMinutes(attendance || {}, schedule);
-  const deviation = attendanceScheduleDeviation(attendance, schedule);
+  const effectiveBreakStart = sequenceValid && hasCompleteBreak && new Date(attendance.break_start) < countedClockIn
+    ? countedClockIn
+    : new Date(attendance?.break_start);
+  const breakMinutes = sequenceValid && hasCompleteBreak
+    ? Math.max(0, durationMinutes(effectiveBreakStart, attendance.break_end) ?? 0)
+    : sequenceValid ? 0 : null;
+  const effectiveMinutes = sequenceValid ? presenceMinutes - breakMinutes : null;
+  const earlyArrivalMinutes = schedule?.starts_at && attendance?.clock_in
+    ? durationMinutes(attendance.clock_in, schedule.starts_at)
+    : null;
   const issues = [];
   let hasIncident = false;
 
-  if (sickLeave) {
-    const reason = visibleCorrectionReason(attendance);
-    issues.push(`病假 / Baja médica${reason ? `：${reason}` : ''}`);
-  } else if (absence) {
-    const reason = visibleCorrectionReason(attendance);
-    issues.push(`缺勤 / Ausencia${reason ? `：${reason}` : ''}`);
+  if (absence) {
+    issues.push(`缺勤 / Ausencia${attendance.correction_reason ? `：${attendance.correction_reason}` : ''}`);
     hasIncident = true;
   } else if (annualLeave && !hasPunch) {
     issues.push('年假 / Vacaciones');
   } else if (dayOff && !hasPunch) {
-    issues.push('休息日 / Día libre');
-  } else if (future && !hasPunch) {
-    issues.push(schedule ? '工作日 · 待打卡 / Día laborable · Pendiente' : '未排班 / Sin horario');
+    issues.push('休息 / Libre');
   } else {
-    if (schedule && scheduleKind(schedule) === 'work') issues.push('工作日 / Día laborable');
     if (!schedule) { issues.push('无排班 / Sin horario'); hasIncident = true; }
     if (annualLeave && hasPunch) { issues.push('年假期间有打卡 / Fichaje durante vacaciones'); hasIncident = true; }
     else if (dayOff && hasPunch) { issues.push('休息日有打卡 / Fichaje en día libre'); hasIncident = true; }
@@ -2449,57 +1980,38 @@ function monthlyReportRow(date, schedule, attendance) {
       hasIncident = true;
     } else {
       const missing = [
-        [actualClockIn, '上班 / entrada'],
-        [actualClockOut, '下班 / salida'],
-      ].filter(([value]) => !value).map(([, label]) => label);
+        ['clock_in', '上班 / entrada'],
+        ['clock_out', '下班 / salida'],
+      ].filter(([field]) => !attendance?.[field]).map(([, label]) => label);
       if (missing.length) { issues.push(`缺少 ${missing.join('、')}`); hasIncident = true; }
       if (!breakPairValid) { issues.push('午休记录不完整 / Pausa incompleta'); hasIncident = true; }
       else if (!sequenceValid) { issues.push('时间顺序异常 / Orden incorrecto'); hasIncident = true; }
       else if (!hasCompleteBreak) issues.push('未午休 / Sin pausa');
 
-      if (Number.isFinite(deviation?.start) && Math.abs(deviation.start) >= 10) {
-        issues.push(deviation.start > 0
-          ? `迟到 / Retraso ${deviation.start}m`
-          : `提前上班 / Entrada anticipada ${Math.abs(deviation.start)}m`);
-        hasIncident = true;
-      }
-      if (Number.isFinite(deviation?.end) && Math.abs(deviation.end) >= 10) {
-        issues.push(deviation.end < 0
-          ? `早退 / Salida anticipada ${Math.abs(deviation.end)}m`
-          : `延时下班 / Salida posterior ${deviation.end}m`);
-        hasIncident = true;
-      }
+      const late = schedule?.starts_at && attendance?.clock_in ? durationMinutes(schedule.starts_at, attendance.clock_in) : null;
+      const early = schedule?.ends_at && attendance?.clock_out ? durationMinutes(attendance.clock_out, schedule.ends_at) : null;
+      if (!attendance?.corrected && earlyArrivalMinutes > 0) issues.push(`提前打卡 / Entrada anticipada ${earlyArrivalMinutes}m（不计入工时 / no computa）`);
+      if (late > 0) { issues.push(`迟到 / Retraso ${late}m`); hasIncident = true; }
+      if (early > 0) { issues.push(`早退 / Salida anticipada ${early}m`); hasIncident = true; }
       if (attendance?.corrected) issues.push(`已修正 / Corregido${attendance.correction_reason ? `：${attendance.correction_reason}` : ''}`);
     }
   }
 
-  const nonWorking = absence || dayOff || annualLeave;
   return {
     date,
     store: attendance?.store_name || (annualLeave ? '—' : schedule?.stores?.name) || '—',
-    actualClockIn: timeText(actualClockIn),
-    actualBreakStart: timeText(actualBreakStart),
-    actualBreakEnd: timeText(actualBreakEnd),
-    actualClockOut: timeText(actualClockOut),
-    effectiveMinutes: nonWorking ? 0 : effectiveMinutes,
+    clockIn: timeText(attendance?.clock_in),
+    breakStart: timeText(attendance?.break_start),
+    breakEnd: timeText(attendance?.break_end),
+    clockOut: timeText(attendance?.clock_out),
+    presenceMinutes: absence ? 0 : presenceMinutes,
+    breakMinutes: absence ? 0 : sequenceValid ? breakMinutes : null,
+    effectiveMinutes: absence ? 0 : effectiveMinutes,
     note: issues.join('；') || '正常 / Correcto',
     hasIncident,
     annualLeave,
     absence,
-    sickLeave,
-    dayOff,
-    future,
   };
-}
-
-function monthlyReportStatus(row) {
-  if (row.sickLeave) return { className: 'sick-leave', label: '病假 / Baja' };
-  if (row.absence) return { className: 'absence', label: '缺勤 / Ausencia' };
-  if (row.annualLeave) return { className: 'annual-leave', label: '年假 / Vacaciones' };
-  if (row.dayOff) return { className: 'day-off', label: '休息 / Libre' };
-  if (row.future && row.actualClockIn === '—') return { className: 'pending', label: '待打卡 / Pendiente' };
-  if (row.actualClockIn === '—' && row.actualClockOut === '—') return { className: 'missing', label: '未打卡 / Sin fichajes' };
-  return { className: row.hasIncident ? 'incident' : 'worked', label: '工作 / Trabajo' };
 }
 
 function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
@@ -2507,34 +2019,23 @@ function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
   const ownAttendance = attendance.filter((item) => item.employee_id === employee.user_id);
   const scheduleByDate = new Map(ownSchedules.map((item) => [item.work_date, item]));
   const attendanceByDate = new Map(ownAttendance.map((item) => [item.work_date, item]));
-  const dates = monthDates(month);
+  const dates = [...new Set([...scheduleByDate.keys(), ...attendanceByDate.keys()])].filter((date) => date <= reportEnd).sort();
   const rows = dates.map((date) => monthlyReportRow(date, scheduleByDate.get(date), attendanceByDate.get(date)));
+  const presenceTotal = rows.reduce((sum, row) => sum + (row.presenceMinutes ?? 0), 0);
+  const breakTotal = rows.reduce((sum, row) => sum + (row.breakMinutes ?? 0), 0);
   const effectiveTotal = rows.reduce((sum, row) => sum + (row.effectiveMinutes ?? 0), 0);
-  const completeDays = rows.filter((row) => !row.absence && !row.dayOff && !row.annualLeave && !row.future && row.effectiveMinutes !== null).length;
-  const dayOffDays = rows.filter((row) => row.dayOff && !row.annualLeave).length;
-  const sickLeaveDays = rows.filter((row) => row.sickLeave).length;
+  const completeDays = rows.filter((row) => !row.absence && row.effectiveMinutes !== null).length;
   const annualLeaveDays = rows.filter((row) => row.annualLeave).length;
   const incidentCount = rows.filter((row) => row.hasIncident).length;
   const monthLabel = new Intl.DateTimeFormat('es-ES', { timeZone: 'UTC', year: 'numeric', month: 'long' }).format(new Date(`${month}-15T12:00:00Z`));
-  const leadingBlanks = scheduleWeekdayIndex(`${month}-01`);
-  const trailingBlanks = (7 - ((leadingBlanks + rows.length) % 7)) % 7;
-  const calendarRows = [
-    ...Array.from({ length: leadingBlanks }, () => null),
-    ...rows,
-    ...Array.from({ length: trailingBlanks }, () => null),
-  ];
-  const calendarHtml = calendarRows.map((row) => {
-    if (!row) return '<div class="report-calendar-day outside-month"></div>';
-    const status = monthlyReportStatus(row);
-    return `<div class="report-calendar-day ${status.className} ${row.date === madridDate() ? 'today' : ''}"><div class="report-calendar-date"><b>${Number(row.date.slice(-2))}${row.date === madridDate() ? ` · ${L('今天','Hoy')}` : ''}</b><strong>${status.label}</strong></div><small>${escapeHTML(row.store)}</small><span>E ${row.actualClockIn} · S ${row.actualClockOut}</span><span>P ${row.actualBreakStart}–${row.actualBreakEnd}</span><b>${L('有效','Efectivas')} ${reportDuration(row.effectiveMinutes)}</b>${row.hasIncident ? `<em>${escapeHTML(row.note)}</em>` : ''}</div>`;
-  }).join('');
+  const rowHtml = rows.length ? rows.map((row) => `<tr class="${row.hasIncident ? 'report-incident' : ''}"><td>${escapeHTML(reportDateText(row.date))}</td><td>${escapeHTML(row.store)}</td><td>${row.clockIn}</td><td>${row.breakStart}</td><td>${row.breakEnd}</td><td>${row.clockOut}</td><td>${reportDuration(row.presenceMinutes)}</td><td>${reportDuration(row.breakMinutes)}</td><td>${reportDuration(row.effectiveMinutes)}</td><td>${escapeHTML(row.note)}</td></tr>`).join('') : `<tr><td colspan="10">本月没有已发布排班或考勤记录 / No hay horarios ni fichajes publicados</td></tr>`;
 
   return `<article class="monthly-report-sheet">
     <header class="report-header"><div><b>HOLA!SEVILLA</b><small>NOVAKEEPS S.L.</small></div><div><h1>Registro mensual de jornada</h1><p>月度工时签字表 · ${escapeHTML(monthLabel)}</p></div></header>
-    <div class="report-meta"><span><b>Empleado / 员工：</b>${escapeHTML(employee.full_name)}</span><span><b>NIF：</b>${escapeHTML(employee.nif || '—')}</span><span><b>Periodo / 统计截止：</b>${escapeHTML(month)}-01 — ${escapeHTML(reportEnd)}</span></div>
-    <div class="report-calendar"><div class="report-calendar-weekdays"><b>Lunes<br>星期一</b><b>Martes<br>星期二</b><b>Miércoles<br>星期三</b><b>Jueves<br>星期四</b><b>Viernes<br>星期五</b><b>Sábado<br>星期六</b><b>Domingo<br>星期天</b></div><div class="report-calendar-grid">${calendarHtml}</div></div>
-    <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Días libres / 休息日</small><b>${dayOffDays}</b></span><span><small>Ausencias / 缺勤</small><b>${rows.filter((row) => row.absence && !row.sickLeave).length}</b></span><span><small>Baja médica / 病假</small><b>${sickLeaveDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Horas efectivas / 有效工时</small><b>${reportDuration(effectiveTotal)}</b></span><span class="${incidentCount ? 'alert' : ''}"><small>Incidencias / 异常</small><b>${incidentCount}</b></span></div>
-    <p class="report-note">Las horas efectivas se calculan desde la entrada real o corregida hasta la salida real o corregida, descontando la pausa entre su inicio y fin. Si la entrada o la salida difiere 10 minutos o más del horario, se marca como incidencia.<br>有效工时按实际或补录后的上班至下班时间计算，再减去“开始休息—结束休息”的时长；上班或下班与排班相差10分钟及以上标记为异常。</p>
+    <div class="report-meta"><span><b>Empleado / 员工：</b>${escapeHTML(employee.full_name)}</span><span><b>N.º empleado / 编号：</b>${escapeHTML(employee.employee_no || '—')}</span><span><b>Periodo / 统计截止：</b>${escapeHTML(month)}-01 — ${escapeHTML(reportEnd)}</span></div>
+    <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Entrada real<br><small>实际打卡</small></th><th>Inicio pausa<br><small>午休开始</small></th><th>Fin pausa<br><small>午休结束</small></th><th>Salida<br><small>下班</small></th><th>Presencia computada<br><small>计时跨度</small></th><th>Pausa<br><small>午休</small></th><th>Horas efectivas<br><small>有效工时</small></th><th>Incidencias / 备注</th></tr></thead><tbody>${rowHtml}</tbody></table>
+    <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Presencia computada / 计时跨度</small><b>${reportDuration(presenceTotal)}</b></span><span><small>Pausas / 午休合计</small><b>${reportDuration(breakTotal)}</b></span><span><small>Horas efectivas / 有效工时</small><b>${reportDuration(effectiveTotal)}</b></span><span class="${incidentCount ? 'alert' : ''}"><small>Incidencias / 异常</small><b>${incidentCount}</b></span></div>
+    <p class="report-note">La entrada puede ficharse desde 5 minutos antes del turno, pero el tiempo efectivo empieza a la hora programada. Si se ficha tarde, empieza desde el fichaje real. Si hay una pausa completa, se descuenta; una pausa incompleta debe corregirse.<br>上班卡可在排班开始前5分钟内打，但有效工时从排班开始时间计算；迟到则从实际打卡时间计算。完整午休会扣除，午休记录不完整时必须先修正。</p>
     <div class="report-signatures"><div><span>Firma del trabajador / 员工签字</span><i></i><small>Fecha / 日期：________________</small></div><div><span>Firma de la empresa / 公司签字</span><i></i><small>Fecha / 日期：________________</small></div></div>
     <footer>El trabajador confirma la recepción y revisión de este registro, sin renunciar a comunicar discrepancias. / 员工签字表示已收到并核对本表，如有差异仍可书面提出。</footer>
   </article>`;
@@ -2549,7 +2050,7 @@ async function generateMonthlyReports(event, allEmployees) {
   buttons.forEach((button) => { button.disabled = true; });
   try {
     const monthStart = `${month}-01`;
-    const reportEnd = monthLastDate(month);
+    const reportEnd = month === madridDate().slice(0, 7) ? madridDate() : monthLastDate(month);
     const [schedulesResult, attendanceResult] = await Promise.all([
       client.from('schedules').select('*, stores(name)').gte('work_date', monthStart).lte('work_date', reportEnd).eq('published', true).order('work_date'),
       client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', reportEnd).order('work_date'),
@@ -2586,7 +2087,7 @@ function renderCurrent() {
 async function initialize() {
   document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : 'es';
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js?v=20261002-11').then((registration) => registration.update()).catch(() => {});
+    navigator.serviceWorker.register(`./sw.js?v=${BUILD_VERSION}`).then((registration) => registration.update()).catch(() => {});
   }
   if (!configured) { renderConfigurationError(); return; }
   try {
@@ -2626,22 +2127,6 @@ setInterval(() => {
   const kioskClock = $('#kioskTime'); if (kioskClock) kioskClock.textContent = timeText(new Date());
   const portalClock = $('#portalClock'); if (portalClock) portalClock.textContent = timeText(new Date());
 }, 1000);
-
-setInterval(() => {
-  if (document.visibilityState === 'visible' && state.profile?.role === 'manager' && state.view === 'home') {
-    refreshManagerLiveSnapshot();
-  }
-}, 5_000);
-
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && state.profile?.role === 'manager' && state.view === 'home') {
-    refreshManagerLiveSnapshot();
-  }
-});
-
-window.addEventListener('focus', () => {
-  if (state.profile?.role === 'manager' && state.view === 'home') refreshManagerLiveSnapshot();
-});
 
 initialize().catch((error) => {
   console.error('Application startup failed', error);
