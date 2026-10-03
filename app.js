@@ -15,7 +15,7 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
-const BUILD_VERSION = '20261003-restore3';
+const BUILD_VERSION = '20261003-live-overview1';
 
 function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
@@ -825,12 +825,13 @@ async function loadManagerData() {
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const photoStart = new Date(Date.now() - 30 * 86_400_000).toISOString();
-  const [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents, annualLeave] = await Promise.all([
+  const [stores, employees, schedules, todaySchedules, events, todayAttendance, requests, permissions, devices, attendance, audits, photoEvents, annualLeave] = await Promise.all([
     client.from('stores').select('*').order('name'),
     client.from('profiles').select('*, stores(name)').eq('role', 'employee').order('full_name'),
     client.from('schedules').select('*, stores(name)').gte('work_date', scheduleQueryStart).lte('work_date', scheduleQueryEnd).order('work_date'),
     client.from('schedules').select('*, stores(name)').eq('work_date', today).order('starts_at'),
     client.from('attendance_events').select('*, stores(name)').gte('occurred_at', dayStart).lt('occurred_at', dayEnd).order('occurred_at'),
+    client.from('attendance_daily').select('*').eq('work_date', today).order('employee_id'),
     client.from('requests').select('*').order('created_at', { ascending: false }).limit(100),
     client.from('gps_permissions').select('*, stores(name)').eq('active', true).gte('valid_until', new Date().toISOString()).order('valid_until'),
     client.from('kiosk_devices').select('*, stores(name)').order('created_at', { ascending: false }),
@@ -842,7 +843,7 @@ async function loadManagerData() {
     client.from('schedules').select('employee_id, work_date').eq('schedule_kind', 'annual_leave').eq('published', true)
       .gte('work_date', `${leaveYear}-01-01`).lte('work_date', `${leaveYear}-12-31`).order('work_date'),
   ]);
-  const results = [stores, employees, schedules, todaySchedules, events, requests, permissions, devices, attendance, audits, photoEvents];
+  const results = [stores, employees, schedules, todaySchedules, events, todayAttendance, requests, permissions, devices, attendance, audits, photoEvents];
   assertQueryResults(results);
   const employeeById = new Map((employees.data || []).map((employee) => [employee.user_id, employee]));
   const attachEmployee = (items) => (items || []).map((item) => ({ ...item, profiles: employeeById.get(item.employee_id) || null }));
@@ -852,6 +853,7 @@ async function loadManagerData() {
     schedules: attachEmployee(schedules.data),
     todaySchedules: attachEmployee(todaySchedules.data),
     events: attachEmployee(events.data),
+    todayAttendance: attachEmployee(todayAttendance.data),
     requests: attachEmployee(requests.data),
     permissions: attachEmployee(permissions.data),
     devices: devices.data || [],
@@ -1037,14 +1039,14 @@ function renderProfile() {
 
 function renderManagerHome() {
   const active = state.data.employees.filter((item) => item.active);
-  const punched = new Set(state.data.events.filter((event) => event.event_type === 'clock_in').map((event) => event.employee_id));
+  const punched = new Set(todayAttendanceRows(state.data.events).filter((row) => row.events.clock_in).map((row) => row.employeeId));
   const pending = state.data.requests.filter((item) => item.status === 'pending');
   const unconfigured = state.data.stores.filter((store) => store.latitude === null || store.longitude === null);
   const unhealthy = (state.health || []).filter((item) => !item.ok);
   return `${unhealthy.length ? `<div class="callout warning"><b>${L('系统版本未同步', 'Versión sin sincronizar')}</b><span>${L('以下后台需要重新部署：', 'Hay que volver a desplegar:')} ${unhealthy.map((item) => escapeHTML(item.name)).join('、')}</span></div>` : `<div class="callout"><b>${L('系统正常', 'Sistema correcto')}</b><span>${L('网页、数据库与三套后台服务连接正常。', 'La web, la base de datos y los tres servicios están conectados.')}</span></div>`}
   <div class="stat-grid"><article class="stat-card"><small>${L('在职员工', 'Empleados activos')}</small><b>${active.length}</b></article><article class="stat-card"><small>${L('今日已上班打卡', 'Entradas hoy')}</small><b>${punched.size}</b></article><article class="stat-card"><small>${L('待审批', 'Pendientes')}</small><b>${pending.length}</b></article><article class="stat-card"><small>${L('GPS未配置店铺', 'Tiendas sin GPS')}</small><b>${unconfigured.length}</b></article></div>
   ${unconfigured.length ? `<div class="callout warning"><b>${L('上线前必须完成', 'Pendiente antes de publicar')}</b><span>${L('请在“店铺设置”中填写四店准确地址、经纬度和有效范围。未配置的店铺不能使用GPS打卡。', 'Completa dirección, coordenadas y radio de las cuatro tiendas. Sin ello no se permite el fichaje GPS.')}</span></div>` : ''}
-  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日员工打卡汇总', 'Resumen de fichajes de hoy')}</h2><p>${L('按当天排班店铺分组，每名员工的上班、休息和下班记录集中在同一行。', 'Agrupado por la tienda programada; todos los fichajes de cada empleado aparecen en una sola fila.')}</p></div><span class="status ok">Europe/Madrid</span></div>${todayAttendanceSummary(state.data.events)}</article>`;
+  <article class="card"><div class="section-head"><div><p class="eyebrow">LIVE TODAY</p><h2>${L('今日员工打卡汇总', 'Resumen de fichajes de hoy')}</h2><p>${L('按当天排班店铺分组；管理员修正后立即显示，并每15秒自动更新。', 'Agrupado por la tienda programada; las correcciones aparecen inmediatamente y se actualiza cada 15 segundos.')}</p></div><span class="status ok">${L('实时更新', 'En directo')} · Europe/Madrid</span></div>${todayAttendanceSummary(state.data.events)}</article>`;
 }
 
 function todayAttendanceRows(events = []) {
@@ -1105,6 +1107,40 @@ function todayAttendanceRows(events = []) {
     }
   });
 
+  // attendance_daily is authoritative after an administrator correction. Raw events
+  // remain useful for source/photo evidence, but their old times must not overwrite
+  // the corrected values shown on the four-store dashboard.
+  (state.data.todayAttendance || []).filter((record) => record.work_date === today).forEach((record) => {
+    const schedule = scheduleByEmployee.get(record.employee_id) || null;
+    const row = ensureRow({
+      employeeId: record.employee_id,
+      storeId: record.store_id || schedule?.store_id,
+      profile: record.profiles || schedule?.profiles,
+      schedule,
+    });
+    row.attendanceRecord = record;
+    const evidenceEvents = { ...row.events };
+    if (record.corrected) {
+      row.events = {};
+      row.sources.add('admin_correction');
+    }
+    const fields = ['clock_in', 'break_start', 'break_end', 'clock_out'];
+    fields.forEach((field) => {
+      if (!record[field]) return;
+      const original = row.events[field];
+      if (record.corrected || !original) {
+        row.events[field] = {
+          ...(record.corrected ? (evidenceEvents[field] || {}) : original),
+          employee_id: record.employee_id,
+          store_id: record.store_id || schedule?.store_id || null,
+          event_type: field,
+          occurred_at: record[field],
+          source: record.corrected ? 'admin_correction' : (original?.source || 'daily'),
+        };
+      }
+    });
+  });
+
   return [...rows.values()].sort((a, b) => {
     if (a.storeOrder !== b.storeOrder) return a.storeOrder - b.storeOrder;
     const aStart = a.schedule?.starts_at || '99:99';
@@ -1116,6 +1152,7 @@ function todayAttendanceRows(events = []) {
 }
 
 function todayAttendanceStatus(row) {
+  if (row.attendanceRecord?.correction_kind === 'absence') return { className: 'alert', label: L('缺勤', 'Ausencia') };
   if (row.events.clock_out) return { className: 'ok', label: L('已下班', 'Finalizado') };
   if (row.events.break_start && !row.events.break_end) return { className: 'pending', label: L('休息中', 'En pausa') };
   if (row.events.clock_in) return { className: 'ok', label: L('工作中', 'Trabajando') };
@@ -1147,7 +1184,12 @@ function todayAttendanceSummary(events) {
     <div class="live-store-head"><h3>${escapeHTML(group.name)}</h3><span>${group.rows.length} ${L('人', 'personas')}</span></div>
     <div class="table-wrap live-summary-table"><table><thead><tr><th>${L('员工', 'Empleado')}</th><th>${L('排班', 'Horario')}</th><th>${L('上班', 'Entrada')}</th><th>${L('开始休息', 'Inicio pausa')}</th><th>${L('结束休息', 'Fin pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('当前状态', 'Estado')}</th><th>${L('方式', 'Origen')}</th><th>${L('现场照片', 'Fotos')}</th></tr></thead><tbody>${group.rows.map((row) => {
       const status = todayAttendanceStatus(row);
-      const sources = [...row.sources].map((source) => source === 'kiosk' ? L('电脑', 'PC') : source.toUpperCase()).join(' + ');
+      const sources = [...row.sources].map((source) => {
+        if (source === 'kiosk') return L('电脑', 'PC');
+        if (source === 'admin_correction') return L('管理员修正', 'Corrección admin.');
+        if (source === 'daily') return L('考勤记录', 'Registro');
+        return source.toUpperCase();
+      }).join(' + ');
       const photos = photoButtons(row);
       return `<tr><td class="live-employee"><b>${escapeHTML(row.employeeName)}</b><small>${escapeHTML(row.employeeNo)}</small></td><td>${row.schedule ? `${timeText(row.schedule.starts_at)}—${timeText(row.schedule.ends_at)}` : `<span class="status alert">${L('无排班', 'Sin horario')}</span>`}</td><td>${timeCell(row.events.clock_in)}</td><td>${timeCell(row.events.break_start)}</td><td>${timeCell(row.events.break_end)}</td><td>${timeCell(row.events.clock_out)}</td><td><span class="status ${status.className}">${status.label}</span></td><td>${sources ? `<span class="status ${row.sources.has('gps') ? 'pending' : 'ok'}">${escapeHTML(sources)}</span>` : '—'}</td><td><div class="live-photo-actions">${photos || '—'}</div></td></tr>`;
     }).join('')}</tbody></table></div>
@@ -2188,6 +2230,16 @@ setInterval(() => {
   const kioskClock = $('#kioskTime'); if (kioskClock) kioskClock.textContent = timeText(new Date());
   const portalClock = $('#portalClock'); if (portalClock) portalClock.textContent = timeText(new Date());
 }, 1000);
+
+setInterval(() => {
+  if (document.hidden || !state.profile || state.profile.role !== 'manager' || state.view !== 'home' || portalReloadPromise) return;
+  reloadPortal().catch((error) => console.warn('Live overview refresh failed:', error));
+}, 15_000);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !state.profile || state.profile.role !== 'manager' || state.view !== 'home' || portalReloadPromise) return;
+  reloadPortal().catch((error) => console.warn('Overview resume refresh failed:', error));
+});
 
 initialize().catch((error) => {
   console.error('Application startup failed', error);
