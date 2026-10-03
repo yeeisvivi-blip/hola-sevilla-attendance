@@ -15,7 +15,7 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
-const BUILD_VERSION = '20261003-restore2';
+const BUILD_VERSION = '20261003-restore3';
 
 function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
@@ -255,9 +255,7 @@ function countedStart(item, schedule = attendanceSchedule(item)) {
   if (!item?.clock_in) return null;
   const clockIn = new Date(item.clock_in);
   if (Number.isNaN(clockIn.getTime())) return null;
-  const scheduledStart = new Date(schedule?.starts_at);
-  if (Number.isNaN(scheduledStart.getTime())) return clockIn;
-  return clockIn < scheduledStart ? scheduledStart : clockIn;
+  return clockIn;
 }
 
 function countedWorkMinutes(item, schedule = attendanceSchedule(item)) {
@@ -772,16 +770,16 @@ async function loadEmployeeData() {
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const [stores, schedules, attendance, requests, permissions, todayEvents] = await Promise.all([
     client.from('stores').select('*').eq('active', true).order('name'),
-    client.from('schedules').select('*, stores(name,address)').gte('work_date', monthStart).lte('work_date', scheduleEnd).order('work_date'),
-    client.from('attendance_daily').select('*').gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
-    client.from('requests').select('*').order('created_at', { ascending: false }).limit(50),
-    client.from('gps_permissions').select('*, stores(name,address,latitude,longitude,radius_m)').eq('active', true).lte('valid_from', now).gte('valid_until', now).order('valid_until'),
+    client.from('schedules').select('*, stores(name,address)').eq('employee_id', state.profile.user_id).gte('work_date', monthStart).lte('work_date', scheduleEnd).order('work_date'),
+    client.from('attendance_daily').select('*').eq('employee_id', state.profile.user_id).gte('work_date', monthStart).lte('work_date', today).order('work_date', { ascending: false }),
+    client.from('requests').select('*').eq('employee_id', state.profile.user_id).order('created_at', { ascending: false }).limit(50),
+    client.from('gps_permissions').select('*, stores(name,address,latitude,longitude,radius_m)').eq('employee_id', state.profile.user_id).eq('active', true).lte('valid_from', now).gte('valid_until', now).order('valid_until'),
     client.from('attendance_events').select('employee_id,store_id,event_type,occurred_at')
       .eq('employee_id', state.profile.user_id).gte('occurred_at', dayStart).lt('occurred_at', dayEnd)
       .order('occurred_at'),
   ]);
   assertQueryResults([stores, schedules, attendance, requests, permissions]);
-  const attendanceRows = attendance.data || [];
+  const attendanceRows = (attendance.data || []).filter((item) => item.employee_id === state.profile.user_id);
   const cachedEvents = readJSON(PUNCH_CACHE_STORAGE, []).filter((item) =>
     item?.employee_id === state.profile.user_id && item?.work_date === today
   );
@@ -807,10 +805,10 @@ async function loadEmployeeData() {
   if (todayEvents.error) console.warn('Attendance event fallback unavailable:', todayEvents.error);
   state.data = {
     stores: stores.data || [],
-    schedules: schedules.data || [],
+    schedules: (schedules.data || []).filter((item) => item.employee_id === state.profile.user_id),
     attendance: attendanceRows,
-    requests: requests.data || [],
-    permissions: permissions.data || [],
+    requests: (requests.data || []).filter((item) => item.employee_id === state.profile.user_id),
+    permissions: (permissions.data || []).filter((item) => item.employee_id === state.profile.user_id),
   };
 }
 async function loadManagerData() {
@@ -905,8 +903,8 @@ function renderPortalView() {
 
 function renderEmployeeHome() {
   const today = madridDate();
-  const schedule = state.data.schedules.find((item) => item.work_date === today);
-  const record = state.data.attendance.find((item) => item.work_date === today);
+  const schedule = state.data.schedules.find((item) => item.employee_id === state.profile.user_id && item.work_date === today);
+  const record = state.data.attendance.find((item) => item.employee_id === state.profile.user_id && item.work_date === today);
   const permissions = state.data.permissions || [];
   const annualLeave = scheduleKind(schedule) === 'annual_leave';
   const status = record?.clock_out ? L('今日已完成', 'Jornada completada') : record?.clock_in ? L('工作进行中', 'Jornada en curso') : annualLeave ? L('今天年假', 'Vacaciones') : schedule?.is_day_off ? L('今天休息', 'Día libre') : L('等待到店', 'Pendiente de entrada');
@@ -1583,7 +1581,7 @@ async function confirmEmployeePunch(eventType, previousValue) {
   const dayStart = madridLocalToIso(today, '00:00');
   const dayEnd = madridLocalToIso(addDays(today, 1), '00:00');
   const [daily, events] = await withTimeout(Promise.all([
-    client.from('attendance_daily').select(field).eq('work_date', today).maybeSingle(),
+    client.from('attendance_daily').select(field).eq('employee_id', state.profile.user_id).eq('work_date', today).maybeSingle(),
     client.from('attendance_events').select('occurred_at').eq('employee_id', state.profile.user_id)
       .eq('event_type', eventType).gte('occurred_at', dayStart).lt('occurred_at', dayEnd)
       .order('occurred_at', { ascending: false }).limit(1),
@@ -1598,7 +1596,7 @@ async function gpsPunch(eventType, permissionId = null) {
   if (state.busy) return;
   state.busy = true;
   $$('[data-gps-punch]').forEach((button) => { button.disabled = true; });
-  const currentRecord = (state.data.attendance || []).find((item) => item.work_date === madridDate());
+  const currentRecord = (state.data.attendance || []).find((item) => item.employee_id === state.profile.user_id && item.work_date === madridDate());
   const previousValue = currentRecord?.[eventType] || null;
   toast(L('正在确认你位于店铺100米内…', 'Comprobando que estás a menos de 100 m…'));
   try {
@@ -2053,7 +2051,7 @@ function monthlyReportRow(date, schedule, attendance) {
 
       const late = schedule?.starts_at && attendance?.clock_in ? durationMinutes(schedule.starts_at, attendance.clock_in) : null;
       const early = schedule?.ends_at && attendance?.clock_out ? durationMinutes(attendance.clock_out, schedule.ends_at) : null;
-      if (!attendance?.corrected && earlyArrivalMinutes > 0) issues.push(`提前打卡 / Entrada anticipada ${earlyArrivalMinutes}m（不计入工时 / no computa）`);
+      if (!attendance?.corrected && earlyArrivalMinutes > 0) issues.push(`提前打卡 / Entrada anticipada ${earlyArrivalMinutes}m`);
       if (late > 0) { issues.push(`迟到 / Retraso ${late}m`); hasIncident = true; }
       if (early > 0) { issues.push(`早退 / Salida anticipada ${early}m`); hasIncident = true; }
       if (attendance?.corrected) issues.push(`已修正 / Corregido${attendance.correction_reason ? `：${attendance.correction_reason}` : ''}`);
