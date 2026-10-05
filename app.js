@@ -15,7 +15,7 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
-const BUILD_VERSION = '20261003-live-overview1';
+const BUILD_VERSION = '20261005-employee-info-missed-punch1';
 
 function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
@@ -1008,11 +1008,18 @@ function attendanceStatus(item) {
 
 function attendanceTable(items, showEmployee = true, editable = false) {
   if (!items.length) return `<div class="empty">${L('暂无考勤记录', 'No hay registros')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th><th>${L('状态', 'Estado')}</th>${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => {
+  const employeeView = state.profile?.role === 'employee' && !showEmployee && !editable;
+  return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('上班', 'Entrada')}</th><th>${L('休息', 'Pausa')}</th><th>${L('下班', 'Salida')}</th><th>${L('有效工时', 'Horas efectivas')}</th><th>${L('状态', 'Estado')}</th>${employeeView ? `<th>${L('补打卡申请', 'Solicitud de fichaje')}</th>` : ''}${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => {
     const status = attendanceStatus(item);
     const noTimes = !item.clock_in && !item.break_start && !item.break_end && !item.clock_out;
     const hours = status.zeroHours ? '0h 00m' : noTimes ? '—' : shiftDurationText(item);
-    return `<tr class="attendance-row ${item.calendar_only ? 'calendar-only' : ''}">${showEmployee ? `<td><b>${escapeHTML(item.employee_name || '')}</b></td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '—')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${hours}</td><td><span class="status ${status.className}">${status.label}</span>${item.corrected && item.correction_kind !== 'absence' ? `<br><small>${L('已审计修正', 'Corregido')}</small>` : ''}</td>${editable ? `<td><div class="button-row"><button type="button" class="ghost-btn" data-edit-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${item.corrected ? L('再次修改', 'Volver a corregir') : L('修改', 'Corregir')}</button>${item.corrected ? `<button type="button" class="ghost-btn danger" data-void-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${L('撤销修正', 'Anular corrección')}</button>` : ''}</div></td>` : ''}</tr>`;
+    const request = employeeView ? (state.data.requests || []).find((candidate) => candidate.request_type === 'missed_punch' && candidate.request_date === item.work_date && candidate.status !== 'rejected') : null;
+    const schedule = item.display_schedule || attendanceSchedule(item);
+    const mayRequest = employeeView && item.work_date <= madridDate() && scheduleKind(schedule) === 'work';
+    const requestCell = !employeeView ? '' : `<td>${request
+      ? `<span class="status ${request.status}">${statusLabel(request.status)}</span>`
+      : mayRequest ? `<button type="button" class="ghost-btn" data-request-missed-punch="${escapeHTML(item.work_date)}">${L('申请补打卡', 'Solicitar corrección')}</button>` : '—'}</td>`;
+    return `<tr class="attendance-row ${item.calendar_only ? 'calendar-only' : ''}">${showEmployee ? `<td><b>${escapeHTML(item.employee_name || '')}</b></td>` : ''}<td>${dateText(item.work_date)}</td><td>${escapeHTML(item.store_name || '—')}</td><td>${timeText(item.clock_in)}</td><td>${timeText(item.break_start)}–${timeText(item.break_end)}</td><td>${timeText(item.clock_out)}</td><td>${hours}</td><td><span class="status ${status.className}">${status.label}</span>${item.corrected && item.correction_kind !== 'absence' ? `<br><small>${L('已审计修正', 'Corregido')}</small>` : ''}</td>${requestCell}${editable ? `<td><div class="button-row"><button type="button" class="ghost-btn" data-edit-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${item.corrected ? L('再次修改', 'Volver a corregir') : L('修改', 'Corregir')}</button>${item.corrected ? `<button type="button" class="ghost-btn danger" data-void-attendance="${escapeHTML(item.employee_id)}" data-work-date="${escapeHTML(item.work_date)}">${L('撤销修正', 'Anular corrección')}</button>` : ''}</div></td>` : ''}</tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
@@ -1027,11 +1034,75 @@ function renderEmployeeRequests() {
 
 function requestTable(items, manager = true) {
   if (!items.length) return `<div class="empty">${L('暂无申请', 'No hay solicitudes')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr>${manager ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('类型', 'Tipo')}</th><th>${L('日期', 'Fecha')}</th><th>${L('说明', 'Explicación')}</th><th>${L('状态', 'Estado')}</th>${manager ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${manager ? `<td>${escapeHTML(item.profiles?.full_name || '')}</td>` : ''}<td>${escapeHTML(requestTypeLabel(item.request_type))}</td><td>${dateText(item.request_date)}${item.related_time ? ` · ${escapeHTML(item.related_time.slice(0,5))}` : ''}</td><td>${escapeHTML(item.reason)}${item.review_note ? `<br><small>${L('回复', 'Respuesta')}: ${escapeHTML(item.review_note)}</small>` : ''}</td><td><span class="status ${item.status}">${statusLabel(item.status)}</span></td>${manager ? `<td>${item.status === 'pending' ? `<div class="button-row"><button class="secondary-btn" data-review="approved" data-id="${item.id}">${L('批准', 'Aprobar')}</button><button class="danger-btn" data-review="rejected" data-id="${item.id}">${L('拒绝', 'Rechazar')}</button></div>` : '—'}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr>${manager ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('类型', 'Tipo')}</th><th>${L('日期', 'Fecha')}</th><th>${L('说明', 'Explicación')}</th><th>${L('状态', 'Estado')}</th>${manager ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${manager ? `<td>${escapeHTML(item.profiles?.full_name || '')}</td>` : ''}<td>${escapeHTML(requestTypeLabel(item.request_type))}</td><td>${dateText(item.request_date)}${item.related_time ? ` · ${escapeHTML(item.related_time.slice(0,5))}` : ''}</td><td>${escapeHTML(item.reason)}${item.review_note ? `<br><small>${L('回复', 'Respuesta')}: ${escapeHTML(item.review_note)}</small>` : ''}</td><td><span class="status ${item.status}">${statusLabel(item.status)}</span></td>${manager ? `<td>${item.status === 'pending' ? `<div class="button-row"><button class="secondary-btn" data-review="approved" data-id="${item.id}">${item.request_type === 'missed_punch' ? L('批准并补卡', 'Aprobar y corregir') : L('批准', 'Aprobar')}</button><button class="danger-btn" data-review="rejected" data-id="${item.id}">${L('拒绝', 'Rechazar')}</button></div>` : '—'}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function requestTypeLabel(type) { return ({ missed_punch: L('补卡', 'Corrección'), leave: L('请假', 'Permiso'), gps_issue: L('GPS异常', 'GPS'), cross_store: L('跨店', 'Otra tienda'), other: L('其他', 'Otro') })[type] || type; }
 function statusLabel(status) { return ({ pending: L('待审批', 'Pendiente'), approved: L('已批准', 'Aprobada'), rejected: L('已拒绝', 'Rechazada') })[status] || status; }
+
+function openMissedPunchRequest(workDate) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate || '') || workDate > madridDate()) return;
+  const row = calendarAttendanceRows(workDate.slice(0, 7), state.profile.user_id).find((item) => item.work_date === workDate) || {};
+  const missing = [
+    ['clock_in', L('上班', 'Entrada'), row.clock_in],
+    ['break_start', L('开始休息', 'Inicio pausa'), row.break_start],
+    ['break_end', L('结束休息', 'Fin pausa'), row.break_end],
+    ['clock_out', L('下班', 'Salida'), row.clock_out],
+  ].filter(([, , value]) => !value);
+  const choices = (missing.length ? missing : [
+    ['clock_in', L('上班', 'Entrada')],
+    ['break_start', L('开始休息', 'Inicio pausa')],
+    ['break_end', L('结束休息', 'Fin pausa')],
+    ['clock_out', L('下班', 'Salida')],
+  ]).map(([value, label]) => `<option value="${value}">${label}</option>`).join('');
+  openEditDialog(`${L('补打卡申请', 'Solicitud de corrección')} · ${dateText(workDate)}`, `<form id="missedPunchRequestForm" class="stack-form">
+    <input id="missedPunchDate" type="hidden" value="${escapeHTML(workDate)}">
+    <label>${L('需要补的打卡', 'Fichaje que falta')}<select id="missedPunchType">${choices}</select></label>
+    <label>${L('实际打卡时间', 'Hora real')}<input id="missedPunchTime" type="time" required></label>
+    <label>${L('原因说明', 'Motivo')}<textarea id="missedPunchReason" minlength="5" maxlength="900" required placeholder="${L('例如：忘记打卡、手机定位失败','Ej.: olvido de fichar o fallo de ubicación')}"></textarea></label>
+    <p class="save-status" id="missedPunchRequestStatus" role="status"></p>
+    <button class="primary-btn" type="submit">${L('提交给管理员审批', 'Enviar para aprobación')}</button>
+  </form>`);
+  $('#missedPunchRequestForm').addEventListener('submit', submitMissedPunchRequest);
+}
+
+async function submitMissedPunchRequest(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const status = $('#missedPunchRequestStatus');
+  const punchType = $('#missedPunchType').value;
+  const punchLabel = ({
+    clock_in: '上班 / Entrada',
+    break_start: '开始休息 / Inicio pausa',
+    break_end: '结束休息 / Fin pausa',
+    clock_out: '下班 / Salida',
+  })[punchType];
+  if (!punchLabel) return;
+  button.disabled = true;
+  status.textContent = L('正在提交…', 'Enviando…');
+  try {
+    const workDate = $('#missedPunchDate').value;
+    const duplicate = (state.data.requests || []).some((item) => item.request_type === 'missed_punch' && item.request_date === workDate && item.status === 'pending');
+    if (duplicate) throw new Error('REQUEST_ALREADY_PENDING');
+    const { error } = await client.from('requests').insert({
+      employee_id: state.profile.user_id,
+      request_type: 'missed_punch',
+      request_date: workDate,
+      related_time: $('#missedPunchTime').value,
+      reason: `[${punchLabel}] ${$('#missedPunchReason').value.trim()}`,
+    });
+    if (error) throw error;
+    closeEditDialog();
+    await finishMutation(L('补打卡申请已提交，等待管理员审批', 'Solicitud enviada; pendiente de aprobación'));
+  } catch (error) {
+    status.textContent = normalizedErrorCode(error) === 'REQUEST_ALREADY_PENDING'
+      ? L('当天已有待审批的补打卡申请', 'Ya existe una solicitud pendiente para ese día')
+      : errorText(error);
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
+}
 
 function renderProfile() {
   return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>${escapeHTML(state.profile.employee_no)} · ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('在职', 'En activo') : L('停用', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article><article class="card summary-card"><p class="eyebrow">PRIVACY</p><h3>${L('数据、位置与照片', 'Datos, ubicación y fotos')}</h3><p>${L('GPS只在手机打卡时读取一次，不会持续追踪。店铺电脑的上班和下班打卡会拍摄现场照片，照片直接上传至私有云端，不保存在店铺电脑，并在30天后自动删除。', 'El GPS solo se obtiene al fichar con el móvil y no realiza seguimiento continuo. En el ordenador de tienda se hace una foto en la entrada y la salida; se sube directamente al almacenamiento privado, no se guarda en el ordenador y se elimina automáticamente después de 30 días.')}</p></article></div>`;
@@ -1215,7 +1286,7 @@ function renderEmployees() {
 
 function employeeTable() {
   if (!state.data.employees.length) return `<div class="empty">${L('尚未创建员工', 'Todavía no hay empleados')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>${L('员工', 'Empleado')}</th><th>${L('手机号', 'Teléfono')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('状态', 'Estado')}</th><th>${L('操作', 'Acción')}</th></tr></thead><tbody>${state.data.employees.map((employee) => `<tr><td><b>${escapeHTML(employee.full_name)}</b><br><small>${escapeHTML(employee.employee_no)}</small></td><td>${escapeHTML(employee.phone)}</td><td>${escapeHTML(employee.stores?.name || '')}</td><td><span class="status ${employee.active ? 'ok' : 'alert'}">${employee.active ? L('在职', 'Activo') : L('停用', 'Inactivo')}</span></td><td><div class="button-row"><button class="ghost-btn" data-reset="password" data-id="${employee.user_id}">${L('改密码', 'Contraseña')}</button><button class="ghost-btn" data-reset="pin" data-id="${employee.user_id}">PIN</button><button class="${employee.active ? 'danger-btn' : 'secondary-btn'}" data-toggle-employee="${employee.user_id}" data-active="${employee.active ? 'false' : 'true'}">${employee.active ? L('停用', 'Desactivar') : L('启用', 'Activar')}</button>${employee.active ? '' : `<button class="danger-btn" data-delete-employee="${employee.user_id}">${L('删除误建账号', 'Eliminar cuenta errónea')}</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>${L('姓名', 'Nombre')}</th><th>NIF</th><th>${L('电话号码', 'Teléfono')}</th><th>${L('员工编号', 'N.º empleado')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('状态', 'Estado')}</th><th>${L('操作', 'Acción')}</th></tr></thead><tbody>${state.data.employees.map((employee) => `<tr><td><b>${escapeHTML(employee.full_name)}</b></td><td>${escapeHTML(employee.nif || '—')}</td><td>${escapeHTML(employee.phone)}</td><td>${escapeHTML(employee.employee_no || '—')}</td><td>${escapeHTML(employee.stores?.name || '')}</td><td><span class="status ${employee.active ? 'ok' : 'alert'}">${employee.active ? L('在职', 'Activo') : L('停用', 'Inactivo')}</span></td><td><div class="button-row"><button class="ghost-btn" data-reset="password" data-id="${employee.user_id}">${L('改密码', 'Contraseña')}</button><button class="ghost-btn" data-reset="pin" data-id="${employee.user_id}">PIN</button><button class="${employee.active ? 'danger-btn' : 'secondary-btn'}" data-toggle-employee="${employee.user_id}" data-active="${employee.active ? 'false' : 'true'}">${employee.active ? L('停用', 'Desactivar') : L('启用', 'Activar')}</button>${employee.active ? '' : `<button class="danger-btn" data-delete-employee="${employee.user_id}">${L('删除误建账号', 'Eliminar cuenta errónea')}</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function weekdayNames() {
@@ -1514,6 +1585,7 @@ function bindPortal() {
   $('#refreshData')?.addEventListener('click', refreshPortal);
   $$('[data-view]').forEach((button) => button.addEventListener('click', () => { state.view = button.dataset.view; renderPortal(); }));
   $('#requestForm')?.addEventListener('submit', submitRequest);
+  $$('[data-request-missed-punch]').forEach((button) => button.addEventListener('click', () => openMissedPunchRequest(button.dataset.requestMissedPunch)));
   $$('[data-gps-punch]').forEach((button) => button.addEventListener('click', () => gpsPunch(button.dataset.gpsPunch, button.dataset.gpsPermission || null)));
   $('#employeeForm')?.addEventListener('submit', createEmployee);
   $$('[data-toggle-employee]').forEach((button) => button.addEventListener('click', () => toggleEmployee(button)));
@@ -1834,12 +1906,19 @@ async function saveSingleSchedule(event) {
 }
 
 async function reviewRequest(button) {
+  const request = (state.data.requests || []).find((item) => item.id === button.dataset.id);
   const note = prompt(button.dataset.review === 'approved' ? L('批准备注（可留空）', 'Nota de aprobación (opcional)') : L('请填写拒绝原因', 'Indica el motivo del rechazo'));
   if (button.dataset.review === 'rejected' && !note) return;
   button.disabled = true;
   try {
     await adminAction({ action: 'review_request', requestId: button.dataset.id, status: button.dataset.review, note: note || '' });
-    await finishMutation(L('申请状态已更新', 'Solicitud actualizada'));
+    await reloadPortal();
+    if (button.dataset.review === 'approved' && request?.request_type === 'missed_punch') {
+      openCorrectionDialog(request.employee_id, request.request_date);
+      toast(L('申请已批准，请核实并保存补卡时间', 'Solicitud aprobada; verifica y guarda el fichaje'));
+    } else {
+      toast(L('申请状态已更新', 'Solicitud actualizada'));
+    }
   }
   catch (error) { toast(errorText(error), true); }
   finally { button.disabled = false; }

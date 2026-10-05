@@ -1,6 +1,6 @@
-const CACHE_NAME = 'hola-sevilla-production-live-overview-v1';
+const CACHE_NAME = 'hola-sevilla-production-employee-info-missed-punch-v1';
 const BASE = new URL('./', self.location.href);
-const SHELL = ['', 'index.html', 'styles.css?v=20261003-live-overview1', 'app.js?v=20261003-live-overview1', 'config.js?v=20261003-live-overview1', 'manifest.webmanifest', 'icon.svg']
+const SHELL = ['', 'index.html', 'styles.css?v=20261005-employee-info-missed-punch1', 'app.js?v=20261005-employee-info-missed-punch1', 'config.js?v=20261005-employee-info-missed-punch1', 'manifest.webmanifest', 'icon.svg']
   .map((path) => new URL(path, BASE).href);
 
 self.addEventListener('install', (event) => {
