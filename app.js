@@ -15,7 +15,7 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
-const BUILD_VERSION = '20261005-employee-info-missed-punch1';
+const BUILD_VERSION = '20261007-scheduled-effective-start1';
 
 function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
@@ -255,7 +255,10 @@ function countedStart(item, schedule = attendanceSchedule(item)) {
   if (!item?.clock_in) return null;
   const clockIn = new Date(item.clock_in);
   if (Number.isNaN(clockIn.getTime())) return null;
-  return clockIn;
+  if (!schedule?.starts_at) return clockIn;
+  const scheduledStart = new Date(schedule.starts_at);
+  if (Number.isNaN(scheduledStart.getTime())) return clockIn;
+  return clockIn < scheduledStart ? scheduledStart : clockIn;
 }
 
 function countedWorkMinutes(item, schedule = attendanceSchedule(item)) {
