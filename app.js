@@ -15,7 +15,7 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
-const BUILD_VERSION = '20261007-scheduled-effective-start1';
+const BUILD_VERSION = '20261007-monthly-report-nif1';
 
 function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
@@ -2211,15 +2211,14 @@ function monthlyReportHtml(employee, month, reportEnd, schedules, attendance) {
   const effectiveTotal = rows.reduce((sum, row) => sum + (row.effectiveMinutes ?? 0), 0);
   const completeDays = rows.filter((row) => !row.absence && row.effectiveMinutes !== null).length;
   const annualLeaveDays = rows.filter((row) => row.annualLeave).length;
-  const incidentCount = rows.filter((row) => row.hasIncident).length;
   const monthLabel = new Intl.DateTimeFormat('es-ES', { timeZone: 'UTC', year: 'numeric', month: 'long' }).format(new Date(`${month}-15T12:00:00Z`));
-  const rowHtml = rows.length ? rows.map((row) => `<tr class="${row.hasIncident ? 'report-incident' : ''}"><td>${escapeHTML(reportDateText(row.date))}</td><td>${escapeHTML(row.store)}</td><td>${row.clockIn}</td><td>${row.breakStart}</td><td>${row.breakEnd}</td><td>${row.clockOut}</td><td>${reportDuration(row.presenceMinutes)}</td><td>${reportDuration(row.breakMinutes)}</td><td>${reportDuration(row.effectiveMinutes)}</td><td>${escapeHTML(row.note)}</td></tr>`).join('') : `<tr><td colspan="10">本月没有已发布排班或考勤记录 / No hay horarios ni fichajes publicados</td></tr>`;
+  const rowHtml = rows.length ? rows.map((row) => `<tr><td>${escapeHTML(reportDateText(row.date))}</td><td>${escapeHTML(row.store)}</td><td>${row.clockIn}</td><td>${row.breakStart}</td><td>${row.breakEnd}</td><td>${row.clockOut}</td><td>${reportDuration(row.presenceMinutes)}</td><td>${reportDuration(row.breakMinutes)}</td><td>${reportDuration(row.effectiveMinutes)}</td></tr>`).join('') : `<tr><td colspan="9">本月没有已发布排班或考勤记录 / No hay horarios ni fichajes publicados</td></tr>`;
 
   return `<article class="monthly-report-sheet">
     <header class="report-header"><div><b>HOLA!SEVILLA</b><small>NOVAKEEPS S.L.</small></div><div><h1>Registro mensual de jornada</h1><p>月度工时签字表 · ${escapeHTML(monthLabel)}</p></div></header>
-    <div class="report-meta"><span><b>Empleado / 员工：</b>${escapeHTML(employee.full_name)}</span><span><b>N.º empleado / 编号：</b>${escapeHTML(employee.employee_no || '—')}</span><span><b>Periodo / 统计截止：</b>${escapeHTML(month)}-01 — ${escapeHTML(reportEnd)}</span></div>
-    <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Entrada real<br><small>实际打卡</small></th><th>Inicio pausa<br><small>午休开始</small></th><th>Fin pausa<br><small>午休结束</small></th><th>Salida<br><small>下班</small></th><th>Presencia computada<br><small>计时跨度</small></th><th>Pausa<br><small>午休</small></th><th>Horas efectivas<br><small>有效工时</small></th><th>Incidencias / 备注</th></tr></thead><tbody>${rowHtml}</tbody></table>
-    <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Presencia computada / 计时跨度</small><b>${reportDuration(presenceTotal)}</b></span><span><small>Pausas / 午休合计</small><b>${reportDuration(breakTotal)}</b></span><span><small>Horas efectivas / 有效工时</small><b>${reportDuration(effectiveTotal)}</b></span><span class="${incidentCount ? 'alert' : ''}"><small>Incidencias / 异常</small><b>${incidentCount}</b></span></div>
+    <div class="report-meta"><span><b>Empleado / 姓名：</b>${escapeHTML(employee.full_name)}</span><span><b>NIF：</b>${escapeHTML(employee.nif || '—')}</span><span><b>Periodo / 统计截止：</b>${escapeHTML(month)}-01 — ${escapeHTML(reportEnd)}</span></div>
+    <table class="report-table"><thead><tr><th>Fecha<br><small>日期</small></th><th>Tienda<br><small>店铺</small></th><th>Entrada real<br><small>实际打卡</small></th><th>Inicio pausa<br><small>午休开始</small></th><th>Fin pausa<br><small>午休结束</small></th><th>Salida<br><small>下班</small></th><th>Presencia computada<br><small>计时跨度</small></th><th>Pausa<br><small>午休</small></th><th>Horas efectivas<br><small>有效工时</small></th></tr></thead><tbody>${rowHtml}</tbody></table>
+    <div class="report-totals"><span><small>Días completos / 完整天数</small><b>${completeDays}</b></span><span><small>Vacaciones / 年假</small><b>${annualLeaveDays}</b></span><span><small>Presencia computada / 计时跨度</small><b>${reportDuration(presenceTotal)}</b></span><span><small>Pausas / 午休合计</small><b>${reportDuration(breakTotal)}</b></span><span><small>Horas efectivas / 有效工时</small><b>${reportDuration(effectiveTotal)}</b></span></div>
     <p class="report-note">La entrada puede ficharse desde 5 minutos antes del turno, pero el tiempo efectivo empieza a la hora programada. Si se ficha tarde, empieza desde el fichaje real. Si hay una pausa completa, se descuenta; una pausa incompleta debe corregirse.<br>上班卡可在排班开始前5分钟内打，但有效工时从排班开始时间计算；迟到则从实际打卡时间计算。完整午休会扣除，午休记录不完整时必须先修正。</p>
     <div class="report-signatures"><div><span>Firma del trabajador / 员工签字</span><i></i><small>Fecha / 日期：________________</small></div><div><span>Firma de la empresa / 公司签字</span><i></i><small>Fecha / 日期：________________</small></div></div>
     <footer>El trabajador confirma la recepción y revisión de este registro, sin renunciar a comunicar discrepancias. / 员工签字表示已收到并核对本表，如有差异仍可书面提出。</footer>

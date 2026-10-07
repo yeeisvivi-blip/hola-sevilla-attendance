@@ -1,6 +1,6 @@
-const CACHE_NAME = 'hola-sevilla-production-scheduled-effective-start-v1';
+const CACHE_NAME = 'hola-sevilla-production-monthly-report-nif-v1';
 const BASE = new URL('./', self.location.href);
-const SHELL = ['', 'index.html', 'styles.css?v=20261007-scheduled-effective-start1', 'app.js?v=20261007-scheduled-effective-start1', 'config.js?v=20261007-scheduled-effective-start1', 'manifest.webmanifest', 'icon.svg']
+const SHELL = ['', 'index.html', 'styles.css?v=20261007-monthly-report-nif1', 'app.js?v=20261007-monthly-report-nif1', 'config.js?v=20261007-monthly-report-nif1', 'manifest.webmanifest', 'icon.svg']
   .map((path) => new URL(path, BASE).href);
 
 self.addEventListener('install', (event) => {
