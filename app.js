@@ -15,7 +15,7 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
-const BUILD_VERSION = '20261012-employee-profile-optional1';
+const BUILD_VERSION = '20261012-attendance-correction-types1';
 
 function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
@@ -955,6 +955,28 @@ function scheduleKind(item) {
   return item?.is_day_off ? 'day_off' : 'work';
 }
 
+const SICK_LEAVE_MARKER = '[SICK_LEAVE]';
+
+function isSickLeaveRecord(item) {
+  if (item?.correction_kind !== 'absence') return false;
+  const reason = String(item.correction_reason || '');
+  return reason.includes(SICK_LEAVE_MARKER) || /(^|[\s:：])(病假|baja médica)([\s:：]|$)/i.test(reason);
+}
+
+function visibleCorrectionReason(item) {
+  return String(item?.correction_reason || '').replace(SICK_LEAVE_MARKER, '').trim();
+}
+
+function correctionDefaultReason(kind) {
+  return ({
+    attendance: '忘记打卡 / Olvidó fichar',
+    absence: '缺勤 / Ausencia',
+    sick_leave: '病假 / Baja médica',
+    annual_leave: '年假 / Vacaciones',
+    day_off: '休息 / Descanso',
+  })[kind] || '';
+}
+
 function scheduleTable(items, showEmployee = true, editable = false) {
   if (!items.length) return `<div class="empty">${L('暂无排班', 'No hay horarios')}</div>`;
   return `<div class="table-wrap"><table><thead><tr>${showEmployee ? `<th>${L('员工', 'Empleado')}</th>` : ''}<th>${L('日期', 'Fecha')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('时间', 'Horario')}</th>${editable ? `<th>${L('操作', 'Acción')}</th>` : ''}</tr></thead><tbody>${items.map((item) => `<tr>${showEmployee ? `<td><b>${escapeHTML(item.profiles?.full_name || '')}</b><br><small>${escapeHTML(item.profiles?.employee_no || '')}</small></td>` : ''}<td>${dateText(item.work_date)}</td><td>${scheduleKind(item) === 'annual_leave' ? '—' : escapeHTML(item.stores?.name || '')}</td><td>${scheduleKind(item) === 'annual_leave' ? `<span class="status annual-leave">${L('年假', 'Vacaciones')}</span>` : item.is_day_off ? `<span class="status">${L('休息', 'Libre')}</span>` : `${timeText(item.starts_at)}—${timeText(item.ends_at)}`}</td>${editable ? `<td>${item.profiles?.active === false ? '—' : `<button class="ghost-btn" data-edit-schedule="${item.id}" type="button">${L('修改', 'Modificar')}</button>`}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
@@ -997,14 +1019,14 @@ function attendanceStatus(item) {
   const kind = scheduleKind(schedule);
   const hasPunch = Boolean(item.clock_in || item.break_start || item.break_end || item.clock_out);
   const today = madridDate();
-  if (['sick_leave', 'sick', 'medical_leave'].includes(item.correction_kind) || kind === 'sick_leave') {
+  if (isSickLeaveRecord(item) || ['sick_leave', 'sick', 'medical_leave'].includes(item.correction_kind) || kind === 'sick_leave') {
     return { label: L('病假', 'Baja médica'), className: 'pending', zeroHours: true };
-  }
-  if (item.correction_kind === 'absence' || (schedule && kind === 'work' && item.work_date < today && !hasPunch)) {
-    return { label: L('缺勤', 'Ausencia'), className: 'alert', zeroHours: true };
   }
   if (kind === 'annual_leave') return { label: L('年假', 'Vacaciones'), className: 'annual-leave', zeroHours: true };
   if (kind === 'day_off') return { label: L('休息日', 'Día libre'), className: '', zeroHours: true };
+  if (item.correction_kind === 'absence' || (schedule && kind === 'work' && item.work_date < today && !hasPunch)) {
+    return { label: L('缺勤', 'Ausencia'), className: 'alert', zeroHours: true };
+  }
   if (schedule && kind === 'work') {
     return { label: hasPunch ? L('工作日', 'Día trabajado') : L('工作日 · 待打卡', 'Día laboral · pendiente'), className: hasPunch ? 'ok' : 'pending' };
   }
@@ -1540,10 +1562,16 @@ function openCorrectionDialog(employeeId, date) {
   const title = fixed ? `${employee.full_name} · ${dateText(date)}` : L('补充考勤记录','Añadir registro');
   openEditDialog(title, `<form id="correctionForm" class="stack-form">
     ${fixed ? `<input type="hidden" id="correctionEmployee" value="${employeeId}"><input type="hidden" id="correctionDate" value="${date}">` : `<div class="form-row"><label>${L('员工','Empleado')}<select id="correctionEmployee">${employeeOptions(false,state.attendanceEmployeeId)}</select></label><label>${L('日期','Fecha')}<input id="correctionDate" type="date" value="${madridDate()}" required></label></div>`}
-    <label>${L('处理类型','Tipo')}<select id="correctionKind"><option value="attendance">${L('补充／修正打卡','Corregir fichajes')}</option><option value="absence">${L('缺勤','Ausencia')}</option></select></label>
+    <label>${L('处理类型','Tipo')}<select id="correctionKind">
+      <option value="attendance">${L('补打卡','Corrección de fichaje')}</option>
+      <option value="absence">${L('缺勤','Ausencia')}</option>
+      <option value="sick_leave">${L('病假','Baja médica')}</option>
+      <option value="annual_leave">${L('年假','Vacaciones')}</option>
+      <option value="day_off">${L('休息','Descanso')}</option>
+    </select></label>
     <p id="correctionLoadStatus" role="status"></p><button id="loadCorrection" type="button" class="ghost-btn">${L('重新载入','Recargar')}</button>
     <div id="correctionTimeFields"><div class="form-row"><label>${L('上班','Entrada')}<input id="correctionClockIn" type="time"></label><label>${L('下班','Salida')}<input id="correctionClockOut" type="time"></label></div><div class="form-row"><label>${L('开始休息','Inicio pausa')}<input id="correctionBreakStart" type="time"></label><label>${L('结束休息','Fin pausa')}<input id="correctionBreakEnd" type="time"></label></div></div>
-    <label>${L('修改原因','Motivo del cambio')}<textarea id="correctionReason" minlength="5" required placeholder="${L('请说明本次修改原因','Indica el motivo de este cambio')}"></textarea></label><p id="correctionSaveStatus" class="save-status" role="status"></p><button class="primary-btn" type="submit" disabled>${L('保存修改','Guardar cambios')}</button></form>`);
+    <label>${L('修改原因','Motivo del cambio')}<textarea id="correctionReason" minlength="5" required placeholder="${L('请说明本次修改原因','Indica el motivo de este cambio')}">${correctionDefaultReason('attendance')}</textarea></label><p id="correctionSaveStatus" class="save-status" role="status"></p><button class="primary-btn" type="submit" disabled>${L('保存修改','Guardar cambios')}</button></form>`);
   $('#correctionForm').addEventListener('submit',saveCorrection);
   $('#correctionKind').addEventListener('change',toggleCorrectionFields);
   $('#loadCorrection').onclick = () => {
@@ -2121,13 +2149,23 @@ async function loadCorrectionRecord() {
     if (sequence !== correctionLoadSequence || !form.isConnected) return;
     if (result.error) throw result.error;
     const record = result.data;
-    $('#correctionKind').value = record?.correction_kind === 'absence' ? 'absence' : 'attendance';
+    const schedule = (state.data.schedules || []).find((item) => item.employee_id === employeeId && item.work_date === workDate);
+    const existingKind = isSickLeaveRecord(record)
+      ? 'sick_leave'
+      : record?.correction_kind === 'absence'
+        ? 'absence'
+        : ['annual_leave', 'day_off'].includes(scheduleKind(schedule))
+          ? scheduleKind(schedule)
+          : 'attendance';
+    $('#correctionKind').value = existingKind;
     toggleCorrectionFields();
     ['clock_in', 'break_start', 'break_end', 'clock_out'].forEach((key, index) => {
       $('#' + fields[index]).value = record?.[key] ? new Intl.DateTimeFormat('en-GB', {
         timeZone: MADRID_TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
       }).format(new Date(record[key])) : '';
     });
+    $('#correctionReason').value = visibleCorrectionReason(record) || schedule?.notes || correctionDefaultReason(existingKind);
+    $('#correctionReason').dataset.autoReason = $('#correctionReason').value;
     status.textContent = record
       ? L('已载入当前生效记录，可再次修改并填写本次原因。', 'Registro vigente cargado. Puedes corregirlo de nuevo indicando el motivo.')
       : L('当天暂无记录，可填写补卡时间。', 'No hay registro para este día. Puedes añadirlo.');
@@ -2144,12 +2182,17 @@ function toggleCorrectionFields() {
   const kind = $('#correctionKind');
   const fields = $('#correctionTimeFields');
   if (!kind || !fields) return;
-  const absence = kind.value === 'absence';
-  fields.hidden = absence;
+  const nonAttendance = kind.value !== 'attendance';
+  fields.hidden = nonAttendance;
   fields.querySelectorAll('input').forEach((input) => {
-    input.disabled = absence;
-    if (absence) input.value = '';
+    input.disabled = nonAttendance;
+    if (nonAttendance) input.value = '';
   });
+  const reason = $('#correctionReason');
+  if (reason && (!reason.value.trim() || reason.value === reason.dataset.autoReason)) {
+    reason.value = correctionDefaultReason(kind.value);
+    reason.dataset.autoReason = reason.value;
+  }
 }
 
 async function saveCorrection(event) {
@@ -2159,6 +2202,7 @@ async function saveCorrection(event) {
   const date = $('#correctionDate').value;
   const correctionKind = $('#correctionKind').value;
   const employeeId = $('#correctionEmployee').value;
+  const reason = $('#correctionReason').value.trim() || correctionDefaultReason(correctionKind);
   const iso = (selector) => $(selector).value ? madridLocalToIso(date, $(selector).value) : null;
   if (correctionKind === 'attendance' && !$('#correctionClockIn').value && !$('#correctionClockOut').value && !$('#correctionBreakStart').value && !$('#correctionBreakEnd').value) {
     toast(L('请至少填写一个修正时间', 'Indica al menos una hora corregida'), true); return;
@@ -2170,12 +2214,25 @@ async function saveCorrection(event) {
     toast(errorText('INVALID_TIME_RANGE'), true); return;
   }
   if (button.disabled) return;
+  if (['annual_leave', 'day_off'].includes(correctionKind)) {
+    const employee = (state.data.employees || []).find((item) => item.user_id === employeeId);
+    const schedule = (state.data.schedules || []).find((item) => item.employee_id === employeeId && item.work_date === date);
+    const storeId = schedule?.store_id || employee?.home_store_id || state.data.stores?.find((item) => item.active !== false)?.id;
+    if (!storeId) { toast(L('请先为员工设置所属店铺', 'Asigna primero una tienda al empleado'), true); return; }
+    await editorSave(form,'#correctionSaveStatus',{
+      action:'upsert_schedule', employeeId, storeId, workDate:date,
+      scheduleKind:correctionKind, dayOff:true, startsAt:null, endsAt:null, notes:reason,
+    }, correctionKind === 'annual_leave' ? L('已标记为年假','Marcado como vacaciones') : L('已标记为休息','Marcado como descanso'));
+    return;
+  }
+  const backendCorrectionKind = correctionKind === 'sick_leave' ? 'absence' : correctionKind;
   await editorSave(form,'#correctionSaveStatus',{
-    action:'correct_attendance',correctionKind,employeeId,workDate:date,
-    clockIn:correctionKind === 'absence' ? null : iso('#correctionClockIn'),
-    breakStart:correctionKind === 'absence' ? null : iso('#correctionBreakStart'),
-    breakEnd:correctionKind === 'absence' ? null : iso('#correctionBreakEnd'),
-    clockOut:correctionKind === 'absence' ? null : iso('#correctionClockOut'),reason:$('#correctionReason').value,
+    action:'correct_attendance',correctionKind:backendCorrectionKind,employeeId,workDate:date,
+    clockIn:backendCorrectionKind === 'absence' ? null : iso('#correctionClockIn'),
+    breakStart:backendCorrectionKind === 'absence' ? null : iso('#correctionBreakStart'),
+    breakEnd:backendCorrectionKind === 'absence' ? null : iso('#correctionBreakEnd'),
+    clockOut:backendCorrectionKind === 'absence' ? null : iso('#correctionClockOut'),
+    reason:correctionKind === 'sick_leave' ? `${SICK_LEAVE_MARKER} ${reason}` : reason,
   },L('考勤修改已保存','Corrección guardada'));
 }
 
@@ -2185,7 +2242,7 @@ function exportCsv() {
   const rows = filteredAttendance().map((item) => {
     const schedule = attendanceSchedule(item);
     const status = attendanceStatus(item);
-    return [item.employee_no, item.employee_name, item.work_date, item.store_name, timeText(item.clock_in), timeText(schedule?.starts_at), timeText(countedStart(item, schedule)), timeText(item.break_start), timeText(item.break_end), timeText(item.clock_out), status.zeroHours ? '0h 00m' : shiftDurationText(item, schedule), status.zeroHours ? '0m' : breakDurationText(item), status.label, item.corrected ? 'YES' : 'NO', item.correction_reason || ''];
+    return [item.employee_no, item.employee_name, item.work_date, item.store_name, timeText(item.clock_in), timeText(schedule?.starts_at), timeText(countedStart(item, schedule)), timeText(item.break_start), timeText(item.break_end), timeText(item.clock_out), status.zeroHours ? '0h 00m' : shiftDurationText(item, schedule), status.zeroHours ? '0m' : breakDurationText(item), status.label, item.corrected ? 'YES' : 'NO', visibleCorrectionReason(item)];
   });
   const csv = '\uFEFF' + [header, ...rows].map((row) => row.map(csvCell).join(';')).join('\r\n');
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
@@ -2213,6 +2270,7 @@ function reportDateText(dateString) {
 
 function monthlyReportRow(date, schedule, attendance) {
   const absence = attendance?.correction_kind === 'absence';
+  const sickLeave = isSickLeaveRecord(attendance);
   const hasPunch = Boolean(attendance && (attendance.clock_in || attendance.break_start || attendance.break_end || attendance.clock_out));
   const dayOff = Boolean(schedule?.is_day_off);
   const annualLeave = scheduleKind(schedule) === 'annual_leave';
@@ -2242,13 +2300,17 @@ function monthlyReportRow(date, schedule, attendance) {
   const issues = [];
   let hasIncident = false;
 
-  if (absence) {
-    issues.push(`缺勤 / Ausencia${attendance.correction_reason ? `：${attendance.correction_reason}` : ''}`);
-    hasIncident = true;
+  if (sickLeave) {
+    const reason = visibleCorrectionReason(attendance);
+    issues.push(`病假 / Baja médica${reason ? `：${reason}` : ''}`);
   } else if (annualLeave && !hasPunch) {
     issues.push('年假 / Vacaciones');
   } else if (dayOff && !hasPunch) {
     issues.push('休息 / Libre');
+  } else if (absence) {
+    const reason = visibleCorrectionReason(attendance);
+    issues.push(`缺勤 / Ausencia${reason ? `：${reason}` : ''}`);
+    hasIncident = true;
   } else {
     if (!schedule) { issues.push('无排班 / Sin horario'); hasIncident = true; }
     if (annualLeave && hasPunch) { issues.push('年假期间有打卡 / Fichaje durante vacaciones'); hasIncident = true; }
@@ -2271,7 +2333,10 @@ function monthlyReportRow(date, schedule, attendance) {
       if (!attendance?.corrected && earlyArrivalMinutes > 0) issues.push(`提前打卡 / Entrada anticipada ${earlyArrivalMinutes}m`);
       if (late > 0) { issues.push(`迟到 / Retraso ${late}m`); hasIncident = true; }
       if (early > 0) { issues.push(`早退 / Salida anticipada ${early}m`); hasIncident = true; }
-      if (attendance?.corrected) issues.push(`已修正 / Corregido${attendance.correction_reason ? `：${attendance.correction_reason}` : ''}`);
+      if (attendance?.corrected) {
+        const reason = visibleCorrectionReason(attendance);
+        issues.push(`已修正 / Corregido${reason ? `：${reason}` : ''}`);
+      }
     }
   }
 

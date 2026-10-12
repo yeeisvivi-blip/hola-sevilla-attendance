@@ -1,6 +1,6 @@
-const CACHE_NAME = 'hola-sevilla-production-employee-profile-optional-v1';
+const CACHE_NAME = 'hola-sevilla-production-attendance-correction-types-v1';
 const BASE = new URL('./', self.location.href);
-const SHELL = ['', 'index.html', 'styles.css?v=20261012-employee-profile-optional1', 'app.js?v=20261012-employee-profile-optional1', 'config.js?v=20261012-employee-profile-optional1', 'manifest.webmanifest', 'icon.svg']
+const SHELL = ['', 'index.html', 'styles.css?v=20261012-attendance-correction-types1', 'app.js?v=20261012-attendance-correction-types1', 'config.js?v=20261012-attendance-correction-types1', 'manifest.webmanifest', 'icon.svg']
   .map((path) => new URL(path, BASE).href);
 
 self.addEventListener('install', (event) => {
