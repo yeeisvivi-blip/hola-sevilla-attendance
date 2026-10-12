@@ -96,6 +96,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--green-2); box-sh
 .hero-meta { display: flex; gap: 12px; flex-wrap: wrap; }
 .hero-meta span { padding: 8px 11px; border: 1px solid rgba(255,255,255,.2); border-radius: 999px; background: rgba(255,255,255,.08); font-size: 12px; }
 .summary-card { grid-column: span 4; display: grid; align-content: center; gap: 18px; }
+.profile-edit-card { grid-column: span 7; }
+.profile-privacy-card { grid-column: span 5; }
 .metric { display: flex; justify-content: space-between; align-items: end; padding-bottom: 15px; border-bottom: 1px solid var(--line); }
 .metric:last-child { padding-bottom: 0; border: 0; }
 .metric span { color: var(--muted); font-size: 12px; }
@@ -238,7 +240,7 @@ tr:last-child td { border-bottom: 0; }
   .app-layout { grid-template-columns: 1fr; }
   .sidebar { display: none; }
   .main-area { padding: 0 18px 92px; }
-  .hero-card, .summary-card { grid-column: span 12; }
+  .hero-card, .summary-card, .profile-edit-card, .profile-privacy-card { grid-column: span 12; }
   .stat-grid { grid-template-columns: repeat(2, 1fr); }
   .mobile-nav { position: fixed; z-index: 40; inset: auto 0 0; padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: rgba(255,254,250,.96); backdrop-filter: blur(16px); display: flex; gap: 4px; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
   .mobile-nav::-webkit-scrollbar { display: none; }

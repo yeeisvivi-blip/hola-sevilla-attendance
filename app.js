@@ -15,7 +15,7 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
-const BUILD_VERSION = '20261007-monthly-report-nif1';
+const BUILD_VERSION = '20261012-employee-profile-admin1';
 
 function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
@@ -104,6 +104,9 @@ function errorText(error) {
   const messages = {
     INVALID_LOGIN_CREDENTIALS: L('手机号或密码不正确', 'Teléfono o contraseña incorrectos'),
     INVALID_PHONE: L('手机号格式不正确，请填写完整号码，例如 +34 600 000 000', 'El teléfono no es válido. Usa el formato completo, por ejemplo +34 600 000 000'),
+    INVALID_NIF: L('NIF／NIE格式不正确', 'El NIF / NIE no es válido'),
+    INVALID_EMAIL: L('邮箱格式不正确', 'El correo electrónico no es válido'),
+    INVALID_ADDRESS: L('请填写完整地址', 'Escribe la dirección completa'),
     INVALID_PIN: L('个人PIN不正确', 'PIN personal incorrecto'),
     PIN_MUST_BE_6_DIGITS: L('PIN必须是6位数字', 'El PIN debe tener 6 cifras'),
     PIN_NOT_CONFIGURED: L('该员工尚未设置PIN，请由VIVI重设PIN', 'Este empleado no tiene PIN. VIVI debe restablecerlo'),
@@ -1108,7 +1111,44 @@ async function submitMissedPunchRequest(event) {
 }
 
 function renderProfile() {
-  return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>${escapeHTML(state.profile.employee_no)} · ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('在职', 'En activo') : L('停用', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article><article class="card summary-card"><p class="eyebrow">PRIVACY</p><h3>${L('数据、位置与照片', 'Datos, ubicación y fotos')}</h3><p>${L('GPS只在手机打卡时读取一次，不会持续追踪。店铺电脑的上班和下班打卡会拍摄现场照片，照片直接上传至私有云端，不保存在店铺电脑，并在30天后自动删除。', 'El GPS solo se obtiene al fichar con el móvil y no realiza seguimiento continuo. En el ordenador de tienda se hace una foto en la entrada y la salida; se sube directamente al almacenamiento privado, no se guarda en el ordenador y se elimina automáticamente después de 30 días.')}</p></article></div>`;
+  return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>${escapeHTML(state.profile.employee_no)} · ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('在职', 'En activo') : L('停用', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article>
+  <article class="card profile-edit-card"><div class="section-head"><div><p class="eyebrow">CONTACT DETAILS</p><h2>${L('编辑个人资料', 'Editar datos personales')}</h2><p>${L('姓名、员工编号和所属店铺由管理员维护。', 'El nombre, número de empleado y tienda los gestiona la administradora.')}</p></div></div>
+    <form id="employeeProfileForm" class="stack-form">
+      <div class="form-row"><label>${L('NIF／NIE', 'NIF / NIE')}<input id="profileNif" maxlength="20" autocomplete="off" value="${escapeHTML(state.profile.nif || '')}" required></label><label>${L('电话号码', 'Teléfono')}<input id="profilePhone" type="tel" maxlength="24" autocomplete="tel" value="${escapeHTML(state.profile.phone || '')}" placeholder="+34 600 000 000" required></label></div>
+      <label>${L('电子邮箱', 'Correo electrónico')}<input id="profileEmail" type="email" maxlength="254" autocomplete="email" value="${escapeHTML(state.profile.email || '')}" required></label>
+      <label>${L('住址', 'Dirección')}<input id="profileAddress" maxlength="300" autocomplete="street-address" value="${escapeHTML(state.profile.address || '')}" required></label>
+      <div class="callout"><b>${L('登录手机号', 'Teléfono de acceso')}</b><span>${L('电话号码修改后，下次登录请使用新号码；密码保持不变。', 'Si cambias el teléfono, usa el nuevo número la próxima vez. La contraseña no cambia.')}</span></div>
+      <button class="primary-btn" type="submit">${L('保存个人资料', 'Guardar datos')}</button><p class="form-status" id="profileFormStatus" role="status"></p>
+    </form>
+  </article><article class="card summary-card profile-privacy-card"><p class="eyebrow">PRIVACY</p><h3>${L('数据、位置与照片', 'Datos, ubicación y fotos')}</h3><p>${L('GPS只在手机打卡时读取一次，不会持续追踪。店铺电脑的上班和下班打卡会拍摄现场照片，照片直接上传至私有云端，不保存在店铺电脑，并在30天后自动删除。', 'El GPS solo se obtiene al fichar con el móvil y no realiza seguimiento continuo. En el ordenador de tienda se hace una foto en la entrada y la salida; se sube directamente al almacenamiento privado, no se guarda en el ordenador y se elimina automáticamente después de 30 días.')}</p></article></div>`;
+}
+
+async function saveEmployeeProfile(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const status = $('#profileFormStatus');
+  if (button.disabled) return;
+  button.disabled = true;
+  status.textContent = L('正在保存…', 'Guardando…');
+  try {
+    const phone = normalizePhone($('#profilePhone').value);
+    if (!/^\+\d{9,15}$/.test(phone)) throw new Error('INVALID_PHONE');
+    const { error } = await withTimeout(client.rpc('update_my_profile', {
+      p_nif: $('#profileNif').value.trim().toUpperCase(),
+      p_email: $('#profileEmail').value.trim().toLowerCase(),
+      p_phone: phone,
+      p_address: $('#profileAddress').value.trim(),
+    }));
+    if (error) throw error;
+    state.profile = await loadProfile(state.profile.user_id);
+    renderPortal();
+    toast(L('个人资料已保存', 'Datos personales guardados'));
+  } catch (error) {
+    status.textContent = errorText(error);
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
 }
 
 function renderManagerHome() {
@@ -1289,7 +1329,56 @@ function renderEmployees() {
 
 function employeeTable() {
   if (!state.data.employees.length) return `<div class="empty">${L('尚未创建员工', 'Todavía no hay empleados')}</div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>${L('姓名', 'Nombre')}</th><th>NIF</th><th>${L('电话号码', 'Teléfono')}</th><th>${L('员工编号', 'N.º empleado')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('状态', 'Estado')}</th><th>${L('操作', 'Acción')}</th></tr></thead><tbody>${state.data.employees.map((employee) => `<tr><td><b>${escapeHTML(employee.full_name)}</b></td><td>${escapeHTML(employee.nif || '—')}</td><td>${escapeHTML(employee.phone)}</td><td>${escapeHTML(employee.employee_no || '—')}</td><td>${escapeHTML(employee.stores?.name || '')}</td><td><span class="status ${employee.active ? 'ok' : 'alert'}">${employee.active ? L('在职', 'Activo') : L('停用', 'Inactivo')}</span></td><td><div class="button-row"><button class="ghost-btn" data-reset="password" data-id="${employee.user_id}">${L('改密码', 'Contraseña')}</button><button class="ghost-btn" data-reset="pin" data-id="${employee.user_id}">PIN</button><button class="${employee.active ? 'danger-btn' : 'secondary-btn'}" data-toggle-employee="${employee.user_id}" data-active="${employee.active ? 'false' : 'true'}">${employee.active ? L('停用', 'Desactivar') : L('启用', 'Activar')}</button>${employee.active ? '' : `<button class="danger-btn" data-delete-employee="${employee.user_id}">${L('删除误建账号', 'Eliminar cuenta errónea')}</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>${L('姓名', 'Nombre')}</th><th>NIF／NIE</th><th>${L('联系方式', 'Contacto')}</th><th>${L('地址', 'Dirección')}</th><th>${L('员工编号', 'N.º empleado')}</th><th>${L('店铺', 'Tienda')}</th><th>${L('状态', 'Estado')}</th><th>${L('操作', 'Acción')}</th></tr></thead><tbody>${state.data.employees.map((employee) => `<tr><td><b>${escapeHTML(employee.full_name)}</b></td><td>${escapeHTML(employee.nif || '—')}</td><td>${escapeHTML(employee.phone || '—')}${employee.email ? `<br><small>${escapeHTML(employee.email)}</small>` : ''}</td><td>${escapeHTML(employee.address || '—')}</td><td>${escapeHTML(employee.employee_no || '—')}</td><td>${escapeHTML(employee.stores?.name || '')}</td><td><span class="status ${employee.active ? 'ok' : 'alert'}">${employee.active ? L('在职', 'Activo') : L('停用', 'Inactivo')}</span></td><td><div class="button-row"><button class="ghost-btn" data-edit-employee="${employee.user_id}">${L('编辑资料', 'Editar datos')}</button><button class="ghost-btn" data-reset="password" data-id="${employee.user_id}">${L('改密码', 'Contraseña')}</button><button class="ghost-btn" data-reset="pin" data-id="${employee.user_id}">PIN</button><button class="${employee.active ? 'danger-btn' : 'secondary-btn'}" data-toggle-employee="${employee.user_id}" data-active="${employee.active ? 'false' : 'true'}">${employee.active ? L('停用', 'Desactivar') : L('启用', 'Activar')}</button>${employee.active ? '' : `<button class="danger-btn" data-delete-employee="${employee.user_id}">${L('删除误建账号', 'Eliminar cuenta errónea')}</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function openEmployeeProfileDialog(employeeId) {
+  const employee = state.data.employees.find((item) => item.user_id === employeeId);
+  if (!employee) return;
+  openEditDialog(L('编辑员工资料', 'Editar datos del empleado'), `<form id="managerEmployeeProfileForm" class="stack-form">
+    <input id="managerProfileEmployeeId" type="hidden" value="${escapeHTML(employee.user_id)}">
+    <div class="form-row"><label>${L('姓名', 'Nombre completo')}<input id="managerProfileName" minlength="2" maxlength="120" value="${escapeHTML(employee.full_name || '')}" required></label><label>${L('员工编号', 'N.º empleado')}<input id="managerProfileEmployeeNo" maxlength="40" value="${escapeHTML(employee.employee_no || '')}" required></label></div>
+    <div class="form-row"><label>NIF／NIE<input id="managerProfileNif" maxlength="20" value="${escapeHTML(employee.nif || '')}" required></label><label>${L('电话号码', 'Teléfono')}<input id="managerProfilePhone" type="tel" maxlength="24" value="${escapeHTML(employee.phone || '')}" placeholder="+34 600 000 000" required></label></div>
+    <label>${L('电子邮箱', 'Correo electrónico')}<input id="managerProfileEmail" type="email" maxlength="254" value="${escapeHTML(employee.email || '')}" required></label>
+    <label>${L('住址', 'Dirección')}<input id="managerProfileAddress" maxlength="300" value="${escapeHTML(employee.address || '')}" required></label>
+    <label>${L('所属店铺', 'Tienda habitual')}<select id="managerProfileStore">${storeOptions(employee.home_store_id)}</select></label>
+    <div class="callout"><b>${L('登录手机号', 'Teléfono de acceso')}</b><span>${L('修改电话后，员工下次必须使用新号码登录；密码不变。', 'Al cambiar el teléfono, el empleado deberá usar el nuevo número para acceder; la contraseña no cambia.')}</span></div>
+    <p id="managerEmployeeProfileStatus" class="save-status" role="status"></p><button class="primary-btn" type="submit">${L('保存员工资料', 'Guardar datos')}</button>
+  </form>`);
+  $('#managerEmployeeProfileForm').addEventListener('submit', saveManagerEmployeeProfile);
+}
+
+async function saveManagerEmployeeProfile(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const status = $('#managerEmployeeProfileStatus');
+  if (form.dataset.saving === 'true') return;
+  const phone = normalizePhone($('#managerProfilePhone').value);
+  if (!/^\+\d{9,15}$/.test(phone)) { status.textContent = errorText('INVALID_PHONE'); return; }
+  form.dataset.saving = 'true';
+  button.disabled = true;
+  status.textContent = L('正在保存…', 'Guardando…');
+  try {
+    const { error } = await withTimeout(client.rpc('manager_update_employee_profile', {
+      p_employee_id: $('#managerProfileEmployeeId').value,
+      p_full_name: $('#managerProfileName').value.trim(),
+      p_employee_no: $('#managerProfileEmployeeNo').value.trim(),
+      p_nif: $('#managerProfileNif').value.trim().toUpperCase(),
+      p_email: $('#managerProfileEmail').value.trim().toLowerCase(),
+      p_phone: phone,
+      p_address: $('#managerProfileAddress').value.trim(),
+      p_home_store_id: $('#managerProfileStore').value,
+    }));
+    if (error) throw error;
+    closeEditDialog();
+    await finishMutation(L('员工资料已更新', 'Datos del empleado actualizados'));
+  } catch (error) {
+    status.textContent = errorText(error);
+  } finally {
+    delete form.dataset.saving;
+    if (button?.isConnected) button.disabled = false;
+  }
 }
 
 function weekdayNames() {
@@ -1588,9 +1677,11 @@ function bindPortal() {
   $('#refreshData')?.addEventListener('click', refreshPortal);
   $$('[data-view]').forEach((button) => button.addEventListener('click', () => { state.view = button.dataset.view; renderPortal(); }));
   $('#requestForm')?.addEventListener('submit', submitRequest);
+  $('#employeeProfileForm')?.addEventListener('submit', saveEmployeeProfile);
   $$('[data-request-missed-punch]').forEach((button) => button.addEventListener('click', () => openMissedPunchRequest(button.dataset.requestMissedPunch)));
   $$('[data-gps-punch]').forEach((button) => button.addEventListener('click', () => gpsPunch(button.dataset.gpsPunch, button.dataset.gpsPermission || null)));
   $('#employeeForm')?.addEventListener('submit', createEmployee);
+  $$('[data-edit-employee]').forEach((button) => button.addEventListener('click', () => openEmployeeProfileDialog(button.dataset.editEmployee)));
   $$('[data-toggle-employee]').forEach((button) => button.addEventListener('click', () => toggleEmployee(button)));
   $$('[data-delete-employee]').forEach((button) => button.addEventListener('click', () => deleteEmployee(button)));
   $$('[data-reset]').forEach((button) => button.addEventListener('click', () => resetEmployeeCredential(button)));
