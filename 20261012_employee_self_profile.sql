@@ -34,36 +34,41 @@ begin
     raise exception 'EMPLOYEE_NOT_ACTIVE' using errcode = '42501';
   end if;
 
-  v_digits := regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g');
-  if left(v_digits, 2) = '00' then v_digits := substring(v_digits from 3); end if;
-  if length(v_digits) = 9 then v_digits := '34' || v_digits; end if;
-  if length(v_digits) < 9 or length(v_digits) > 15 then
-    raise exception 'INVALID_PHONE' using errcode = '22023';
+  if trim(coalesce(p_phone, '')) <> '' then
+    v_digits := regexp_replace(p_phone, '[^0-9]', '', 'g');
+    if left(v_digits, 2) = '00' then v_digits := substring(v_digits from 3); end if;
+    if length(v_digits) = 9 then v_digits := '34' || v_digits; end if;
+    if length(v_digits) < 9 or length(v_digits) > 15 then
+      raise exception 'INVALID_PHONE' using errcode = '22023';
+    end if;
+    v_phone := '+' || v_digits;
   end if;
-  v_phone := '+' || v_digits;
 
-  if length(trim(coalesce(p_nif, ''))) < 3 or length(trim(coalesce(p_nif, ''))) > 20 then
+  if trim(coalesce(p_nif, '')) <> '' and (length(trim(p_nif)) < 3 or length(trim(p_nif)) > 20) then
     raise exception 'INVALID_NIF' using errcode = '22023';
   end if;
-  if trim(coalesce(p_email, '')) !~* '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
-     or length(trim(p_email)) > 254 then
+  if trim(coalesce(p_email, '')) <> '' and (
+     trim(p_email) !~* '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
+     or length(trim(p_email)) > 254) then
     raise exception 'INVALID_EMAIL' using errcode = '22023';
   end if;
-  if length(trim(coalesce(p_address, ''))) < 5 or length(trim(p_address)) > 300 then
+  if trim(coalesce(p_address, '')) <> '' and (length(trim(p_address)) < 5 or length(trim(p_address)) > 300) then
     raise exception 'INVALID_ADDRESS' using errcode = '22023';
   end if;
 
   update public.profiles
-  set nif = upper(trim(p_nif)),
-      email = lower(trim(p_email)),
-      phone = v_phone,
-      address = trim(p_address)
+  set nif = nullif(upper(trim(p_nif)), ''),
+      email = nullif(lower(trim(p_email)), ''),
+      phone = coalesce(v_phone, phone),
+      address = nullif(trim(p_address), '')
   where user_id = v_user_id;
 
-  update auth.users
-  set email = 'p' || v_digits || '@attendance.invalid',
-      updated_at = now()
-  where id = v_user_id;
+  if v_phone is not null then
+    update auth.users
+    set email = 'p' || v_digits || '@attendance.invalid',
+        updated_at = now()
+    where id = v_user_id;
+  end if;
 end;
 $$;
 
@@ -113,13 +118,15 @@ begin
     raise exception 'STORE_NOT_FOUND' using errcode = 'P0002';
   end if;
 
-  v_digits := regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g');
-  if left(v_digits, 2) = '00' then v_digits := substring(v_digits from 3); end if;
-  if length(v_digits) = 9 then v_digits := '34' || v_digits; end if;
-  if length(v_digits) < 9 or length(v_digits) > 15 then
-    raise exception 'INVALID_PHONE' using errcode = '22023';
+  if trim(coalesce(p_phone, '')) <> '' then
+    v_digits := regexp_replace(p_phone, '[^0-9]', '', 'g');
+    if left(v_digits, 2) = '00' then v_digits := substring(v_digits from 3); end if;
+    if length(v_digits) = 9 then v_digits := '34' || v_digits; end if;
+    if length(v_digits) < 9 or length(v_digits) > 15 then
+      raise exception 'INVALID_PHONE' using errcode = '22023';
+    end if;
+    v_phone := '+' || v_digits;
   end if;
-  v_phone := '+' || v_digits;
 
   if length(trim(coalesce(p_full_name, ''))) < 2 or length(trim(p_full_name)) > 120 then
     raise exception 'INVALID_NAME' using errcode = '22023';
@@ -127,31 +134,34 @@ begin
   if length(trim(coalesce(p_employee_no, ''))) < 1 or length(trim(p_employee_no)) > 40 then
     raise exception 'INVALID_EMPLOYEE_NO' using errcode = '22023';
   end if;
-  if length(trim(coalesce(p_nif, ''))) < 3 or length(trim(p_nif)) > 20 then
+  if trim(coalesce(p_nif, '')) <> '' and (length(trim(p_nif)) < 3 or length(trim(p_nif)) > 20) then
     raise exception 'INVALID_NIF' using errcode = '22023';
   end if;
-  if trim(coalesce(p_email, '')) !~* '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
-     or length(trim(p_email)) > 254 then
+  if trim(coalesce(p_email, '')) <> '' and (
+     trim(p_email) !~* '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
+     or length(trim(p_email)) > 254) then
     raise exception 'INVALID_EMAIL' using errcode = '22023';
   end if;
-  if length(trim(coalesce(p_address, ''))) < 5 or length(trim(p_address)) > 300 then
+  if trim(coalesce(p_address, '')) <> '' and (length(trim(p_address)) < 5 or length(trim(p_address)) > 300) then
     raise exception 'INVALID_ADDRESS' using errcode = '22023';
   end if;
 
   update public.profiles
   set full_name = trim(p_full_name),
       employee_no = trim(p_employee_no),
-      nif = upper(trim(p_nif)),
-      email = lower(trim(p_email)),
-      phone = v_phone,
-      address = trim(p_address),
+      nif = nullif(upper(trim(p_nif)), ''),
+      email = nullif(lower(trim(p_email)), ''),
+      phone = coalesce(v_phone, phone),
+      address = nullif(trim(p_address), ''),
       home_store_id = p_home_store_id
   where user_id = p_employee_id and role = 'employee';
 
-  update auth.users
-  set email = 'p' || v_digits || '@attendance.invalid',
-      updated_at = now()
-  where id = p_employee_id;
+  if v_phone is not null then
+    update auth.users
+    set email = 'p' || v_digits || '@attendance.invalid',
+        updated_at = now()
+    where id = p_employee_id;
+  end if;
 end;
 $$;
 

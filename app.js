@@ -15,7 +15,7 @@ const FUNCTION_RELEASES = {
 };
 const SCHEDULE_START_MONTH = '2026-09';
 const REQUEST_TIMEOUT_MS = 20_000;
-const BUILD_VERSION = '20261012-employee-profile-admin1';
+const BUILD_VERSION = '20261012-employee-profile-optional1';
 
 function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
@@ -1114,9 +1114,9 @@ function renderProfile() {
   return `<div class="page-grid"><article class="card hero-card"><div><p class="eyebrow">EMPLOYEE PROFILE</p><h2>${escapeHTML(state.profile.full_name)}</h2><p>${escapeHTML(state.profile.employee_no)} · ${escapeHTML(state.profile.stores?.name || '')}</p></div><div class="hero-meta"><span>${state.profile.active ? L('在职', 'En activo') : L('停用', 'Desactivado')}</span><span>${escapeHTML(state.profile.phone)}</span></div></article>
   <article class="card profile-edit-card"><div class="section-head"><div><p class="eyebrow">CONTACT DETAILS</p><h2>${L('编辑个人资料', 'Editar datos personales')}</h2><p>${L('姓名、员工编号和所属店铺由管理员维护。', 'El nombre, número de empleado y tienda los gestiona la administradora.')}</p></div></div>
     <form id="employeeProfileForm" class="stack-form">
-      <div class="form-row"><label>${L('NIF／NIE', 'NIF / NIE')}<input id="profileNif" maxlength="20" autocomplete="off" value="${escapeHTML(state.profile.nif || '')}" required></label><label>${L('电话号码', 'Teléfono')}<input id="profilePhone" type="tel" maxlength="24" autocomplete="tel" value="${escapeHTML(state.profile.phone || '')}" placeholder="+34 600 000 000" required></label></div>
-      <label>${L('电子邮箱', 'Correo electrónico')}<input id="profileEmail" type="email" maxlength="254" autocomplete="email" value="${escapeHTML(state.profile.email || '')}" required></label>
-      <label>${L('住址', 'Dirección')}<input id="profileAddress" maxlength="300" autocomplete="street-address" value="${escapeHTML(state.profile.address || '')}" required></label>
+      <div class="form-row"><label>${L('NIF／NIE（可选）', 'NIF / NIE (opcional)')}<input id="profileNif" maxlength="20" autocomplete="off" value="${escapeHTML(state.profile.nif || '')}"></label><label>${L('电话号码（可选）', 'Teléfono (opcional)')}<input id="profilePhone" type="tel" maxlength="24" autocomplete="tel" value="${escapeHTML(state.profile.phone || '')}" placeholder="+34 600 000 000"></label></div>
+      <label>${L('电子邮箱（可选）', 'Correo electrónico (opcional)')}<input id="profileEmail" type="email" maxlength="254" autocomplete="email" value="${escapeHTML(state.profile.email || '')}"></label>
+      <label>${L('住址（可选）', 'Dirección (opcional)')}<input id="profileAddress" maxlength="300" autocomplete="street-address" value="${escapeHTML(state.profile.address || '')}"></label>
       <div class="callout"><b>${L('登录手机号', 'Teléfono de acceso')}</b><span>${L('电话号码修改后，下次登录请使用新号码；密码保持不变。', 'Si cambias el teléfono, usa el nuevo número la próxima vez. La contraseña no cambia.')}</span></div>
       <button class="primary-btn" type="submit">${L('保存个人资料', 'Guardar datos')}</button><p class="form-status" id="profileFormStatus" role="status"></p>
     </form>
@@ -1132,8 +1132,9 @@ async function saveEmployeeProfile(event) {
   button.disabled = true;
   status.textContent = L('正在保存…', 'Guardando…');
   try {
-    const phone = normalizePhone($('#profilePhone').value);
-    if (!/^\+\d{9,15}$/.test(phone)) throw new Error('INVALID_PHONE');
+    const rawPhone = $('#profilePhone').value.trim();
+    const phone = rawPhone ? normalizePhone(rawPhone) : '';
+    if (phone && !/^\+\d{9,15}$/.test(phone)) throw new Error('INVALID_PHONE');
     const { error } = await withTimeout(client.rpc('update_my_profile', {
       p_nif: $('#profileNif').value.trim().toUpperCase(),
       p_email: $('#profileEmail').value.trim().toLowerCase(),
@@ -1338,9 +1339,9 @@ function openEmployeeProfileDialog(employeeId) {
   openEditDialog(L('编辑员工资料', 'Editar datos del empleado'), `<form id="managerEmployeeProfileForm" class="stack-form">
     <input id="managerProfileEmployeeId" type="hidden" value="${escapeHTML(employee.user_id)}">
     <div class="form-row"><label>${L('姓名', 'Nombre completo')}<input id="managerProfileName" minlength="2" maxlength="120" value="${escapeHTML(employee.full_name || '')}" required></label><label>${L('员工编号', 'N.º empleado')}<input id="managerProfileEmployeeNo" maxlength="40" value="${escapeHTML(employee.employee_no || '')}" required></label></div>
-    <div class="form-row"><label>NIF／NIE<input id="managerProfileNif" maxlength="20" value="${escapeHTML(employee.nif || '')}" required></label><label>${L('电话号码', 'Teléfono')}<input id="managerProfilePhone" type="tel" maxlength="24" value="${escapeHTML(employee.phone || '')}" placeholder="+34 600 000 000" required></label></div>
-    <label>${L('电子邮箱', 'Correo electrónico')}<input id="managerProfileEmail" type="email" maxlength="254" value="${escapeHTML(employee.email || '')}" required></label>
-    <label>${L('住址', 'Dirección')}<input id="managerProfileAddress" maxlength="300" value="${escapeHTML(employee.address || '')}" required></label>
+    <div class="form-row"><label>${L('NIF／NIE（可选）', 'NIF / NIE (opcional)')}<input id="managerProfileNif" maxlength="20" value="${escapeHTML(employee.nif || '')}"></label><label>${L('电话号码（可选）', 'Teléfono (opcional)')}<input id="managerProfilePhone" type="tel" maxlength="24" value="${escapeHTML(employee.phone || '')}" placeholder="+34 600 000 000"></label></div>
+    <label>${L('电子邮箱（可选）', 'Correo electrónico (opcional)')}<input id="managerProfileEmail" type="email" maxlength="254" value="${escapeHTML(employee.email || '')}"></label>
+    <label>${L('住址（可选）', 'Dirección (opcional)')}<input id="managerProfileAddress" maxlength="300" value="${escapeHTML(employee.address || '')}"></label>
     <label>${L('所属店铺', 'Tienda habitual')}<select id="managerProfileStore">${storeOptions(employee.home_store_id)}</select></label>
     <div class="callout"><b>${L('登录手机号', 'Teléfono de acceso')}</b><span>${L('修改电话后，员工下次必须使用新号码登录；密码不变。', 'Al cambiar el teléfono, el empleado deberá usar el nuevo número para acceder; la contraseña no cambia.')}</span></div>
     <p id="managerEmployeeProfileStatus" class="save-status" role="status"></p><button class="primary-btn" type="submit">${L('保存员工资料', 'Guardar datos')}</button>
@@ -1354,8 +1355,9 @@ async function saveManagerEmployeeProfile(event) {
   const button = form.querySelector('button[type="submit"]');
   const status = $('#managerEmployeeProfileStatus');
   if (form.dataset.saving === 'true') return;
-  const phone = normalizePhone($('#managerProfilePhone').value);
-  if (!/^\+\d{9,15}$/.test(phone)) { status.textContent = errorText('INVALID_PHONE'); return; }
+  const rawPhone = $('#managerProfilePhone').value.trim();
+  const phone = rawPhone ? normalizePhone(rawPhone) : '';
+  if (phone && !/^\+\d{9,15}$/.test(phone)) { status.textContent = errorText('INVALID_PHONE'); return; }
   form.dataset.saving = 'true';
   button.disabled = true;
   status.textContent = L('正在保存…', 'Guardando…');
